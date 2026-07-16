@@ -28,6 +28,8 @@ And because the remote is a normal Synara server serving its own web bundle, **p
 
 The full spec (with the failure-mode analysis: connectivity state machine, version skew policy, flow control on the proxy, cookie handling, deep links) is in `docs/superpowers/specs/2026-07-16-remote-hosts-design.md` on my fork: https://github.com/aristotl-dylan/synara/blob/remote-hosts-rfc/docs/superpowers/specs/2026-07-16-remote-hosts-design.md
 
+I also made an interactive version of the spec with the architecture diagram, the prior art comparison and the failure mode walkthroughs, if you prefer browsing it that way: https://gistcdn.githack.com/aristotl-dylan/0cc0e4a7bf83b4f8ffe8a42d6af582e8/raw/2026-07-16-remote-hosts-dashboard.html
+
 ## Things I found along the way that are worth fixing regardless
 
 The validation pass surfaced a few real issues in main that matter even without remote hosts:
