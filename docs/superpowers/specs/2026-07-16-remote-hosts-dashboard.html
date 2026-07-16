@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFC: Remote Hosts — Synara</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --background: #0e0e0e;
+    --foreground: #f5f5f5;
+    --card: color-mix(in srgb, var(--background) 99%, #fff);
+    --muted: rgb(255 255 255 / 4%);
+    --muted-foreground: #9c9c9c;
+    --border: rgb(255 255 255 / 6%);
+    --border-strong: rgb(255 255 255 / 12%);
+    --primary: #f5f5f5;
+    --primary-foreground: #171717;
+    --success: #34d399;
+    --destructive: #f87171;
+    --warning: #fbbf24;
+    --info: #60a5fa;
+    --merged: #a5b4fc;
+    --claude: #d97757;
+    --radius: 0.625rem;
+    --radius-lg: 0.9rem;
+    --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", "SF Mono", SFMono-Regular, Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; border-color: var(--border); }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .shell { max-width: 1060px; margin: 0 auto; padding: 40px 24px 96px; }
+
+  /* ── Header ── */
+  header { margin-bottom: 28px; }
+  .kicker {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted-foreground);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px;
+    background: var(--muted);
+  }
+  .kicker .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
+  h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; margin: 16px 0 8px; }
+  .sub { color: var(--muted-foreground); max-width: 720px; margin: 0; }
+  .sub code { font-family: var(--font-mono); font-size: 12.5px; }
+
+  /* ── Tabs ── */
+  nav {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--background) 86%, transparent);
+    backdrop-filter: blur(8px) saturate(135%);
+    -webkit-backdrop-filter: blur(8px) saturate(135%);
+    margin: 28px -8px 32px; padding: 10px 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; gap: 4px; flex-wrap: wrap;
+  }
+  nav button {
+    appearance: none; border: 1px solid transparent; background: transparent;
+    color: var(--muted-foreground); font: inherit; font-size: 13px; font-weight: 500;
+    padding: 6px 14px; border-radius: 999px; cursor: pointer;
+    transition: color .15s, background .15s;
+  }
+  nav button:hover { color: var(--foreground); background: var(--muted); }
+  nav button.active {
+    color: var(--foreground); background: var(--muted); border-color: var(--border);
+  }
+  section[data-panel] { display: none; }
+  section[data-panel].active { display: block; animation: fade .18s ease-out; }
+  @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+  /* ── Cards & layout ── */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 20px 22px; margin-bottom: 16px;
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 2.4%);
+  }
+  .card h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .card p { margin: 6px 0; color: var(--muted-foreground); }
+  .card p strong, .card li strong { color: var(--foreground); font-weight: 570; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 760px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+  h2 { font-size: 20px; font-weight: 640; letter-spacing: -0.015em; margin: 0 0 4px; }
+  .lede { color: var(--muted-foreground); margin: 0 0 22px; max-width: 760px; }
+  code {
+    font-family: var(--font-mono); font-size: 12px;
+    background: var(--muted); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1.5px 5px;
+  }
+  ul { margin: 8px 0; padding-left: 20px; color: var(--muted-foreground); }
+  li { margin: 4px 0; }
+  li::marker { color: var(--border-strong); }
+
+  /* ── Badges ── */
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .05em; text-transform: uppercase;
+    border-radius: 999px; padding: 2.5px 9px; border: 1px solid;
+  }
+  .badge.ok      { color: var(--success);     border-color: color-mix(in srgb, var(--success) 30%, transparent);     background: color-mix(in srgb, var(--success) 8%, transparent); }
+  .badge.no      { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 30%, transparent); background: color-mix(in srgb, var(--destructive) 8%, transparent); }
+  .badge.warn    { color: var(--warning);     border-color: color-mix(in srgb, var(--warning) 30%, transparent);     background: color-mix(in srgb, var(--warning) 8%, transparent); }
+  .badge.info    { color: var(--info);        border-color: color-mix(in srgb, var(--info) 30%, transparent);        background: color-mix(in srgb, var(--info) 8%, transparent); }
+  .badge.neutral { color: var(--muted-foreground); border-color: var(--border-strong); background: var(--muted); }
+  .badge.merged  { color: var(--merged);      border-color: color-mix(in srgb, var(--merged) 30%, transparent);      background: color-mix(in srgb, var(--merged) 8%, transparent); }
+
+  /* ── Tables ── */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; font-weight: 600; font-size: 11px; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--muted-foreground);
+    padding: 10px 12px; border-bottom: 1px solid var(--border-strong);
+  }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--border); vertical-align: top; color: var(--muted-foreground); }
+  td:first-child { color: var(--foreground); font-weight: 550; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  .tablecard { padding: 6px 8px; overflow-x: auto; }
+
+  /* ── Architecture diagram ── */
+  .diagram { padding: 26px 22px 22px; overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; max-width: 100%; }
+  .node { fill: var(--muted); stroke: var(--border-strong); rx: 10; }
+  .node-label { fill: var(--foreground); font: 600 12.5px var(--font-ui); }
+  .node-sub { fill: var(--muted-foreground); font: 11px var(--font-ui); }
+  .mono-sub { fill: var(--muted-foreground); font: 10px var(--font-mono); }
+  .edge { stroke: var(--border-strong); stroke-width: 1.2; fill: none; }
+  .edge.hot { stroke: var(--success); stroke-dasharray: 5 4; animation: dash 1.4s linear infinite; }
+  .edge.alt { stroke: var(--info); stroke-dasharray: 5 4; animation: dash 1.4s linear infinite; }
+  @keyframes dash { to { stroke-dashoffset: -18; } }
+  @media (prefers-reduced-motion: reduce) { .edge.hot, .edge.alt { animation: none; } }
+  .edge-label { fill: var(--muted-foreground); font: 10.5px var(--font-mono); }
+  .zone { fill: none; stroke: var(--border); stroke-dasharray: 3 4; rx: 14; }
+  .zone-label { fill: var(--muted-foreground); font: 600 10px var(--font-ui); letter-spacing: .1em; text-transform: uppercase; }
+
+  /* ── Details / accordions ── */
+  details {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    margin-bottom: 10px; background: var(--card);
+  }
+  details summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px;
+    padding: 13px 16px; font-weight: 570; font-size: 13.5px;
+    border-radius: var(--radius); transition: background .15s;
+  }
+  details summary:hover { background: var(--muted); }
+  details summary::-webkit-details-marker { display: none; }
+  details summary .chev {
+    margin-left: auto; color: var(--muted-foreground);
+    transition: transform .22s ease-out; flex-shrink: 0;
+  }
+  details[open] summary .chev { transform: rotate(90deg); }
+  details .body { padding: 2px 16px 14px; color: var(--muted-foreground); font-size: 13px; border-top: 1px solid var(--border); padding-top: 12px; }
+  details .body ul { margin: 6px 0; }
+
+  /* ── Phase timeline ── */
+  .phase { display: grid; grid-template-columns: 130px 1fr; gap: 18px; position: relative; padding-bottom: 26px; }
+  .phase::before {
+    content: ""; position: absolute; left: 57px; top: 34px; bottom: 0;
+    width: 1px; background: var(--border-strong);
+  }
+  .phase:last-child::before { display: none; }
+  .phase-marker { text-align: center; }
+  .phase-pill {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 116px; padding: 6px 0; border-radius: 999px;
+    font-family: var(--font-mono); font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    border: 1px solid var(--border-strong); background: var(--muted); color: var(--foreground);
+  }
+  .phase .card { margin-bottom: 0; }
+  .ship { font-size: 11.5px; color: var(--success); font-family: var(--font-mono); }
+
+  /* ── Scenario player ── */
+  .scenario-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+  .scenario-tabs button {
+    appearance: none; font: inherit; font-size: 12.5px; font-weight: 550; cursor: pointer;
+    color: var(--muted-foreground); background: var(--muted);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 13px;
+    transition: color .15s, border-color .15s;
+  }
+  .scenario-tabs button:hover { color: var(--foreground); }
+  .scenario-tabs button.active { color: var(--foreground); border-color: var(--border-strong); background: var(--card); }
+  .scenario-body { display: none; }
+  .scenario-body.active { display: block; animation: fade .18s ease-out; }
+  .steps { counter-reset: step; margin: 4px 0 0; padding: 0; list-style: none; }
+  .steps li {
+    counter-increment: step; position: relative; padding: 0 0 14px 40px; margin: 0;
+  }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 0;
+    width: 24px; height: 24px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+    background: var(--muted); border: 1px solid var(--border-strong); color: var(--foreground);
+  }
+  .steps li:not(:last-child)::after {
+    content: ""; position: absolute; left: 12px; top: 26px; bottom: 2px; width: 1px;
+    background: var(--border-strong);
+  }
+  .steps .outcome { color: var(--success); font-weight: 570; }
+
+  .footnote { color: var(--muted-foreground); font-size: 12px; margin-top: 28px; }
+  .footnote a { color: var(--info); text-decoration: none; }
+  .statgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 760px) { .statgrid { grid-template-columns: repeat(2, 1fr); } }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .stat .n { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; }
+  .stat .l { font-size: 11px; color: var(--muted-foreground); text-transform: uppercase; letter-spacing: .07em; margin-top: 2px; }
+  .q { border-left: 2px solid var(--border-strong); padding-left: 14px; margin-bottom: 18px; }
+  .q .qt { font-weight: 600; margin-bottom: 3px; }
+  .q .qa { color: var(--muted-foreground); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+<header>
+  <span class="kicker"><span class="dot"></span> RFC · Design Proposal</span>
+  <h1>Remote Hosts for Synara</h1>
+  <p class="sub">Run agent sessions on other machines (VPS, Mac Studio) over SSH. Sessions survive laptop sleep, phones connect directly, no hosted infrastructure required. Validated against the codebase with a multi-agent review pass: 6 deep-dives, 3 adversarial critiques, 1 synthesis.</p>
+</header>
+
+<nav id="tabs">
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="priorart">Prior Art</button>
+  <button data-tab="architecture">Architecture</button>
+  <button data-tab="design">Design Detail</button>
+  <button data-tab="failures">Failure Modes</button>
+  <button data-tab="phasing">Phasing</button>
+  <button data-tab="questions">Open Questions</button>
+</nav>
+
+<!-- ═══════════ OVERVIEW ═══════════ -->
+<section data-panel="overview" class="active">
+  <h2>The idea in one screen</h2>
+  <p class="lede">A remote environment is a <strong style="color:var(--foreground)">full Synara server</strong> on the remote box. The local server is an SSH broker and byte-level proxy. The browser keeps one origin. The phone connects directly.</p>
+
+  <div class="statgrid">
+    <div class="stat"><div class="n">0</div><div class="l">Files synced</div></div>
+    <div class="stat"><div class="n">1</div><div class="l">Browser origin</div></div>
+    <div class="stat"><div class="n">4</div><div class="l">Independent phases</div></div>
+    <div class="stat"><div class="n">3</div><div class="l">Bugs found in main</div></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>What you get</h3>
+      <ul>
+        <li><strong>Composer picker:</strong> "Start in: Local / worktree / VPS / Mac Studio", exactly like Codex's cloud picker.</li>
+        <li><strong>Sessions outlive the laptop:</strong> threads, terminals and git live on the remote server, supervised by systemd/launchd.</li>
+        <li><strong>Phone access with zero cloud:</strong> the remote is a normal Synara server serving its own web bundle. Tailscale + QR pairing, done.</li>
+        <li><strong>Fork-friendly:</strong> everything self-hosted; artifacts ship as GitHub Release assets.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Why this shape</h3>
+      <ul>
+        <li>Codex, OpenCode and T3 Code all converged on "persistent server on the remote, thin client". Nobody syncs files.</li>
+        <li>Making Synara's ~9 provider spawn paths + PTYs + git remote-aware one by one (the Codex per-session model) was evaluated and rejected: a permanent 2x testing tax.</li>
+        <li>The relay is <strong>byte-level</strong>, never RPC-aware: the WS surface has ~100 methods, no routing key, and weekly contract churn.</li>
+        <li>Validation surfaced 3 real bugs in main that get fixed first, as standalone PRs (Phase 0).</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>The scenario that motivates everything</h3>
+    <p>Start a long-running session on the VPS from the laptop at 6pm. Close the laptop. Open the phone at 11pm over Tailscale, watch the turn finish, answer one approval, go to sleep. Reopen the laptop at 9am: the thread is right there in the sidebar, done. Nothing on the laptop mattered after 6pm.</p>
+  </div>
+</section>
+
+<!-- ═══════════ PRIOR ART ═══════════ -->
+<section data-panel="priorart">
+  <h2>How the ecosystem solved it</h2>
+  <p class="lede">Three tools studied in depth, plus VS Code Remote-SSH and Zed as references. They differ in bootstrap philosophy but agree on the fundamentals.</p>
+
+  <div class="card tablecard">
+    <table>
+      <thead><tr><th>Dimension</th><th>Codex</th><th>OpenCode</th><th>T3 Code</th><th>This proposal</th></tr></thead>
+      <tbody>
+        <tr><td>Remote unit</td><td>SSH-spawned <code>app-server</code> + detached daemon</td><td>User-run <code>opencode serve</code> (HTTP+SSE)</td><td>Full T3 server, SSH-launched</td><td>Full Synara server, SSH-launched</td></tr>
+        <tr><td>Transport</td><td>JSON-RPC over SSH / WS (experimental)</td><td>Plain HTTP + SSE</td><td>Plain WS over SSH port forward</td><td>Byte-proxied WS/HTTP, single origin</td></tr>
+        <tr><td>Working copy</td><td><span class="badge ok">remote</span></td><td><span class="badge ok">remote</span></td><td><span class="badge ok">remote</span></td><td><span class="badge ok">remote</span></td></tr>
+        <tr><td>File sync</td><td><span class="badge neutral">none</span></td><td><span class="badge neutral">none</span></td><td><span class="badge neutral">none</span></td><td><span class="badge neutral">none</span></td></tr>
+        <tr><td>Bootstrap</td><td>Preinstalled binary <span class="badge no">top complaint</span></td><td>Manual <span class="badge warn">DIY</span></td><td>Launcher script, hunts node shims</td><td>Upload-first (VS Code model) <span class="badge ok">exact version</span></td></tr>
+        <tr><td>Survives disconnect</td><td><span class="badge ok">yes</span> daemon</td><td><span class="badge ok">yes</span> server-side</td><td><span class="badge ok">yes</span> server-side</td><td><span class="badge ok">yes</span> + OS supervisor</td></tr>
+        <tr><td>Mobile story</td><td>Cloud relay + QR (hosted infra)</td><td>Tailscale DIY</td><td>Hosted pairing at app.t3.codes</td><td>Tailscale + local QR <span class="badge ok">zero infra</span></td></tr>
+        <tr><td>Multi-host UI</td><td>Host picker in app</td><td>Thin, community fills gap</td><td>Environment switcher</td><td>Composer picker + env registry</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid3">
+    <div class="card">
+      <h3>Lesson from Codex</h3>
+      <p>Bootstrap fragility (login-shell PATH) is their #1 community complaint. Hence: upload-first with pinned Node, absolute paths everywhere, structured probe errors instead of a spinner.</p>
+    </div>
+    <div class="card">
+      <h3>Lesson from T3 Code</h3>
+      <p>SSH as a <em>launch helper</em>, not a transport protocol, keeps the final hop plain WS and the codebase untouched. They rejected Zed's custom proxy protocol deliberately. So do we.</p>
+    </div>
+    <div class="card">
+      <h3>Lesson from OpenCode</h3>
+      <p>Their planned SSH feature (#7790) is exactly this shape. Their headless-approval hang (#16367) and remote worktree bugs told us which failure modes to design for up front.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ ARCHITECTURE ═══════════ -->
+<section data-panel="architecture">
+  <h2>Architecture</h2>
+  <p class="lede">Two access paths to the same remote server: brokered through the laptop (single origin) and direct from the phone (Tailscale). The remote server is authoritative for everything it owns.</p>
+
+  <div class="card diagram">
+    <svg viewBox="0 0 980 470" role="img" aria-label="Architecture diagram">
+      <!-- zones -->
+      <rect class="zone" x="12" y="14" width="360" height="330"/>
+      <text class="zone-label" x="28" y="38">Local machine</text>
+      <rect class="zone" x="560" y="14" width="404" height="330"/>
+      <text class="zone-label" x="576" y="38">Remote host (VPS / Mac Studio)</text>
+
+      <!-- browser -->
+      <rect class="node" x="36" y="60" width="150" height="64" rx="10"/>
+      <text class="node-label" x="52" y="86">Browser</text>
+      <text class="node-sub" x="52" y="104">one origin</text>
+
+      <!-- local server -->
+      <rect class="node" x="36" y="180" width="310" height="140" rx="10"/>
+      <text class="node-label" x="52" y="206">Local Synara server</text>
+      <text class="node-sub" x="52" y="224">broker · byte proxy · health</text>
+      <text class="mono-sub" x="52" y="248">/env/:envId/ws</text>
+      <text class="mono-sub" x="52" y="264">/env/:envId/api/*</text>
+      <text class="mono-sub" x="52" y="288">strips cookies · injects auth</text>
+      <text class="mono-sub" x="52" y="304">flow-controls · never parses RPC</text>
+
+      <!-- ssh tunnel -->
+      <path class="edge hot" d="M346 250 C 430 250, 470 250, 560 250"/>
+      <text class="edge-label" x="380" y="238">ssh tunnel + port forward</text>
+      <text class="edge-label" x="404" y="270">ServerAlive keepalive</text>
+
+      <!-- remote server -->
+      <rect class="node" x="584" y="180" width="356" height="140" rx="10"/>
+      <text class="node-label" x="600" y="206">Remote Synara server</text>
+      <text class="node-sub" x="600" y="224">owns repo · git · worktrees · PTYs · providers</text>
+      <text class="mono-sub" x="600" y="248">~/.synara/remote/versions/&lt;v&gt;/</text>
+      <text class="mono-sub" x="600" y="264">SQLite event log · resume cursors</text>
+      <text class="mono-sub" x="600" y="288">supervised: systemd user / launchd</text>
+      <text class="mono-sub" x="600" y="304">serves its own web bundle</text>
+
+      <!-- provider procs -->
+      <rect class="node" x="584" y="60" width="164" height="56" rx="10"/>
+      <text class="node-label" x="600" y="84">codex app-server</text>
+      <text class="node-sub" x="600" y="100">child process</text>
+      <rect class="node" x="768" y="60" width="172" height="56" rx="10"/>
+      <text class="node-label" x="784" y="84">claude / cursor…</text>
+      <text class="node-sub" x="784" y="100">ACP child processes</text>
+      <path class="edge" d="M666 116 L 700 180"/>
+      <path class="edge" d="M854 116 L 820 180"/>
+
+      <!-- browser to local -->
+      <path class="edge" d="M111 124 L 111 180"/>
+      <text class="edge-label" x="122" y="158">ws (native + relayed)</text>
+
+      <!-- phone -->
+      <rect class="node" x="390" y="386" width="150" height="64" rx="10"/>
+      <text class="node-label" x="406" y="412">Phone</text>
+      <text class="node-sub" x="406" y="430">paired via QR</text>
+      <path class="edge alt" d="M540 410 C 700 410, 762 380, 762 320"/>
+      <text class="edge-label" x="590" y="398">tailscale serve (https) · direct</text>
+    </svg>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>Why the proxy is byte-level</h3>
+      <ul>
+        <li>The WS surface is one flat RpcGroup, ~100 methods, no environment routing key.</li>
+        <li>Event sequences are per-server SQLite <code>AUTOINCREMENT</code>: mixing two servers' streams collides. Aggregation stays client-side, keyed by <code>environmentId</code>.</li>
+        <li><code>contracts/rpc.ts</code> churns weekly; a method-aware relay would break on every release. Byte-forwarding means the browser speaks each server's exact schema.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>But not literally dumb</h3>
+      <ul>
+        <li><strong>Cookie hygiene:</strong> strips <code>Cookie</code>/<code>Set-Cookie</code> both ways across <code>/env/*</code>; injects its own bearer/ws-token. Otherwise the remote's cookie clobbers the local session on the shared origin.</li>
+        <li><strong>Flow control:</strong> pauses upstream on backpressure, never drops frames (terminals are lossless), closes on ceiling breach with bounded memory.</li>
+        <li><strong>Fail-fast liveness:</strong> upstream dial completes <em>before</em> the browser upgrade is accepted; dead tunnels tear down all proxied connections so the client's snapshot-on-subscribe recovery fires.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ DESIGN DETAIL ═══════════ -->
+<section data-panel="design">
+  <h2>Design detail</h2>
+  <p class="lede">Every decision below survived the adversarial pass. Expand what you care about.</p>
+
+  <details open>
+    <summary><span class="badge info">bootstrap</span> Upload-first bootstrap, VS Code model <span class="chev">›</span></summary>
+    <div class="body">
+      <ul>
+        <li>Probe: <code>uname -sm</code> + existing state → <strong>structured readiness report</strong> (runtime, pidfile/port, node-pty, provider CLIs) rendered in the environment UI. Never a bare "connection failed".</li>
+        <li>Pinned Node ≥22.19 provisioned to <code>~/.synara/remote/node/&lt;v&gt;/</code> if missing; server tarball (bundled server + web client) <strong>uploaded</strong> via scp at the broker's exact version. Remote internet download is opt-in.</li>
+        <li>node-pty smoke gate; if it fails to build, terminals disable as a capability flag instead of failing bootstrap.</li>
+        <li>Artifacts: GitHub Release assets per arch (darwin-arm64, linux-x64, linux-arm64). Bare npm name <code>synara</code> is squatted; scoped package if npm at all.</li>
+        <li>SSH auth: agent or passphrase-less keys required and explained; host-key fingerprint confirmed explicitly in the add-host UI; ProxyJump/2FA via <code>~/.ssh/config</code> + "Test connection".</li>
+      </ul>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="badge info">lifecycle</span> OS supervisor owns restarts, not pidfiles <span class="chev">›</span></summary>
+    <div class="body">
+      <ul>
+        <li>systemd <strong>user</strong> unit + <code>loginctl enable-linger</code> on Linux; launchd LaunchAgent (<code>RunAtLoad</code>+<code>KeepAlive</code>) on macOS. The broker is only a fallback restarter.</li>
+        <li>Pidfile-only dies on reboot, which kills the "laptop closed, phone still works" promise. Supervisor is what makes the promise real.</li>
+        <li>No-auto-exit policy: the remote never self-exits while threads exist. Remote logs at <code>~/.synara/logs</code> with a "view remote logs" affordance (VS Code's #1 troubleshooting complaint is the real error hiding behind a spinner).</li>
+        <li>Honest UI copy: a remote restart interrupts in-flight turns; they reconcile to <code>interrupted</code> exactly like local semantics.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="badge warn">auth</span> Pairing &amp; enforcement with zero hosted infra <span class="chev">›</span></summary>
+    <div class="body">
+      <ul>
+        <li><strong>Policy-driven enforcement:</strong> remote-reachable bind or broker-managed mode ⇒ session auth on every WS upgrade and HTTP route, no legacy-token bypass. (Today the socket is unauthenticated whenever <code>--auth-token</code> is unset. That is fixed first.)</li>
+        <li><strong>Pairing client:</strong> a <code>/pair</code> route reading the credential from <code>location.hash</code>, an auth-gate token form as fallback, and "Pair a device" in settings that mints a token on the remote via the relay and renders a <strong>locally generated QR</strong>. T3 needs app.t3.codes for this; we don't.</li>
+        <li><strong>Broker handshake:</strong> launcher seeds a single-use owner grant → broker exchanges for a labeled bearer (stored in local <code>secretsDir</code>) → per-connection ws-token → re-pair over SSH on 401.</li>
+        <li><code>--trusted-origin</code> for the <code>tailscale serve</code> HTTPS origin; Secure cookies on HTTPS; guard the three bare <code>crypto.randomUUID()</code> call sites for plain-HTTP fallback.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="badge merged">versioning</span> Pin to broker; never auto-restart a busy remote <span class="chev">›</span></summary>
+    <div class="body">
+      <ul>
+        <li>Side-by-side installs under <code>~/.synara/remote/versions/&lt;v&gt;/</code>; one server per host <code>SYNARA_HOME</code>; version is a host-level property with a relaunch lockfile.</li>
+        <li>First RPC after tunnel-up fetches the descriptor. Mismatch ⇒ hard-reject into a first-class <code>version-mismatch</code> state: <strong>read-degraded</strong> (view threads, no new dispatch).</li>
+        <li>Relaunch is user-invoked, blocked while turns are active (or explicit "interrupt N turns" confirm). Weekly releases × auto-restart would routinely destroy the long-running work this feature protects.</li>
+        <li>Newest-wins, human-confirmed: an older broker never downgrades a newer server; it prompts to update itself.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="badge ok">client</span> Environment-keyed client, "Start in" picker, deep links <span class="chev">›</span></summary>
+    <div class="body">
+      <ul>
+        <li><code>wsNativeApi</code>/<code>wsTransport</code> refactor from module singleton to an environment-keyed registry behind React context; one shell snapshot + sequence watermark per environment, merged at render.</li>
+        <li><code>environmentId</code> rides thread creation but never enters the orchestration command schema; routing is which per-environment NativeApi instance receives the dispatch.</li>
+        <li>Two-stage picker: environment → that environment's projects (existing local/worktree option per project). Cold-host onboarding: pre-filled remote terminal (<code>git clone</code>, <code>gh auth login</code>, provider logins) + "create project from repo URL".</li>
+        <li>Deep links gain the environment dimension (<code>/env/:envId/:threadId</code>, legacy defaults to local) + a persisted <code>threadId → environmentId</code> map; unreachable environments render as connectivity state, not a 404.</li>
+        <li>Per-environment provider badges from the remote's <code>ProviderHealth</code> stream.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="badge no">prereq</span> Bugs in main found during validation (Phase 0 PRs) <span class="chev">›</span></summary>
+    <div class="body">
+      <ul>
+        <li><strong>Auth bypass:</strong> WS served unauthenticated when no <code>--auth-token</code> set; remote-reachable bind = open RCE. Fix: policy-driven enforcement.</li>
+        <li><strong>Pairing client missing:</strong> server side exists, no <code>/pair</code> route / token gate / QR anywhere in the client.</li>
+        <li><strong>Approval race:</strong> <code>decider.ts</code> accepts <code>thread.approval.respond</code> without a pending check; two devices answering once each appends contradictory events. Fix: first-wins at the event log, benign "already answered" for the loser.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<!-- ═══════════ FAILURE MODES ═══════════ -->
+<section data-panel="failures">
+  <h2>Failure modes, walked through</h2>
+  <p class="lede">The design is judged by its worst days, not its demo. Pick a scenario.</p>
+
+  <div class="scenario-tabs" id="scenarios">
+    <button data-s="sleep" class="active">Laptop sleeps mid-turn</button>
+    <button data-s="reboot">VPS reboots</button>
+    <button data-s="skew">Version mismatch</button>
+    <button data-s="race">Two devices, one approval</button>
+    <button data-s="offline">Host unreachable</button>
+  </div>
+
+  <div class="card scenario-body active" data-s="sleep">
+    <h3>Laptop sleeps while a remote turn is running</h3>
+    <ol class="steps">
+      <li>SSH tunnel drops. The remote server and the in-flight turn <strong>don't notice or care</strong>; nothing in the turn lifecycle requires a client connection.</li>
+      <li>Broker keepalive (<code>ServerAliveInterval</code> + WS ping deadline) declares the environment down and tears down <em>all</em> proxied connections for it, so nothing goes silently stale.</li>
+      <li>The environment shows <code>reconnecting</code> via the <code>environment.status</code> push; per-connection errors are not the UI's source of truth.</li>
+      <li>On wake, the broker re-establishes SSH; the proxy completes the upstream dial before accepting browser upgrades (no connect-then-fail storm), with jittered backoff.</li>
+      <li class="outcome">Relayed subscriptions resubscribe and the remote re-sends full snapshots. No relay-side buffering, no cursors, nothing to corrupt. The finished turn is simply there.</li>
+    </ol>
+  </div>
+
+  <div class="card scenario-body" data-s="reboot">
+    <h3>The VPS reboots overnight</h3>
+    <ol class="steps">
+      <li>SQLite event log, resume cursors and thread projections persist on the remote disk.</li>
+      <li>systemd user unit (with linger) / launchd restarts the server at boot. The broker is only a fallback restarter.</li>
+      <li>Startup reconciliation marks turns that were in flight as <code>interrupted</code>, identical to local restart semantics. The UI says so honestly.</li>
+      <li class="outcome">Phone and laptop reconnect to a healthy server with full history. Provider sessions resume via their native resume cursors on next turn.</li>
+    </ol>
+  </div>
+
+  <div class="card scenario-body" data-s="skew">
+    <h3>Local Synara updated, remote still on last week's version</h3>
+    <ol class="steps">
+      <li>First RPC after tunnel-up is a descriptor fetch; <code>serverVersion</code> mismatch hard-rejects the proxy session. No partially-working schema mismatch, ever.</li>
+      <li>Environment enters <code>version-mismatch</code>: read-degraded, threads visible, no new dispatch. "Remote is v0.5.1, update required."</li>
+      <li>Upgrade is user-invoked and blocked while any thread has an active turn (drain-then-upgrade), or requires an explicit "interrupt N turns" confirmation.</li>
+      <li class="outcome">An older broker never downgrades a newer server; it prompts to update itself instead. Phone-direct is immune throughout: the remote serves its own matching web bundle.</li>
+    </ol>
+  </div>
+
+  <div class="card scenario-body" data-s="race">
+    <h3>Phone approves, laptop denies, same approval</h3>
+    <ol class="steps">
+      <li>Both responses race to the remote's event log (one via direct Tailscale, one via the relay).</li>
+      <li>The decider consults the pending-approval read model: first write wins <strong>at the event log</strong>, the second is rejected with a typed already-resolved error.</li>
+      <li class="outcome">The losing device shows a benign "already answered on another device". This decider fix lands in Phase 0 because the race exists locally today too.</li>
+    </ol>
+  </div>
+
+  <div class="card scenario-body" data-s="offline">
+    <h3>Host configured but unreachable</h3>
+    <ol class="steps">
+      <li>Per-host connection policy (default <strong>on-demand</strong>) means no N-tunnel fan-out storm on every app launch or wake.</li>
+      <li>The host renders from local config as a quiet "offline — tap to connect" row with a connectivity badge. No recurring toasts.</li>
+      <li>Its thread list appears only while connected; the local server never caches or mirrors remote read models.</li>
+      <li class="outcome">Deep links into that environment render "lives on vps-1, reconnecting" as the loading state instead of a 404.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ═══════════ PHASING ═══════════ -->
+<section data-panel="phasing">
+  <h2>Phasing</h2>
+  <p class="lede">Four phases, each independently valuable and shippable. Nothing depends on a big-bang merge.</p>
+
+  <div class="phase">
+    <div class="phase-marker"><span class="phase-pill">PHASE 0</span></div>
+    <div class="card">
+      <h3>Standalone fixes <span class="ship">ships alone · small PRs</span></h3>
+      <ul>
+        <li>Policy-driven auth enforcement (fixes the unauthenticated-socket gap in main)</li>
+        <li>Pairing client: <code>/pair</code> route, auth-gate, locally generated QR</li>
+        <li><code>--trusted-origin</code>, Secure cookies, <code>randomUUID</code> guards</li>
+        <li>Approval idempotency at the decider</li>
+        <li>Publish server tarball as a GitHub Release asset</li>
+      </ul>
+      <p>Every item is a real bug or missing feature today, remote hosts or not.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker"><span class="phase-pill">PHASE 1</span></div>
+    <div class="card">
+      <h3>Connect to a remote by URL <span class="ship">proves the multi-server model</span></h3>
+      <ul>
+        <li>Environment-keyed <code>wsNativeApi</code>/<code>wsTransport</code> registry (series of small PRs)</li>
+        <li>Descriptor handshake, version-skew detection, <code>version-mismatch</code> UI state</li>
+        <li>Client-side aggregation keyed by <code>environmentId</code>; environment-aware deep links</li>
+        <li>"Add server by URL + token" in settings. No SSH, no broker.</li>
+      </ul>
+      <p>This alone is the OpenCode model and already useful to anyone running Synara on a box.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker"><span class="phase-pill">PHASE 2</span></div>
+    <div class="card">
+      <h3>SSH broker + bootstrap + supervisor</h3>
+      <ul>
+        <li>Host config, probe with structured readiness report, host-key confirm UI</li>
+        <li>Upload-first bootstrap, pinned Node, node-pty gate, side-by-side versioned installs</li>
+        <li>systemd/launchd supervisor, remote log surfacing</li>
+        <li>Provisioning handshake, connectivity state machine, per-host connection policy</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker"><span class="phase-pill">PHASE 3</span></div>
+    <div class="card">
+      <h3>Single-origin relay + polish</h3>
+      <ul>
+        <li><code>/env/:envId/*</code> sanitizing, auth-injecting, flow-controlled byte proxy</li>
+        <li>Two-stage "Start in" picker, cold-host onboarding, per-project defaults</li>
+        <li>Provider badges per environment, <code>tailscale serve</code> detection, multi-host QR screen</li>
+        <li>Load test: fast remote terminal against a slow browser consumer</li>
+      </ul>
+      <p>If the relay ever proves troublesome, Phase 2's port forward already enables direct-to-forwarded-port as a fallback.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ QUESTIONS ═══════════ -->
+<section data-panel="questions">
+  <h2>Open questions for the maintainer</h2>
+  <p class="lede">The genuinely contestable calls. Everything else in the proposal I'm confident defending.</p>
+
+  <div class="card">
+    <div class="q"><div class="qt">1 · <code>SYNARA_HOME</code> sharing model</div><div class="qa">One shared home per remote box (unified thread store, phone sees everything, but version becomes a contended host-level property across brokers) versus one per broker identity (no contention, but the shared Mac Studio's thread store forks). Proposal defaults to shared; which do you want?</div></div>
+    <div class="q"><div class="qt">2 · Busy remote on an old version</div><div class="qa">Read-degraded until the user drains and upgrades, or should the broker surface the remote's direct URL so an out-of-date-but-busy remote stays fully usable until idle?</div></div>
+    <div class="q"><div class="qt">3 · Scope ownership</div><div class="qa">The full design is a 4–8+ week arc and SSH bootstrap is the highest support-burden tier. Comfortable with incremental external contribution starting at Phase 0/1, gating the broker tier on those proving out?</div></div>
+    <div class="q"><div class="qt">4 · macOS headless setup</div><div class="qa">Mac Studio as a host needs one-time manual steps (auto-login or LaunchDaemon, Full Disk Access for sshd). Document rather than automate in v1?</div></div>
+    <div class="q"><div class="qt">5 · Publishing</div><div class="qa">GitHub Releases only (fully self-hosted, fork-friendly) or also a scoped npm package? Bare <code>synara</code> on npm is squatted either way.</div></div>
+    <div class="q"><div class="qt">6 · Tailscale positioning</div><div class="qa">Bless <code>tailscale serve</code> as the recommended phone path (best UX, third-party dependency) with SSH port-forward as the always-works fallback, or keep Tailscale strictly optional?</div></div>
+  </div>
+
+  <p class="footnote">Full spec: <code>docs/superpowers/specs/2026-07-16-remote-hosts-design.md</code> · Prior art: <a href="https://developers.openai.com/codex/remote-connections">Codex remote connections</a> · <a href="https://github.com/anomalyco/opencode/issues/7790">OpenCode #7790</a> · <a href="https://github.com/pingdotgg/t3code">T3 Code</a></p>
+</section>
+
+</div>
+<script>
+  const tabs = document.getElementById('tabs');
+  tabs.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-tab]');
+    if (!btn) return;
+    tabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+    document.querySelectorAll('section[data-panel]').forEach(s =>
+      s.classList.toggle('active', s.dataset.panel === btn.dataset.tab));
+    window.scrollTo({ top: 0 });
+  });
+  const sc = document.getElementById('scenarios');
+  sc.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-s]');
+    if (!btn) return;
+    sc.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+    document.querySelectorAll('.scenario-body').forEach(d =>
+      d.classList.toggle('active', d.dataset.s === btn.dataset.s));
+  });
+</script>
+</body>
+</html>
