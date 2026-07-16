@@ -55,5 +55,3 @@ Each phase ships on its own:
 4. macOS as a remote host needs some one-time manual setup (auto-login or a LaunchDaemon, Full Disk Access for sshd). OK to document rather than automate in v1?
 5. Publishing: GitHub Releases only, or also npm? The bare `synara` npm name is taken, so it'd be a scoped package either way.
 6. Is recommending Tailscale as the blessed phone path acceptable, with plain SSH port-forward as the always-works fallback?
-
-If the direction looks good I'll open the Phase 0 PRs right away.
