@@ -26,7 +26,7 @@ The composer gets a "Start in" picker (environment, then that environment's proj
 
 And because the remote is a normal Synara server serving its own web bundle, **phone access comes for free**: connect directly to it over Tailscale (ideally `tailscale serve` for HTTPS). Laptop asleep is irrelevant, the session lives on the VPS. No hosted infrastructure needed anywhere, which matters since Synara doesn't have a domain like t3.codes and I think staying fully self-hosted is a feature.
 
-The full spec (with the failure-mode analysis: connectivity state machine, version skew policy, flow control on the proxy, cookie handling, deep links) is in `docs/superpowers/specs/2026-07-16-remote-hosts-design.md` on my fork: <LINK>
+The full spec (with the failure-mode analysis: connectivity state machine, version skew policy, flow control on the proxy, cookie handling, deep links) is in `docs/superpowers/specs/2026-07-16-remote-hosts-design.md` on my fork: https://github.com/aristotl-dylan/synara/blob/remote-hosts-rfc/docs/superpowers/specs/2026-07-16-remote-hosts-design.md
 
 ## Things I found along the way that are worth fixing regardless
 
