@@ -58,7 +58,7 @@ import { resolveFavicon, tryParseHost } from "./siteFaviconCache";
 import {
   ifNoneMatchSatisfies,
   isSidecarRequestPath,
-  negotiateStaticEncodings,
+  negotiateStaticEncodingPreference,
   staticCacheControl,
   staticEtag,
 } from "./staticAssets";
@@ -1145,6 +1145,29 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
       candidate === staticRoot ||
       candidate.startsWith(staticRoot.endsWith(path.sep) ? staticRoot : `${staticRoot}${path.sep}`);
 
+    // Lexical containment is not containment: stat and readFile follow
+    // symlinks, so a link inside the root pointing outside it would be served.
+    // Canonicalize before opening anything. The root itself is canonicalized
+    // too, otherwise a symlinked staticDir would fail its own check.
+    const canonicalStaticRoot = yield* fileSystem
+      .realPath(staticRoot)
+      .pipe(Effect.catch(() => Effect.succeed(staticRoot)));
+    const isWithinCanonicalRoot = (candidate: string) =>
+      candidate === canonicalStaticRoot ||
+      candidate.startsWith(
+        canonicalStaticRoot.endsWith(path.sep)
+          ? canonicalStaticRoot
+          : `${canonicalStaticRoot}${path.sep}`,
+      );
+    const resolvesInsideRoot = Effect.fn(function* (candidate: string) {
+      const real = yield* fileSystem
+        .realPath(candidate)
+        .pipe(Effect.catch(() => Effect.succeed(null)));
+      // A path that cannot be canonicalized does not exist; the caller's own
+      // stat/readFile will fail it, and refusing here keeps 404 semantics.
+      return real === null ? false : isWithinCanonicalRoot(real);
+    });
+
     let filePath = path.resolve(staticRoot, relativePath);
     if (!isWithinStaticRoot(filePath)) {
       return HttpServerResponse.text("Invalid static file path", { status: 400 });
@@ -1173,6 +1196,9 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
       const contentType =
         baseContentType === "text/html" ? "text/html; charset=utf-8" : baseContentType;
       const respond = Effect.fn(function* (servedPath: string, encoding?: string) {
+        // Canonicalize before opening: a symlink inside the root pointing
+        // outside it passes the lexical guard but must not be served.
+        if (!(yield* resolvesInsideRoot(servedPath))) return null;
         const info = yield* fileSystem
           .stat(servedPath)
           .pipe(Effect.catch(() => Effect.succeed(null)));
@@ -1189,13 +1215,22 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
         if (!data) return null;
         return HttpServerResponse.uint8Array(data, { status: 200, contentType, headers });
       });
-      for (const candidate of negotiateStaticEncodings(request.headers["accept-encoding"])) {
+      const preference = negotiateStaticEncodingPreference(request.headers["accept-encoding"]);
+      for (const candidate of preference.candidates) {
         const sidecarPath = `${resolvedPath}${candidate.sidecarExtension}`;
         // Sidecars share the traversal guard with their source file: appending
         // an extension cannot escape the root, but keep the invariant explicit.
         if (!isWithinStaticRoot(sidecarPath)) continue;
         const sidecarResponse = yield* respond(sidecarPath, candidate.encoding);
         if (sidecarResponse) return sidecarResponse;
+      }
+      // No acceptable sidecar and the client excluded identity: RFC 9110
+      // §12.5.3 makes this a 406 rather than a body it said it cannot use.
+      if (!preference.identityAcceptable) {
+        return HttpServerResponse.text("Not Acceptable", {
+          status: 406,
+          headers: { Vary: "Accept-Encoding" },
+        });
       }
       return yield* respond(resolvedPath);
     });

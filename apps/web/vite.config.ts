@@ -132,6 +132,15 @@ function precompressPlugin(): Plugin {
       // builds, but partial/watch builds would otherwise serve a stale
       // compressed body under a current filename.
       const removeStale = (sidecarPath: string) => fs.rm(sidecarPath, { force: true });
+      // Write to a temp file and rename: a watch-build server reading a
+      // sidecar mid-write would otherwise get a truncated compressed stream.
+      // Rename is atomic within a directory, so readers see either the old
+      // sidecar or the complete new one.
+      const writeSidecarAtomically = async (sidecarPath: string, data: Buffer) => {
+        const tempPath = `${sidecarPath}.tmp`;
+        await fs.writeFile(tempPath, data);
+        await fs.rename(tempPath, sidecarPath);
+      };
       let sidecarCount = 0;
       await Promise.all(
         files.map(async (file) => {
@@ -155,10 +164,10 @@ function precompressPlugin(): Plugin {
           ]);
           await Promise.all([
             gzipped.byteLength < source.byteLength
-              ? fs.writeFile(`${file}.gz`, gzipped)
+              ? writeSidecarAtomically(`${file}.gz`, gzipped)
               : removeStale(`${file}.gz`),
             brotlied.byteLength < source.byteLength
-              ? fs.writeFile(`${file}.br`, brotlied)
+              ? writeSidecarAtomically(`${file}.br`, brotlied)
               : removeStale(`${file}.br`),
           ]);
           sidecarCount += 1;

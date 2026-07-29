@@ -10,6 +10,7 @@ import {
   STATIC_REVALIDATE_CACHE_CONTROL,
   ifNoneMatchSatisfies,
   isSidecarRequestPath,
+  negotiateStaticEncodingPreference,
   negotiateStaticEncodings,
   staticCacheControl,
   staticEtag,
@@ -45,14 +46,42 @@ describe("negotiateStaticEncodings", () => {
     expect(encodings("*;q=0")).toEqual([]);
   });
 
-  it("ignores unknown encodings and malformed q parameters", () => {
+  it("ignores unknown encodings and rejects malformed q parameters", () => {
     expect(encodings("x-gzip, deflate")).toEqual([]);
-    expect(encodings("gzip;q=")).toEqual(["gzip"]);
     expect(encodings("identity")).toEqual([]);
+    // Out-of-grammar weights are not valid qvalues, so the entry is ignored
+    // rather than treated as fully acceptable.
+    expect(encodings("gzip;q=")).toEqual([]);
+    expect(encodings("gzip;q=2")).toEqual([]);
+    expect(encodings("gzip;q=bogus")).toEqual([]);
+    expect(encodings("gzip;q=1.0001")).toEqual([]);
+  });
+
+  it("ranks by client weight before server preference", () => {
+    expect(encodings("br;q=0.1, gzip;q=1")).toEqual(["gzip", "br"]);
+    expect(encodings("br;q=1, gzip;q=0.5")).toEqual(["br", "gzip"]);
+    // Equal weights fall back to server preference (brotli first).
+    expect(encodings("gzip;q=0.5, br;q=0.5")).toEqual(["br", "gzip"]);
+    // An explicit weight beats the wildcard for the same encoding.
+    expect(encodings("*;q=1, br;q=0.2")).toEqual(["gzip", "br"]);
   });
 
   it("parses whitespace and case variations", () => {
     expect(encodings(" GZip ;q=1.0 , BR ")).toEqual(["br", "gzip"]);
+  });
+});
+
+describe("negotiateStaticEncodingPreference identity handling", () => {
+  const identityOk = (header: string | undefined) =>
+    negotiateStaticEncodingPreference(header).identityAcceptable;
+
+  it("treats identity as acceptable unless explicitly excluded", () => {
+    expect(identityOk(undefined)).toBe(true);
+    expect(identityOk("gzip, br")).toBe(true);
+    expect(identityOk("identity;q=0")).toBe(false);
+    expect(identityOk("*;q=0")).toBe(false);
+    // An explicit identity weight outranks a zero wildcard.
+    expect(identityOk("*;q=0, identity;q=1")).toBe(true);
   });
 });
 
@@ -74,6 +103,9 @@ describe("isSidecarRequestPath", () => {
   it("flags sidecar extensions and nothing else", () => {
     expect(isSidecarRequestPath("assets/app.js.br")).toBe(true);
     expect(isSidecarRequestPath("assets/app.js.gz")).toBe(true);
+    // Case-insensitive filesystems resolve .BR/.GZ to the real sidecar.
+    expect(isSidecarRequestPath("assets/app.js.BR")).toBe(true);
+    expect(isSidecarRequestPath("assets/app.js.Gz")).toBe(true);
     expect(isSidecarRequestPath("assets/app.js")).toBe(false);
     expect(isSidecarRequestPath("archive.tar.gz.txt")).toBe(false);
   });
@@ -84,6 +116,9 @@ describe("ifNoneMatchSatisfies", () => {
 
   it("matches a single tag, a list member, and the wildcard", () => {
     expect(ifNoneMatchSatisfies(etag, etag)).toBe(true);
+    // RFC 9110 weak comparison ignores the W/ prefix on either side.
+    expect(ifNoneMatchSatisfies(etag.slice(2), etag)).toBe(true);
+    expect(ifNoneMatchSatisfies(`W/"other", ${etag.slice(2)}`, etag)).toBe(true);
     expect(ifNoneMatchSatisfies(`W/"other", ${etag}`, etag)).toBe(true);
     expect(ifNoneMatchSatisfies("*", etag)).toBe(true);
   });

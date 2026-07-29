@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -390,6 +390,60 @@ describe("production Effect HTTP routes", () => {
         const response = await fetch(`${origin}${direct}`);
         expect(response.status, direct).toBe(404);
       }
+    });
+  });
+
+  it("refuses symlinks that escape the static root", async () => {
+    const parentDir = makeTempDir("synara-effect-static-");
+    const staticDir = path.join(parentDir, "static");
+    mkdirSync(path.join(staticDir, "assets"), { recursive: true });
+    writeFileSync(path.join(staticDir, "index.html"), "<main>Synara shell</main>");
+    const secretPath = path.join(parentDir, "secret.js");
+    writeFileSync(secretPath, "outside root");
+    writeFileSync(`${secretPath}.gz`, zlib.gzipSync("outside root"));
+    // Lexically inside the root, physically outside it — the guard must
+    // canonicalize before opening rather than trusting the prefix.
+    symlinkSync(secretPath, path.join(staticDir, "assets", "leak.js"));
+    symlinkSync(`${secretPath}.gz`, path.join(staticDir, "assets", "leak-sidecar.js.gz"));
+    writeFileSync(path.join(staticDir, "assets", "leak-sidecar.js"), "inside root");
+
+    await withEffectServer(makeConfig({ staticDir }), { kind: "static" }, async (origin) => {
+      // The escaping source falls through to the SPA shell, never the target.
+      const escaped = await fetch(`${origin}/assets/leak.js`);
+      const escapedBody = await escaped.text();
+      expect(escapedBody).not.toContain("outside root");
+
+      // A sidecar that escapes is skipped; the in-root source is still served.
+      const sidecarEscape = await fetch(`${origin}/assets/leak-sidecar.js`, {
+        headers: { "accept-encoding": "gzip" },
+      });
+      expect(sidecarEscape.headers.get("content-encoding")).toBeNull();
+      await expect(sidecarEscape.text()).resolves.toBe("inside root");
+    });
+  });
+
+  it("returns 406 when no acceptable encoding exists and identity is excluded", async () => {
+    const staticDir = makeTempDir("synara-effect-static-");
+    mkdirSync(path.join(staticDir, "assets"), { recursive: true });
+    const source = "globalThis.synara = true;".repeat(64);
+    writeFileSync(path.join(staticDir, "index.html"), "<main>Synara shell</main>");
+    writeFileSync(path.join(staticDir, "assets", "plain-def456.js"), source);
+
+    await withEffectServer(makeConfig({ staticDir }), { kind: "static" }, async (origin) => {
+      // No sidecars on disk and identity refused: nothing is servable.
+      const refused = await fetch(`${origin}/assets/plain-def456.js`, {
+        headers: { "accept-encoding": "identity;q=0" },
+      });
+      expect(refused.status).toBe(406);
+      expect(refused.headers.get("vary")).toBe("Accept-Encoding");
+
+      // Same exclusion, but a sidecar the client accepts exists → 200.
+      writeFileSync(path.join(staticDir, "assets", "plain-def456.js.gz"), zlib.gzipSync(source));
+      const served = await fetch(`${origin}/assets/plain-def456.js`, {
+        headers: { "accept-encoding": "gzip, identity;q=0" },
+      });
+      expect(served.status).toBe(200);
+      expect(served.headers.get("content-encoding")).toBe("gzip");
     });
   });
 
