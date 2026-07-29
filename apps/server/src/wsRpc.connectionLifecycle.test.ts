@@ -516,6 +516,8 @@ describe("websocket permessage-deflate negotiation", () => {
         "/ws//bootstrap",
         "/ws/%62ootstrap",
         "/ws/bootstrap;sid=1",
+        // Absolute-form targets cannot be expressed through a ws:// client
+        // URL; nodeHttpServer.upgradePath.test.ts covers them directly.
       ]) {
         const socket = await connect(`${server.origin}${alias}`, { perMessageDeflate: true });
         expect(socket.extensions, alias).not.toContain("permessage-deflate");

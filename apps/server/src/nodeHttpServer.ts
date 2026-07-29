@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { ListenOptions, Socket } from "node:net";
 
+import { WS_FEATURE_PATH } from "@synara/contracts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Effect, Scope } from "effect";
 import * as HttpServer from "effect/unstable/http/HttpServer";
@@ -36,9 +37,11 @@ function protectClientSocket(socket: Socket): void {
  * UUIDs, event envelopes), which is the best case for DEFLATE with context
  * takeover: the compression window is shared across frames, so each frame is
  * coded against the vocabulary of everything sent before it. Context takeover
- * stays enabled (the negotiated default); a client that offers
- * no-context-takeover still gets standard-compliant compression, just without
- * the shared-window win.
+ * stays enabled (the negotiated default). A client offering
+ * `client_no_context_takeover` still compresses normally; one offering
+ * `server_no_context_takeover` loses the shared vocabulary and can end up
+ * with frames slightly larger than uncompressed, since framing overhead
+ * exceeds the gain on a single small frame.
  *
  * No `threshold` is set: `ws` only honors it when context takeover is
  * disabled, and skipping tiny frames would also skip priming the shared
@@ -55,19 +58,22 @@ function protectClientSocket(socket: Socket): void {
  * without credentials. Compression is a post-authentication privilege so
  * unauthenticated connections cannot multiply per-connection memory.
  *
- * Measured on a simulated streaming turn (2k push frames x 8 clients,
- * ~430B repetitive JSON frames): 80.7% wire reduction at ~65us CPU per
- * send — dominated by per-invocation zlib overhead, not compression level
- * (levels 1/3/6 within 2% on both axes), so zlib options stay at defaults.
+ * Measured on a simulated streaming turn of small repetitive JSON frames:
+ * ~80% wire reduction, with CPU dominated by per-invocation zlib overhead
+ * rather than compression level (levels 1/3/6 within 2% on both axes), so
+ * zlib options stay at their defaults. Numbers in the PR that added this.
+ *
+ * `ws` already defaults `concurrencyLimit` to 10 and creates its limiter
+ * once per process on the first PerMessageDeflate instance, so passing it
+ * here would pin the default rather than bound anything new.
  */
-const PER_MESSAGE_DEFLATE_OPTIONS = {
-  // Bound zlib concurrency so a burst of streaming pushes across many
-  // connections cannot pile up unbounded deflate work on the event loop.
-  concurrencyLimit: 10,
-} as const;
+const PER_MESSAGE_DEFLATE_OPTIONS = true;
 
-/** The one upgrade route allowed to negotiate compression (post-auth). */
-const COMPRESSED_UPGRADE_PATH = "/ws";
+/**
+ * The one upgrade route allowed to negotiate compression (post-auth). Shared
+ * with the route registration so the dispatcher and the router cannot drift.
+ */
+const COMPRESSED_UPGRADE_PATH = WS_FEATURE_PATH;
 
 /**
  * Normalizes a raw request target the way the Effect router does before route
