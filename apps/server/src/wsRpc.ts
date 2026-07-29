@@ -897,6 +897,10 @@ const makeWsRpcHandlersLayer = () =>
               threadId: input.threadId,
             },
             makeCursorSafeSnapshotLiveStream({
+              // Cursor resume: a client holding cached detail replays only the
+              // gap. Out-of-range cursors (negative or overflowing gap) fall
+              // back to the snapshot inside the stream factory.
+              resumeFromSequence: input.afterSequence,
               onResnapshotRequired: (report) =>
                 recordThreadResnapshotRequired(input.threadId, report),
               subscribeLive: orchestrationEngine.subscribeDomainEvents.pipe(

@@ -10,6 +10,12 @@ export type SnapshotLiveStreamItem<Snapshot> =
 /**
  * Attach live delivery first, capture a snapshot and durable high-water fence,
  * replay the exact gap, then continue with strictly newer live events.
+ *
+ * When `resumeFromSequence` is provided and the gap to the durable head is
+ * non-negative and within the replay limit, the snapshot is skipped entirely
+ * and only the gap is replayed. A negative gap (client cursor ahead of the
+ * server head — restored backup or reset database) or an overflowing gap is
+ * never trusted: both fall back to the full snapshot path.
  */
 export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
   readonly subscribeLive: Effect.Effect<Stream.Stream<OrchestrationEvent, E>, never, Scope.Scope>;
@@ -20,6 +26,7 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
     fromSequenceExclusive: number,
     throughSequenceInclusive: number,
   ) => Stream.Stream<OrchestrationEvent, E>;
+  readonly resumeFromSequence?: number | undefined;
   readonly onResnapshotRequired?: (report: {
     readonly snapshotSequence: number;
     readonly highWaterSequence: number;
@@ -35,6 +42,28 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
       const live = yield* input.subscribeLive;
       const liveQueue = yield* Queue.bounded<OrchestrationEvent, E | Cause.Done>(1);
       yield* Stream.runIntoQueue(live, liveQueue).pipe(Effect.forkScoped);
+      if (input.resumeFromSequence !== undefined) {
+        // The head is read after the live attach, so replay through the head
+        // plus live-after-fence covers every event exactly once — the same
+        // fence discipline as the snapshot path, with the cursor standing in
+        // for the snapshot sequence.
+        const resumeFromSequence = input.resumeFromSequence;
+        const highWaterSequence = yield* input.getHighWaterSequence;
+        const resumeGap = highWaterSequence - resumeFromSequence;
+        if (resumeGap >= 0 && resumeGap <= ORCHESTRATION_SNAPSHOT_REPLAY_LIMIT) {
+          const replay = input.replay(resumeFromSequence, highWaterSequence).pipe(
+            Stream.filter(
+              (event) => event.sequence > resumeFromSequence && event.sequence <= highWaterSequence,
+            ),
+            Stream.map((event): SnapshotLiveStreamItem<Snapshot> => ({ kind: "event", event })),
+          );
+          const liveAfterFence = Stream.fromQueue(liveQueue).pipe(
+            Stream.filter((event) => event.sequence > highWaterSequence),
+            Stream.map((event): SnapshotLiveStreamItem<Snapshot> => ({ kind: "event", event })),
+          );
+          return Stream.concat(replay, liveAfterFence);
+        }
+      }
       const snapshot = yield* input.snapshot;
       const snapshotSequence = input.snapshotSequence(snapshot);
       const highWaterSequence = yield* input.getHighWaterSequence;
