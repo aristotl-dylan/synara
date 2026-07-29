@@ -224,18 +224,19 @@ const NEGOTIATE_HTTP_TIMEOUT_MS = 5_000;
  */
 export async function negotiateOverHttp(
   explicitUrl: string | null,
+  lifetimeSignal?: AbortSignal,
 ): Promise<WsBootstrapNegotiateResult | null> {
+  // Browsers apply no default fetch timeout. Without the deadline, a
+  // connection that accepts and then stalls (the WAN/tunnel case this
+  // endpoint exists to improve) never settles, so the bootstrap fallback
+  // never runs and the transport wedges; the legacy socket path got that
+  // backstop for free from the browser's WS handshake timeout. The caller's
+  // lifetime signal is composed in so disposal aborts the request too.
+  const deadline = AbortSignal.timeout(NEGOTIATE_HTTP_TIMEOUT_MS);
+  const signal = lifetimeSignal ? AbortSignal.any([lifetimeSignal, deadline]) : deadline;
   let response: Response;
   try {
-    response = await fetch(makeNegotiateHttpUrl(explicitUrl), {
-      cache: "no-store",
-      // Browsers apply no default fetch timeout. Without this, a connection
-      // that accepts and then stalls (the WAN/tunnel case this endpoint
-      // exists to improve) never settles, so the bootstrap fallback never
-      // runs and the transport wedges. The legacy socket path got this
-      // backstop for free from the browser's WS handshake timeout.
-      signal: AbortSignal.timeout(NEGOTIATE_HTTP_TIMEOUT_MS),
-    });
+    response = await fetch(makeNegotiateHttpUrl(explicitUrl), { cache: "no-store", signal });
   } catch {
     return null;
   }
@@ -553,6 +554,9 @@ export class WsTransport {
   >();
   private runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never> | null = null;
   private clientScope: Scope.Closeable | null = null;
+  // Aborted by dispose() so an in-flight HTTP negotiation cannot outlive the
+  // transport and resurrect a runtime after teardown returned.
+  private readonly lifetime = new AbortController();
   private clientPromise: Promise<RpcClientInstance>;
   private reconnectPromise: Promise<RpcClientInstance> | null = null;
   private reconnectFailures = 0;
@@ -761,6 +765,9 @@ export class WsTransport {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    // Abort before anything else: a pending negotiate must fail now rather
+    // than resolve later and build a runtime this teardown will not see.
+    this.lifetime.abort();
     this.setState("disposed");
     this.resetAllStreamCapacityRetries();
     this.resetAllStreamCompletionRetries();
@@ -787,8 +794,13 @@ export class WsTransport {
    * it fall back to the legacy `/ws/bootstrap` socket round trip.
    */
   private async negotiateCompatibility(): Promise<WsBootstrapNegotiateResult> {
-    const httpResult = await negotiateOverHttp(this.explicitUrl);
+    const httpResult = await negotiateOverHttp(this.explicitUrl, this.lifetime.signal);
     if (httpResult) return httpResult;
+    // dispose() may have run while the request was in flight; it captured a
+    // null runtime and returned, so building one here would strand it.
+    if (this.disposed) {
+      throw new Error("WebSocket transport was disposed during negotiation.");
+    }
     const runtime = ManagedRuntime.make(
       makeProtocolLayer(makeSocketUrl(this.explicitUrl, WS_BOOTSTRAP_PATH)),
     );

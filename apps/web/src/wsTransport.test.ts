@@ -816,6 +816,58 @@ describe("WsTransport", () => {
     await expect(negotiateOverHttp("ws://localhost:3020")).resolves.toBeNull();
   }, 10_000);
 
+  it("aborts a stalled negotiate when the caller's lifetime signal fires", async () => {
+    const controller = new AbortController();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_input: unknown, init?: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("The operation was aborted.", "AbortError")),
+            );
+          }),
+      ),
+    );
+
+    const negotiation = negotiateOverHttp("ws://localhost:3020", controller.signal);
+    controller.abort();
+    // Resolves well before the 5s deadline because disposal, not the timeout,
+    // ended the request.
+    await expect(negotiation).resolves.toBeNull();
+  });
+
+  it("does not create a bootstrap socket when disposed during negotiation", async () => {
+    // dispose() captures a null runtime and returns while the HTTP request is
+    // still pending; the transport must not build one afterwards.
+    let abortNegotiation: (() => void) | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_input: unknown, init?: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            abortNegotiation = () =>
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            init?.signal?.addEventListener("abort", () => abortNegotiation?.());
+          }),
+      ),
+    );
+
+    const transport = new WsTransport();
+    // Any request drives the connect path, which begins with HTTP negotiation.
+    const connecting = transport
+      .request(ORCHESTRATION_WS_METHODS.unsubscribeShell, {})
+      .catch(() => null);
+    await Promise.resolve();
+    const socketsBefore = sockets.length;
+
+    await transport.dispose();
+    await connecting;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(sockets.length).toBe(socketsBefore);
+  }, 10_000);
+
   it("uses the desktop bridge URL before falling back to the browser location", async () => {
     const getWsUrl = vi.fn().mockReturnValue("ws://127.0.0.1:53036/?token=old");
     Object.defineProperty(globalThis, "window", {

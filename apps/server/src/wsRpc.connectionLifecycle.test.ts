@@ -513,6 +513,7 @@ describe("websocket RPC payload admission", () => {
       expect(untrusted.status).toBe(403);
       expect(untrusted.headers.get("access-control-allow-origin")).toBeNull();
       expect(untrusted.headers.get("cache-control")).toBe("no-store");
+      expect(untrusted.headers.get("vary")).toBe("Origin");
 
       // A lookalike of the desktop scheme is not the desktop scheme.
       const lookalike = await fetch(negotiateHttpUrl(server), {
