@@ -125,11 +125,13 @@ function makeRpcFrame(totalBytes: number, requestId: string): string {
 function sendFragment(
   socket: WebSocket,
   data: string,
-  options: { readonly fin: boolean },
+  options: { readonly fin: boolean; readonly compress?: boolean },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    socket.send(data, { binary: false, compress: false, fin: options.fin }, (error) =>
-      error ? reject(error) : resolve(),
+    socket.send(
+      data,
+      { binary: false, compress: options.compress ?? false, fin: options.fin },
+      (error) => (error ? reject(error) : resolve()),
     );
   });
 }
@@ -276,9 +278,20 @@ async function startTestServer(): Promise<RunningTestServer> {
       ),
     ),
   );
-  const routeLayer = makeWebsocketRpcRouteLayer(rpcHttpEffectSource).pipe(
-    Layer.provide(Layer.succeed(WsConnectionSessions, connectionSessions)),
+  // Minimal bootstrap-path route: which underlying ws server (compressed vs
+  // uncompressed) handles an upgrade is decided by path in nodeHttpServer, so
+  // the route handler itself can be the plain RPC effect.
+  const bootstrapRouteLayer = Layer.effectDiscard(
+    Effect.gen(function* () {
+      const httpEffect = yield* rpcHttpEffectSource;
+      const router = yield* HttpRouter.HttpRouter;
+      yield* router.add("GET", "/ws/bootstrap", httpEffect);
+    }),
   );
+  const routeLayer = Layer.merge(
+    makeWebsocketRpcRouteLayer(rpcHttpEffectSource),
+    bootstrapRouteLayer,
+  ).pipe(Layer.provide(Layer.succeed(WsConnectionSessions, connectionSessions)));
   const scope = await Effect.runPromise(Scope.make("sequential"));
   const context = await Effect.runPromise(
     Layer.buildWithScope(
@@ -476,6 +489,47 @@ describe("websocket RPC payload admission", () => {
 });
 
 describe("websocket permessage-deflate negotiation", () => {
+  it("never negotiates compression on the pre-auth bootstrap socket", async () => {
+    const server = await startTestServer();
+    try {
+      // Offer compression on the bootstrap path: the server must decline the
+      // extension (compression is a post-authentication privilege; pre-auth
+      // connections must not be able to multiply per-connection zlib memory).
+      const bootstrapSocket = await connect(`${server.origin}/ws/bootstrap`, {
+        perMessageDeflate: true,
+      });
+      expect(bootstrapSocket.extensions).not.toContain("permessage-deflate");
+      bootstrapSocket.terminate();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("closes a fragmented compressed message whose decompressed aggregate crosses the ceiling", async () => {
+    const server = await startTestServer();
+    try {
+      const connected = await connectSession(server, undefined, { perMessageDeflate: true });
+      expect(connected.socket.extensions).toContain("permessage-deflate");
+      const frame = makeRpcFrame(MAX_WEBSOCKET_MESSAGE_BYTES + 1, "204");
+      const splitAt = Math.floor(frame.length / 2);
+      const close = waitForCloseInfo(connected.socket);
+
+      await sendFragment(connected.socket, frame.slice(0, splitAt), {
+        fin: false,
+        compress: true,
+      });
+      void sendFragment(connected.socket, frame.slice(splitAt), {
+        fin: true,
+        compress: true,
+      }).catch(() => {});
+
+      await expect(close).resolves.toMatchObject({ code: 1009 });
+      expect(server.observedRpc).toEqual({ decoderCalls: 0, handlerCalls: 0 });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("negotiates compression when the client offers it and serves RPC over the compressed socket", async () => {
     const server = await startTestServer();
     try {

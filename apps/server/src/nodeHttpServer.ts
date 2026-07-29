@@ -30,26 +30,30 @@ function protectClientSocket(socket: Socket): void {
 }
 
 /**
- * permessage-deflate configuration for the WS server.
+ * permessage-deflate configuration for the feature WS socket only.
  *
  * The RPC stream is small, highly repetitive JSON (repeated schema keys,
  * UUIDs, event envelopes), which is the best case for DEFLATE with context
  * takeover: the compression window is shared across frames, so each frame is
  * coded against the vocabulary of everything sent before it. Context takeover
- * is the negotiated default and must not be disabled — per-frame compression
- * without it costs CPU for a fraction of the win on frames this small.
+ * stays enabled (the negotiated default); a client that offers
+ * no-context-takeover still gets standard-compliant compression, just without
+ * the shared-window win.
  *
  * No `threshold` is set: `ws` only honors it when context takeover is
  * disabled, and skipping tiny frames would also skip priming the shared
  * window they benefit from.
  *
  * `maxPayload` admission control is unaffected: `ws` enforces it on the
- * decompressed size, so a compressed frame cannot smuggle an oversized
- * message past the bound.
+ * decompressed size — accumulated across continuation frames — so a
+ * compressed or fragmented message cannot smuggle past the bound.
  *
- * Negotiated per connection via the standard Sec-WebSocket-Extensions
- * handshake, so clients that do not offer the extension (or explicitly
- * refuse it) continue to work uncompressed.
+ * The pre-auth bootstrap socket deliberately never negotiates compression:
+ * each actively compressed connection retains zlib window state (~288 KiB at
+ * defaults) plus potentially near-`maxPayload` inflated buffers for
+ * incomplete fragmented messages, and the bootstrap path is reachable
+ * without credentials. Compression is a post-authentication privilege so
+ * unauthenticated connections cannot multiply per-connection memory.
  *
  * Measured on a simulated streaming turn (2k push frames x 8 clients,
  * ~430B repetitive JSON frames): 80.7% wire reduction at ~65us CPU per
@@ -61,6 +65,17 @@ const PER_MESSAGE_DEFLATE_OPTIONS = {
   // connections cannot pile up unbounded deflate work on the event loop.
   concurrencyLimit: 10,
 } as const;
+
+/** Pre-auth upgrade paths that must never negotiate compression. */
+const UNCOMPRESSED_UPGRADE_PATH_PREFIX = "/ws/bootstrap";
+
+export function upgradePathAllowsCompression(requestUrl: string | undefined): boolean {
+  const pathname = (requestUrl ?? "").split("?")[0] ?? "";
+  return (
+    pathname !== UNCOMPRESSED_UPGRADE_PATH_PREFIX &&
+    !pathname.startsWith(`${UNCOMPRESSED_UPGRADE_PATH_PREFIX}/`)
+  );
+}
 
 /**
  * Owns the Node HTTP/WebSocket transport so Synara, rather than the platform
@@ -102,21 +117,26 @@ export const makeBoundedNodeHttpServer = Effect.fnUntraced(function* (
   });
 
   const address = server.address()!;
-  const webSocketServer = yield* Effect.acquireRelease(
-    Effect.sync(
-      () =>
-        new WebSocketServer({
-          noServer: true,
-          maxPayload: MAX_WEBSOCKET_MESSAGE_BYTES,
-          perMessageDeflate: PER_MESSAGE_DEFLATE_OPTIONS,
+  const makeBoundedWebSocketServer = (perMessageDeflate: boolean) =>
+    Effect.acquireRelease(
+      Effect.sync(
+        () =>
+          new WebSocketServer({
+            noServer: true,
+            maxPayload: MAX_WEBSOCKET_MESSAGE_BYTES,
+            perMessageDeflate: perMessageDeflate ? PER_MESSAGE_DEFLATE_OPTIONS : false,
+          }),
+      ),
+      (server) =>
+        Effect.callback<void>((resume) => {
+          for (const client of server.clients) client.terminate();
+          server.close(() => resume(Effect.void));
         }),
-    ),
-    (server) =>
-      Effect.callback<void>((resume) => {
-        for (const client of server.clients) client.terminate();
-        server.close(() => resume(Effect.void));
-      }),
-  ).pipe(Scope.provide(scope));
+    ).pipe(Scope.provide(scope));
+  // Two ws servers sharing one HTTP listener: compression is negotiated only
+  // on authenticated feature-socket paths (see PER_MESSAGE_DEFLATE_OPTIONS).
+  const featureWebSocketServer = yield* makeBoundedWebSocketServer(true);
+  const bootstrapWebSocketServer = yield* makeBoundedWebSocketServer(false);
 
   return HttpServer.make({
     address:
@@ -135,14 +155,32 @@ export const makeBoundedNodeHttpServer = Effect.fnUntraced(function* (
       }) as Effect.Effect<
         (nodeRequest: http.IncomingMessage, nodeResponse: http.ServerResponse) => void
       >;
-      const upgradeHandler = yield* NodeHttpServer.makeUpgradeHandler(
-        Effect.succeed(webSocketServer),
+      const featureUpgradeHandler = yield* NodeHttpServer.makeUpgradeHandler(
+        Effect.succeed(featureWebSocketServer),
         httpApp,
         {
           middleware: middleware as any,
           scope: serveScope,
         },
       );
+      const bootstrapUpgradeHandler = yield* NodeHttpServer.makeUpgradeHandler(
+        Effect.succeed(bootstrapWebSocketServer),
+        httpApp,
+        {
+          middleware: middleware as any,
+          scope: serveScope,
+        },
+      );
+      const upgradeHandler = (
+        nodeRequest: http.IncomingMessage,
+        socket: Parameters<typeof featureUpgradeHandler>[1],
+        head: Parameters<typeof featureUpgradeHandler>[2],
+      ) => {
+        const dispatch = upgradePathAllowsCompression(nodeRequest.url)
+          ? featureUpgradeHandler
+          : bootstrapUpgradeHandler;
+        dispatch(nodeRequest, socket, head);
+      };
 
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
