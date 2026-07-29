@@ -66,15 +66,47 @@ const PER_MESSAGE_DEFLATE_OPTIONS = {
   concurrencyLimit: 10,
 } as const;
 
-/** Pre-auth upgrade paths that must never negotiate compression. */
-const UNCOMPRESSED_UPGRADE_PATH_PREFIX = "/ws/bootstrap";
+/** The one upgrade route allowed to negotiate compression (post-auth). */
+const COMPRESSED_UPGRADE_PATH = "/ws";
 
+/**
+ * Normalizes a raw request target the way the Effect router does before route
+ * matching: absolute-form targets, query and fragment, `;params`, duplicate
+ * slashes, percent-encoding, case, and trailing slashes all collapse. The
+ * router matches case-insensitively on the decoded path, so comparing the raw
+ * target here would let `/WS/BOOTSTRAP` or `/ws/%62ootstrap` reach the
+ * bootstrap route while classifying as something else.
+ */
+function normalizeUpgradePath(requestUrl: string | undefined): string {
+  const target = requestUrl ?? "";
+  // Absolute-form request targets (RFC 9112 §3.2.2) are legal on upgrades.
+  const afterAuthority = /^[a-z][a-z0-9+.-]*:\/\//i.test(target)
+    ? target.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, "") || "/"
+    : target;
+  const pathOnly = afterAuthority.split("#")[0]?.split("?")[0] ?? "";
+  let decoded = pathOnly;
+  try {
+    decoded = decodeURIComponent(pathOnly);
+  } catch {
+    // Malformed percent-encoding cannot be a recognized route; leave as-is so
+    // it falls through to the uncompressed default.
+  }
+  const withoutParams = decoded
+    .split("/")
+    .map((segment) => segment.split(";")[0] ?? "")
+    .join("/");
+  const collapsed = withoutParams.replace(/\/{2,}/g, "/").toLowerCase();
+  return collapsed.length > 1 ? collapsed.replace(/\/+$/, "") : collapsed;
+}
+
+/**
+ * Fail closed: only the exact feature route negotiates compression. Anything
+ * else — the pre-auth bootstrap route, unrecognized paths, malformed targets —
+ * lands on the uncompressed server, so no unauthenticated connection can hold
+ * zlib state regardless of how its path is spelled.
+ */
 export function upgradePathAllowsCompression(requestUrl: string | undefined): boolean {
-  const pathname = (requestUrl ?? "").split("?")[0] ?? "";
-  return (
-    pathname !== UNCOMPRESSED_UPGRADE_PATH_PREFIX &&
-    !pathname.startsWith(`${UNCOMPRESSED_UPGRADE_PATH_PREFIX}/`)
-  );
+  return normalizeUpgradePath(requestUrl) === COMPRESSED_UPGRADE_PATH;
 }
 
 /**

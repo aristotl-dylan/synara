@@ -505,6 +505,27 @@ describe("websocket permessage-deflate negotiation", () => {
     }
   });
 
+  it("declines compression on every spelling the router still routes to bootstrap", async () => {
+    const server = await startTestServer();
+    try {
+      // The router matches case-insensitively and normalizes duplicate
+      // slashes, percent-encoding, and `;params`; the upgrade dispatcher must
+      // use the same semantics or an alias would reach bootstrap compressed.
+      for (const alias of [
+        "/WS/BOOTSTRAP",
+        "/ws//bootstrap",
+        "/ws/%62ootstrap",
+        "/ws/bootstrap;sid=1",
+      ]) {
+        const socket = await connect(`${server.origin}${alias}`, { perMessageDeflate: true });
+        expect(socket.extensions, alias).not.toContain("permessage-deflate");
+        socket.terminate();
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("closes a fragmented compressed message whose decompressed aggregate crosses the ceiling", async () => {
     const server = await startTestServer();
     try {
