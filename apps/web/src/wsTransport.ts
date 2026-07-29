@@ -37,7 +37,6 @@ import {
   type WsPush,
   type WsPushChannel,
   type WsPushMessage,
-  type WsBootstrapNegotiateResult,
   ThreadId,
 } from "@synara/contracts";
 import {

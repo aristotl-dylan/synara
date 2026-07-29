@@ -289,20 +289,12 @@ async function startTestServer(): Promise<RunningTestServer> {
       ),
     ),
   );
-  // Minimal bootstrap-path route: which underlying ws server (compressed vs
-  // uncompressed) handles an upgrade is decided by path in nodeHttpServer, so
-  // the route handler itself can be the plain RPC effect.
-  const bootstrapRouteLayer = Layer.effectDiscard(
-    Effect.gen(function* () {
-      const httpEffect = yield* rpcHttpEffectSource;
-      const router = yield* HttpRouter.HttpRouter;
-      yield* router.add("GET", "/ws/bootstrap", httpEffect);
-    }),
-  );
-  const routeLayer = Layer.mergeAll(
+  // The negotiation layer owns WS_BOOTSTRAP_PATH, which the compression tests
+  // also need: which underlying ws server (compressed vs uncompressed) handles
+  // an upgrade is decided by path in nodeHttpServer.
+  const routeLayer = Layer.merge(
     makeWebsocketNegotiationRouteLayer(),
     makeWebsocketRpcRouteLayer(rpcHttpEffectSource),
-    bootstrapRouteLayer,
   ).pipe(Layer.provide(Layer.succeed(WsConnectionSessions, connectionSessions)));
   const scope = await Effect.runPromise(Scope.make("sequential"));
   const context = await Effect.runPromise(
