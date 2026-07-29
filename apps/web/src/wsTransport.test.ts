@@ -854,9 +854,10 @@ describe("WsTransport", () => {
     );
 
     const transport = new WsTransport();
-    // Any request drives the connect path, which begins with HTTP negotiation.
+    // subscribeShell reaches getClient(), so the request genuinely drives the
+    // connect path rather than relying on the constructor's eager session.
     const connecting = transport
-      .request(ORCHESTRATION_WS_METHODS.unsubscribeShell, {})
+      .request(ORCHESTRATION_WS_METHODS.subscribeShell, {})
       .catch(() => null);
     await Promise.resolve();
     const socketsBefore = sockets.length;
