@@ -88,19 +88,28 @@ export function negotiateWsCompatibility(
 // The HTTP negotiate endpoint carries the same input as bootstrap.negotiate,
 // flattened into query params so the request stays a cacheable-free plain GET
 // with no body to decode before the compatibility gate runs.
+// Decimal digits only. `Number()` would accept "0x1" and "1e0", which the RPC
+// path's Schema.Int rejects — the two transports must decode identically or
+// "one negotiation, two transports" is only true for well-formed clients.
+function parseDecimalInteger(raw: string | null): number | null {
+  // No trimming: surrounding whitespace (including a `+` that decodes to a
+  // space) is not a well-formed integer on either transport.
+  if (raw === null || !/^\d+$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 export function parseWsNegotiateSearchParams(
   searchParams: URLSearchParams,
 ): WsBootstrapNegotiateInput | WsCompatibilityError {
-  const protocolEpoch = Number(searchParams.get(WS_NEGOTIATE_QUERY.protocolEpoch));
-  const minRevision = Number(searchParams.get(WS_NEGOTIATE_QUERY.minRevision));
-  const maxRevision = Number(searchParams.get(WS_NEGOTIATE_QUERY.maxRevision));
+  const protocolEpoch = parseDecimalInteger(searchParams.get(WS_NEGOTIATE_QUERY.protocolEpoch));
+  const minRevision = parseDecimalInteger(searchParams.get(WS_NEGOTIATE_QUERY.minRevision));
+  const maxRevision = parseDecimalInteger(searchParams.get(WS_NEGOTIATE_QUERY.maxRevision));
   const clientBuild = searchParams.get(WS_NEGOTIATE_QUERY.clientBuild)?.trim() ?? "";
   if (
-    !Number.isSafeInteger(protocolEpoch) ||
-    !Number.isSafeInteger(minRevision) ||
-    !Number.isSafeInteger(maxRevision) ||
-    minRevision < 0 ||
-    maxRevision < 0 ||
+    protocolEpoch === null ||
+    minRevision === null ||
+    maxRevision === null ||
     clientBuild.length === 0
   ) {
     return incompatibility(

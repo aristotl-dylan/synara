@@ -502,6 +502,60 @@ describe("websocket RPC payload admission", () => {
     }
   });
 
+  it("gates HTTP negotiation on trusted origins and reflects CORS for none else", async () => {
+    const server = await startTestServer();
+    try {
+      // An untrusted origin must be refused before any negotiation data is
+      // produced, and must never see an Access-Control-Allow-Origin header.
+      const untrusted = await fetch(negotiateHttpUrl(server), {
+        headers: { origin: "http://evil.example" },
+      });
+      expect(untrusted.status).toBe(403);
+      expect(untrusted.headers.get("access-control-allow-origin")).toBeNull();
+      expect(untrusted.headers.get("cache-control")).toBe("no-store");
+
+      // A lookalike of the desktop scheme is not the desktop scheme.
+      const lookalike = await fetch(negotiateHttpUrl(server), {
+        headers: { origin: "synara://app.evil.com" },
+      });
+      expect(lookalike.status).toBe(403);
+      expect(lookalike.headers.get("access-control-allow-origin")).toBeNull();
+
+      // The desktop origin is reflected, and only that origin.
+      const desktop = await fetch(negotiateHttpUrl(server), {
+        headers: { origin: "synara://app" },
+      });
+      expect(desktop.status).toBe(200);
+      expect(desktop.headers.get("access-control-allow-origin")).toBe("synara://app");
+      expect(desktop.headers.get("vary")).toBe("Origin");
+
+      // No Origin at all (CLI clients) passes without reflection, matching
+      // the WS upgrade's own behavior.
+      const noOrigin = await fetch(negotiateHttpUrl(server));
+      expect(noOrigin.status).toBe(200);
+      expect(noOrigin.headers.get("access-control-allow-origin")).toBeNull();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects numeric negotiation params the RPC schema would reject", async () => {
+    const server = await startTestServer();
+    try {
+      // Number() accepts hex and exponential notation; Schema.Int does not.
+      // The two transports must decode identically.
+      for (const raw of ["0x1", "1e0", " 1 ", "+1", "1.0"]) {
+        const response = await fetch(
+          negotiateHttpUrl(server, { [WS_NEGOTIATE_QUERY.minRevision]: raw }),
+        );
+        expect(response.status, raw).toBe(426);
+        expect(await response.json(), raw).toMatchObject({ code: "WS_NEGOTIATION_REQUIRED" });
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("keeps the legacy bootstrap socket negotiating for older clients", async () => {
     const server = await startTestServer();
     try {

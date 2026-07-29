@@ -797,6 +797,25 @@ describe("WsTransport", () => {
     await expect(negotiateOverHttp("ws://localhost:3020")).resolves.toBeNull();
   });
 
+  it("falls back to bootstrap when the negotiate request never settles", async () => {
+    // A connection that accepts and then stalls (WAN/tunnel black hole) must
+    // not wedge the transport: browsers apply no default fetch timeout, so
+    // without an abort signal the bootstrap fallback would never run.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_input: unknown, init?: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("The operation was aborted.", "AbortError")),
+            );
+          }),
+      ),
+    );
+
+    await expect(negotiateOverHttp("ws://localhost:3020")).resolves.toBeNull();
+  }, 10_000);
+
   it("uses the desktop bridge URL before falling back to the browser location", async () => {
     const getWsUrl = vi.fn().mockReturnValue("ws://127.0.0.1:53036/?token=old");
     Object.defineProperty(globalThis, "window", {

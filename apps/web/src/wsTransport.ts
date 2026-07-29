@@ -212,6 +212,9 @@ export function makeNegotiateHttpUrl(explicitUrl: string | null): string {
   return url.toString();
 }
 
+/** Bounded so a stalled negotiate falls back to bootstrap instead of hanging. */
+const NEGOTIATE_HTTP_TIMEOUT_MS = 5_000;
+
 /**
  * Negotiates compatibility over plain HTTP so a connect costs exactly one
  * WebSocket handshake. Returns null when the server does not expose the
@@ -224,7 +227,15 @@ export async function negotiateOverHttp(
 ): Promise<WsBootstrapNegotiateResult | null> {
   let response: Response;
   try {
-    response = await fetch(makeNegotiateHttpUrl(explicitUrl), { cache: "no-store" });
+    response = await fetch(makeNegotiateHttpUrl(explicitUrl), {
+      cache: "no-store",
+      // Browsers apply no default fetch timeout. Without this, a connection
+      // that accepts and then stalls (the WAN/tunnel case this endpoint
+      // exists to improve) never settles, so the bootstrap fallback never
+      // runs and the transport wedges. The legacy socket path got this
+      // backstop for free from the browser's WS handshake timeout.
+      signal: AbortSignal.timeout(NEGOTIATE_HTTP_TIMEOUT_MS),
+    });
   } catch {
     return null;
   }

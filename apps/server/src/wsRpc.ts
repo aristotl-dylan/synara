@@ -1873,7 +1873,12 @@ function makeWsNegotiateHttpRouteLayer() {
           const config = yield* ServerConfig;
           const url = trustedWebSocketRequestUrl(request, config);
           if (!url) {
-            return HttpServerResponse.text("Forbidden", { status: 403 });
+            // Same no-store discipline as the negotiated responses: an
+            // intermediary must never cache a refusal keyed on our behalf.
+            return HttpServerResponse.text("Forbidden", {
+              status: 403,
+              headers: { "Cache-Control": "no-store", Vary: "Origin" },
+            });
           }
           // The desktop app fetches cross-origin (synara://app); reflect only
           // origins the WS upgrade itself would trust.
