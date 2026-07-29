@@ -1,6 +1,17 @@
 import http from "node:http";
 
-import type { AuthSessionId } from "@synara/contracts";
+import {
+  WS_BOOTSTRAP_METHOD,
+  WS_BOOTSTRAP_PATH,
+  WS_COMPATIBILITY_QUERY,
+  WS_NEGOTIATE_HTTP_PATH,
+  WS_NEGOTIATE_QUERY,
+  WS_PROTOCOL_EPOCH,
+  WS_PROTOCOL_MAX_REVISION,
+  WS_PROTOCOL_MIN_REVISION,
+  type AuthSessionId,
+  type WsBootstrapNegotiateResult,
+} from "@synara/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Duration, Effect, Exit, Layer, Schema, Scope } from "effect";
 import { HttpRouter, HttpServerRequest } from "effect/unstable/http";
@@ -21,7 +32,7 @@ import {
 import { ServerConfig } from "./config";
 import { makeBoundedNodeHttpServer, MAX_WEBSOCKET_MESSAGE_BYTES } from "./nodeHttpServer";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
-import { makeWebsocketRpcRouteLayer } from "./wsRpc";
+import { makeWebsocketNegotiationRouteLayer, makeWebsocketRpcRouteLayer } from "./wsRpc";
 import {
   makeWsConnectionSessions,
   WS_CONNECTION_SESSION_HEADER,
@@ -288,7 +299,8 @@ async function startTestServer(): Promise<RunningTestServer> {
       yield* router.add("GET", "/ws/bootstrap", httpEffect);
     }),
   );
-  const routeLayer = Layer.merge(
+  const routeLayer = Layer.mergeAll(
+    makeWebsocketNegotiationRouteLayer(),
     makeWebsocketRpcRouteLayer(rpcHttpEffectSource),
     bootstrapRouteLayer,
   ).pipe(Layer.provide(Layer.succeed(WsConnectionSessions, connectionSessions)));
@@ -364,6 +376,36 @@ function featureSocketUrl(server: RunningTestServer, token: string): string {
   return `${server.origin}/ws?${searchParams.toString()}`;
 }
 
+function negotiateHttpUrl(
+  server: RunningTestServer,
+  overrides?: Readonly<Record<string, string>>,
+): string {
+  const searchParams = new URLSearchParams({
+    [WS_NEGOTIATE_QUERY.clientBuild]: "test-client",
+    [WS_NEGOTIATE_QUERY.protocolEpoch]: String(WS_PROTOCOL_EPOCH),
+    [WS_NEGOTIATE_QUERY.minRevision]: String(WS_PROTOCOL_MIN_REVISION),
+    [WS_NEGOTIATE_QUERY.maxRevision]: String(WS_PROTOCOL_MAX_REVISION),
+    ...overrides,
+  });
+  const httpOrigin = server.origin.replace(/^ws:/, "http:");
+  return `${httpOrigin}${WS_NEGOTIATE_HTTP_PATH}?${searchParams.toString()}`;
+}
+
+function featureSocketUrlFromNegotiation(
+  server: RunningTestServer,
+  negotiation: WsBootstrapNegotiateResult,
+  token: string,
+): string {
+  const searchParams = new URLSearchParams({
+    [WS_COMPATIBILITY_QUERY.clientBuild]: "test-client",
+    [WS_COMPATIBILITY_QUERY.protocolEpoch]: String(negotiation.protocolEpoch),
+    [WS_COMPATIBILITY_QUERY.protocolRevision]: String(negotiation.negotiatedRevision),
+    [WS_COMPATIBILITY_QUERY.serverInstanceId]: negotiation.serverInstanceId,
+    wsToken: token,
+  });
+  return `${server.origin}/ws?${searchParams.toString()}`;
+}
+
 async function waitForObserved(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -388,6 +430,118 @@ describe("websocket RPC payload admission", () => {
 
       const admitted = await connect(featureSocketUrl(server, websocket.token));
       await expect(ping(admitted)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("negotiates over HTTP and admits the feature socket in one WebSocket handshake", async () => {
+    const server = await startTestServer();
+    try {
+      const response = await fetch(negotiateHttpUrl(server));
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      const negotiation = (await response.json()) as WsBootstrapNegotiateResult;
+      expect(negotiation).toMatchObject({
+        protocolEpoch: WS_PROTOCOL_EPOCH,
+        negotiatedRevision: WS_PROTOCOL_MAX_REVISION,
+      });
+      expect(negotiation.serverInstanceId.length).toBeGreaterThan(0);
+      expect(negotiation.capabilities).toContain("transport.http-negotiate");
+
+      const issued = await Effect.runPromise(server.sessions.issue());
+      const websocket = await Effect.runPromise(
+        server.sessions.issueWebSocketToken(issued.sessionId),
+      );
+      const socket = await connect(
+        featureSocketUrlFromNegotiation(server, negotiation, websocket.token),
+      );
+      await expect(ping(socket)).resolves.toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("refuses HTTP negotiation with 426 for missing or incompatible parameters", async () => {
+    const server = await startTestServer();
+    try {
+      const missing = await fetch(
+        `${server.origin.replace(/^ws:/, "http:")}${WS_NEGOTIATE_HTTP_PATH}`,
+      );
+      expect(missing.status).toBe(426);
+      expect(await missing.json()).toMatchObject({
+        code: "WS_NEGOTIATION_REQUIRED",
+        retryable: false,
+      });
+
+      const staleEpoch = await fetch(
+        negotiateHttpUrl(server, {
+          [WS_NEGOTIATE_QUERY.protocolEpoch]: String(WS_PROTOCOL_EPOCH - 1),
+        }),
+      );
+      expect(staleEpoch.status).toBe(426);
+      expect(await staleEpoch.json()).toMatchObject({
+        code: "WS_PROTOCOL_INCOMPATIBLE",
+        retryable: false,
+        action: "update-client",
+      });
+
+      const missingCapability = await fetch(
+        negotiateHttpUrl(server, {
+          [WS_NEGOTIATE_QUERY.requiredCapability]: "rpc.future-capability",
+        }),
+      );
+      expect(missingCapability.status).toBe(426);
+      expect(await missingCapability.json()).toMatchObject({
+        code: "WS_CAPABILITIES_INCOMPATIBLE",
+        retryable: false,
+        action: "update-server",
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps the legacy bootstrap socket negotiating for older clients", async () => {
+    const server = await startTestServer();
+    try {
+      const socket = await connect(`${server.origin}${WS_BOOTSTRAP_PATH}`);
+      const exit = new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("Timed out waiting for bootstrap negotiation exit")),
+          2_000,
+        );
+        socket.on("message", (data: RawData) => {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (frame._tag !== "Exit") return;
+          clearTimeout(timeout);
+          resolve(frame);
+        });
+      });
+      socket.send(
+        JSON.stringify({
+          _tag: "Request",
+          id: "1",
+          tag: WS_BOOTSTRAP_METHOD,
+          payload: {
+            protocolEpoch: WS_PROTOCOL_EPOCH,
+            minRevision: WS_PROTOCOL_MIN_REVISION,
+            maxRevision: WS_PROTOCOL_MAX_REVISION,
+            clientBuild: "legacy-client",
+            requiredCapabilities: [],
+          },
+          headers: [],
+        }),
+      );
+
+      const frame = await exit;
+      expect(frame.exit).toMatchObject({
+        _tag: "Success",
+        value: {
+          protocolEpoch: WS_PROTOCOL_EPOCH,
+          negotiatedRevision: WS_PROTOCOL_MAX_REVISION,
+        },
+      });
     } finally {
       await server.close();
     }

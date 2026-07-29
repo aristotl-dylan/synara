@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   WS_COMPATIBILITY_QUERY,
+  WS_NEGOTIATE_QUERY,
   WS_PROTOCOL_EPOCH,
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
@@ -82,6 +83,39 @@ export function negotiateWsCompatibility(
     serverInstanceId,
     capabilities: [...WS_SERVER_CAPABILITIES],
   });
+}
+
+// The HTTP negotiate endpoint carries the same input as bootstrap.negotiate,
+// flattened into query params so the request stays a cacheable-free plain GET
+// with no body to decode before the compatibility gate runs.
+export function parseWsNegotiateSearchParams(
+  searchParams: URLSearchParams,
+): WsBootstrapNegotiateInput | WsCompatibilityError {
+  const protocolEpoch = Number(searchParams.get(WS_NEGOTIATE_QUERY.protocolEpoch));
+  const minRevision = Number(searchParams.get(WS_NEGOTIATE_QUERY.minRevision));
+  const maxRevision = Number(searchParams.get(WS_NEGOTIATE_QUERY.maxRevision));
+  const clientBuild = searchParams.get(WS_NEGOTIATE_QUERY.clientBuild)?.trim() ?? "";
+  if (
+    !Number.isSafeInteger(protocolEpoch) ||
+    !Number.isSafeInteger(minRevision) ||
+    !Number.isSafeInteger(maxRevision) ||
+    minRevision < 0 ||
+    maxRevision < 0 ||
+    clientBuild.length === 0
+  ) {
+    return incompatibility(
+      "reload",
+      "WebSocket negotiation request is missing required parameters.",
+      "WS_NEGOTIATION_REQUIRED",
+    );
+  }
+  return {
+    protocolEpoch,
+    minRevision,
+    maxRevision,
+    clientBuild,
+    requiredCapabilities: searchParams.getAll(WS_NEGOTIATE_QUERY.requiredCapability),
+  };
 }
 
 export function validateWsFeatureCompatibility(
