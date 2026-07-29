@@ -55,7 +55,12 @@ import {
   type ServerShutdownController,
 } from "./serverShutdown";
 import { resolveFavicon, tryParseHost } from "./siteFaviconCache";
-import { negotiateStaticEncodings, staticCacheControl } from "./staticAssets";
+import {
+  isSidecarRequestPath,
+  negotiateStaticEncodings,
+  staticCacheControl,
+  staticEtag,
+} from "./staticAssets";
 import {
   isTrustedAppOrigin,
   normalizeCorsOrigin,
@@ -1131,6 +1136,9 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
     ) {
       return HttpServerResponse.text("Invalid static file path", { status: 400 });
     }
+    if (isSidecarRequestPath(relativePath)) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
 
     const isWithinStaticRoot = (candidate: string) =>
       candidate === staticRoot ||
@@ -1151,38 +1159,44 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
     // when the client accepts them. Content-Type always reflects the
     // underlying file; Vary is set even on identity responses so shared
     // caches never hand a compressed body to a client that cannot decode it.
+    // Every response carries an ETag derived from the served file (sidecar's
+    // when a sidecar is served, so validators differ per encoding), making
+    // no-cache revalidation a 304 instead of a full re-transfer.
     const serveStaticFile = Effect.fn(function* (resolvedPath: string) {
       const cacheHeaders = {
         "Cache-Control": staticCacheControl(path.relative(staticRoot, resolvedPath)),
         Vary: "Accept-Encoding",
       };
+      const ifNoneMatch = request.headers["if-none-match"];
       const baseContentType = Mime.getType(resolvedPath) ?? "application/octet-stream";
       const contentType =
         baseContentType === "text/html" ? "text/html; charset=utf-8" : baseContentType;
+      const respond = Effect.fn(function* (servedPath: string, encoding?: string) {
+        const info = yield* fileSystem
+          .stat(servedPath)
+          .pipe(Effect.catch(() => Effect.succeed(null)));
+        if (!info || info.type !== "File") return null;
+        const etag = staticEtag(Number(info.size), info.mtime?.getTime() ?? 0, encoding);
+        const encodingHeaders = encoding ? { "Content-Encoding": encoding } : {};
+        const headers = { ...cacheHeaders, ...encodingHeaders, ETag: etag };
+        if (ifNoneMatch === etag) {
+          return HttpServerResponse.empty({ status: 304, headers });
+        }
+        const data = yield* fileSystem
+          .readFile(servedPath)
+          .pipe(Effect.catch(() => Effect.succeed(null)));
+        if (!data) return null;
+        return HttpServerResponse.uint8Array(data, { status: 200, contentType, headers });
+      });
       for (const candidate of negotiateStaticEncodings(request.headers["accept-encoding"])) {
         const sidecarPath = `${resolvedPath}${candidate.sidecarExtension}`;
         // Sidecars share the traversal guard with their source file: appending
         // an extension cannot escape the root, but keep the invariant explicit.
         if (!isWithinStaticRoot(sidecarPath)) continue;
-        const sidecarData = yield* fileSystem
-          .readFile(sidecarPath)
-          .pipe(Effect.catch(() => Effect.succeed(null)));
-        if (!sidecarData) continue;
-        return HttpServerResponse.uint8Array(sidecarData, {
-          status: 200,
-          contentType,
-          headers: { ...cacheHeaders, "Content-Encoding": candidate.encoding },
-        });
+        const sidecarResponse = yield* respond(sidecarPath, candidate.encoding);
+        if (sidecarResponse) return sidecarResponse;
       }
-      const data = yield* fileSystem
-        .readFile(resolvedPath)
-        .pipe(Effect.catch(() => Effect.succeed(null)));
-      if (!data) return null;
-      return HttpServerResponse.uint8Array(data, {
-        status: 200,
-        contentType,
-        headers: cacheHeaders,
-      });
+      return yield* respond(resolvedPath);
     });
 
     const fileInfo = yield* fileSystem

@@ -127,16 +127,28 @@ function precompressPlugin(): Plugin {
       const files = (await listFiles(resolvedOutDir)).filter((file) =>
         PRECOMPRESS_EXTENSIONS.has(path.extname(file)),
       );
+      // A sidecar whose source shrank below threshold or stopped compressing
+      // smaller must be removed, not just skipped: emptyOutDir protects full
+      // builds, but partial/watch builds would otherwise serve a stale
+      // compressed body under a current filename.
+      const removeStale = (sidecarPath: string) => fs.rm(sidecarPath, { force: true });
       let sidecarCount = 0;
       await Promise.all(
         files.map(async (file) => {
           const source = await fs.readFile(file);
-          if (source.byteLength < PRECOMPRESS_MIN_BYTES) return;
+          if (source.byteLength < PRECOMPRESS_MIN_BYTES) {
+            await Promise.all([removeStale(`${file}.gz`), removeStale(`${file}.br`)]);
+            return;
+          }
+          // Max-quality brotli on thousands of small files dominates plugin
+          // wall-clock; below 16 KiB quality 9 is byte-for-byte competitive.
+          const brotliQuality =
+            source.byteLength < 16 * 1024 ? 9 : zlib.constants.BROTLI_MAX_QUALITY;
           const [gzipped, brotlied] = await Promise.all([
             gzip(source, { level: zlib.constants.Z_BEST_COMPRESSION }),
             brotliCompress(source, {
               params: {
-                [zlib.constants.BROTLI_PARAM_QUALITY]: zlib.constants.BROTLI_MAX_QUALITY,
+                [zlib.constants.BROTLI_PARAM_QUALITY]: brotliQuality,
                 [zlib.constants.BROTLI_PARAM_SIZE_HINT]: source.byteLength,
               },
             }),
@@ -144,10 +156,10 @@ function precompressPlugin(): Plugin {
           await Promise.all([
             gzipped.byteLength < source.byteLength
               ? fs.writeFile(`${file}.gz`, gzipped)
-              : Promise.resolve(),
+              : removeStale(`${file}.gz`),
             brotlied.byteLength < source.byteLength
               ? fs.writeFile(`${file}.br`, brotlied)
-              : Promise.resolve(),
+              : removeStale(`${file}.br`),
           ]);
           sidecarCount += 1;
         }),
