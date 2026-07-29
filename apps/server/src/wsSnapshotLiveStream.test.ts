@@ -101,7 +101,10 @@ describe("makeCursorSafeSnapshotLiveStream", () => {
       { kind: "snapshot", snapshot: { snapshotSequence: 1 } },
       { kind: "event", event: event(2) },
     ]);
-  });
+    // A short deadline: when the attach ordering regresses, this test fails by
+    // losing the mid-snapshot event and would otherwise stall for the suite's
+    // full 90s default before reporting.
+  }, 15_000);
 
   it("resumes from a cursor by replaying exactly the gap without a snapshot", async () => {
     let snapshotLoaded = false;
@@ -142,6 +145,42 @@ describe("makeCursorSafeSnapshotLiveStream", () => {
       { kind: "event", event: event(6) },
     ]);
   });
+
+  it("does not lose an event published while the resume path reads the durable head", async () => {
+    // The resume branch must share the snapshot path's attach-before-IO
+    // discipline: the live subscription attaches before the durable head is
+    // read, so an event published during that read lands in the live queue and
+    // is delivered after the gap replay instead of being lost. Moving the
+    // attach after the head read passes every other test in this file — only
+    // this probe catches it.
+    const items = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const live = yield* PubSub.unbounded<OrchestrationEvent>();
+          const publishedDuringHeadRead = event(6);
+          return yield* makeCursorSafeSnapshotLiveStream({
+            subscribeLive: PubSub.subscribe(live).pipe(
+              Effect.map((subscription) => Stream.fromEffectRepeat(PubSub.take(subscription))),
+            ),
+            snapshot: Effect.die(new Error("cursor resume must not load the snapshot")),
+            snapshotSequence: () => 0,
+            getHighWaterSequence: Effect.sleep(Duration.millis(20)).pipe(
+              Effect.andThen(PubSub.publish(live, publishedDuringHeadRead)),
+              Effect.as(5),
+            ),
+            resumeFromSequence: 3,
+            replay: () => Stream.make(event(4), event(5)),
+          }).pipe(Stream.take(3), Stream.runCollect);
+        }),
+      ),
+    );
+
+    expect(Array.from(items)).toEqual([
+      { kind: "event", event: event(4) },
+      { kind: "event", event: event(5) },
+      { kind: "event", event: event(6) },
+    ]);
+  }, 15_000);
 
   it("falls back to the snapshot when the cursor gap exceeds the replay limit", async () => {
     const replayRanges: Array<readonly [number, number]> = [];

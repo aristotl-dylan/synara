@@ -6,7 +6,6 @@
 import { WS_STREAM_LIMITS, type ThreadId } from "@synara/contracts";
 import { useSyncExternalStore } from "react";
 import { useStore } from "./store";
-import { clearThreadDetailResumeCursor } from "./threadDetailResumeCursors";
 import { getThreadFromState } from "./threadDerivation";
 
 const THREAD_DETAIL_RETENTION_EVICTION_MS = 15 * 60 * 1000;
@@ -147,9 +146,8 @@ function evictEntry(
   if (!retainedThreadEntries.delete(threadId)) {
     return;
   }
-  // The wiped detail is what the resume cursor vouched for; without it a
-  // resubscribe must fetch a fresh snapshot, not a gap replay.
-  clearThreadDetailResumeCursor(threadId);
+  // The store's detail-wipe transition also drops the thread's resume cursor,
+  // so a resubscribe after this eviction fetches a fresh snapshot.
   useStore.getState().evictThreadDetail(threadId);
   emitEviction(threadId);
   if (options?.notify !== false) {

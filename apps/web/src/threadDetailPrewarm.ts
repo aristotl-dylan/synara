@@ -43,7 +43,11 @@ const DEFAULT_CLOCK: ThreadDetailPrewarmClock = {
   clearTimeout: (timeoutId) => clearTimeout(timeoutId),
 };
 
-function uniqueThreadIds(threadIds: readonly ThreadId[], limit: number): ThreadId[] {
+function uniqueEligibleThreadIds(
+  threadIds: readonly ThreadId[],
+  limit: number,
+  isEligible: (threadId: ThreadId) => boolean,
+): ThreadId[] {
   const nextThreadIds: ThreadId[] = [];
   const seenThreadIds = new Set<ThreadId>();
 
@@ -52,6 +56,11 @@ function uniqueThreadIds(threadIds: readonly ThreadId[], limit: number): ThreadI
       continue;
     }
     seenThreadIds.add(threadId);
+    // Eligibility filters before the limit: ineligible (cold) threads must not
+    // consume prewarm slots that a cached thread later in the list could use.
+    if (!isEligible(threadId)) {
+      continue;
+    }
     nextThreadIds.push(threadId);
     if (nextThreadIds.length >= limit) {
       break;
@@ -110,7 +119,13 @@ export function createThreadDetailPrewarmController(
   return {
     prewarmThreadDetail,
     prewarmThreadDetails(threadIds) {
-      const nextThreadIds = uniqueThreadIds(threadIds, maxRetainedThreads);
+      const nextThreadIds = uniqueEligibleThreadIds(
+        threadIds,
+        maxRetainedThreads,
+        // Already-retained threads stay eligible: their prewarm retain is live
+        // even if the cursor moved underneath, matching prewarmThreadDetail.
+        (threadId) => retainedThreadById.has(threadId) || canPrewarmThreadDetail(threadId),
+      );
       const nextThreadIdSet = new Set(nextThreadIds);
 
       for (const threadId of nextThreadIds) {

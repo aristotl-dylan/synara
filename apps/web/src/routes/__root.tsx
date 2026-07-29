@@ -89,7 +89,6 @@ import {
   advanceThreadDetailResumeCursor,
   buildThreadSubscribeInput,
   clearThreadDetailResumeCursor,
-  clearThreadDetailResumeCursors,
   getThreadDetailResumeCursor,
   setThreadDetailResumeCursor,
 } from "../threadDetailResumeCursors";
@@ -943,9 +942,8 @@ function releaseOrphanedThreadDetail(input: {
   if (orphanedThreadIds.length === 0) {
     return;
   }
-  // The evicted detail is what the resume cursors vouch for; without cached
-  // history a resubscribe must fetch a fresh snapshot, not a gap replay.
-  clearThreadDetailResumeCursors(orphanedThreadIds);
+  // The store's detail-wipe transition also drops each thread's resume cursor,
+  // so a resubscribe after this release fetches a fresh snapshot.
   useStore.getState().evictThreadDetails(orphanedThreadIds);
 }
 
@@ -1550,6 +1548,18 @@ function EventRouter() {
           clearThreadDetailResumeCursor(threadId);
           return;
         }
+        syncServerThreadDetailHotPath(item.snapshot.thread);
+        // The projection can discard a tombstoned snapshot (deleted thread or
+        // project) instead of applying it; committing the cursor or the stream
+        // fence first would leave resume bookkeeping vouching for detail that
+        // was never stored. `threadDetailSyncById` flips to "synced" only when
+        // the detail was actually applied.
+        if (useStore.getState().threadDetailSyncById?.[threadId] !== "synced") {
+          threadSnapshotSequenceById.delete(threadId);
+          pendingThreadEventsById.delete(threadId);
+          clearThreadDetailResumeCursor(threadId);
+          return;
+        }
         threadSnapshotSequenceById.set(threadId, item.snapshot.snapshotSequence);
         // Snapshots replace cached detail wholesale, so overwrite the cursor
         // even when it is lower than the previous one (server-side reset).
@@ -1558,7 +1568,6 @@ function EventRouter() {
           threadId,
           Date.now() + THREAD_DETAIL_PROJECTION_RECONCILE_INTERVAL_MS,
         );
-        syncServerThreadDetailHotPath(item.snapshot.thread);
         reconcilePromotedDraftFromThreadDetail(item.snapshot.thread);
         flushThreadBuffer(threadId, item.snapshot.snapshotSequence);
         return;

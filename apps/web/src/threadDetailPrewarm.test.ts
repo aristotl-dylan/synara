@@ -151,4 +151,24 @@ describe("thread detail prewarm", () => {
     expect(retain.retainedThreadIds).toEqual([cachedThread]);
     controller.dispose();
   });
+
+  it("filters ineligible threads before applying the prewarm limit", () => {
+    vi.useFakeTimers();
+    const retain = makeRetainSpy();
+    const coldThreadIds = Array.from({ length: 6 }, (_, index) => threadId(`cold-${index}`));
+    const cachedThread = threadId("cached-after-cold");
+    setThreadDetailResumeCursor(cachedThread, 10);
+    const controller = createThreadDetailPrewarmController({
+      retainThreadDetailSubscription: retain.retainThreadDetailSubscription,
+      releaseMs: 1000,
+    });
+
+    // More cold threads than the limit precede the one cached thread. The
+    // limit must apply after eligibility filtering, or the cold prefix would
+    // consume every slot and the cached thread would never prewarm.
+    controller.prewarmThreadDetails([...coldThreadIds, cachedThread]);
+
+    expect(retain.retainedThreadIds).toEqual([cachedThread]);
+    controller.dispose();
+  });
 });

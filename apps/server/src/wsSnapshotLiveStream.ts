@@ -50,6 +50,14 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
         const resumeFromSequence = input.resumeFromSequence;
         const highWaterSequence = yield* input.getHighWaterSequence;
         const resumeGap = highWaterSequence - resumeFromSequence;
+        // The `resumeGap >= 0` guard is load-bearing, not defensive: hard
+        // deletes remove rows from `orchestration_events` (see the thread purge
+        // in profileStatsArchive.ts), which can lower the journal-wide
+        // MAX(sequence) below a cursor a client legitimately held. Such a
+        // cursor must never be trusted for a gap replay — fall through to the
+        // full snapshot instead. Sequences themselves are never reused
+        // (`sequence INTEGER PRIMARY KEY AUTOINCREMENT`), so a non-negative
+        // gap cannot silently alias deleted history onto new events.
         if (resumeGap >= 0 && resumeGap <= ORCHESTRATION_SNAPSHOT_REPLAY_LIMIT) {
           const replay = input.replay(resumeFromSequence, highWaterSequence).pipe(
             Stream.filter(
