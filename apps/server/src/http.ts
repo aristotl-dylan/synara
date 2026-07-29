@@ -55,6 +55,7 @@ import {
   type ServerShutdownController,
 } from "./serverShutdown";
 import { resolveFavicon, tryParseHost } from "./siteFaviconCache";
+import { negotiateStaticEncodings, staticCacheControl } from "./staticAssets";
 import {
   isTrustedAppOrigin,
   normalizeCorsOrigin,
@@ -1146,29 +1147,54 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
       }
     }
 
+    // Serves a resolved static file, preferring build-time .br/.gz sidecars
+    // when the client accepts them. Content-Type always reflects the
+    // underlying file; Vary is set even on identity responses so shared
+    // caches never hand a compressed body to a client that cannot decode it.
+    const serveStaticFile = Effect.fn(function* (resolvedPath: string) {
+      const cacheHeaders = {
+        "Cache-Control": staticCacheControl(path.relative(staticRoot, resolvedPath)),
+        Vary: "Accept-Encoding",
+      };
+      const baseContentType = Mime.getType(resolvedPath) ?? "application/octet-stream";
+      const contentType =
+        baseContentType === "text/html" ? "text/html; charset=utf-8" : baseContentType;
+      for (const candidate of negotiateStaticEncodings(request.headers["accept-encoding"])) {
+        const sidecarPath = `${resolvedPath}${candidate.sidecarExtension}`;
+        // Sidecars share the traversal guard with their source file: appending
+        // an extension cannot escape the root, but keep the invariant explicit.
+        if (!isWithinStaticRoot(sidecarPath)) continue;
+        const sidecarData = yield* fileSystem
+          .readFile(sidecarPath)
+          .pipe(Effect.catch(() => Effect.succeed(null)));
+        if (!sidecarData) continue;
+        return HttpServerResponse.uint8Array(sidecarData, {
+          status: 200,
+          contentType,
+          headers: { ...cacheHeaders, "Content-Encoding": candidate.encoding },
+        });
+      }
+      const data = yield* fileSystem
+        .readFile(resolvedPath)
+        .pipe(Effect.catch(() => Effect.succeed(null)));
+      if (!data) return null;
+      return HttpServerResponse.uint8Array(data, {
+        status: 200,
+        contentType,
+        headers: cacheHeaders,
+      });
+    });
+
     const fileInfo = yield* fileSystem
       .stat(filePath)
       .pipe(Effect.catch(() => Effect.succeed(null)));
     if (!fileInfo || fileInfo.type !== "File") {
-      const indexPath = path.resolve(staticRoot, "index.html");
-      const indexData = yield* fileSystem
-        .readFile(indexPath)
-        .pipe(Effect.catch(() => Effect.succeed(null)));
-      if (!indexData) return HttpServerResponse.text("Not Found", { status: 404 });
-      return HttpServerResponse.uint8Array(indexData, {
-        status: 200,
-        contentType: "text/html; charset=utf-8",
-      });
+      const fallback = yield* serveStaticFile(path.resolve(staticRoot, "index.html"));
+      return fallback ?? HttpServerResponse.text("Not Found", { status: 404 });
     }
 
-    const data = yield* fileSystem
-      .readFile(filePath)
-      .pipe(Effect.catch(() => Effect.succeed(null)));
-    if (!data) return HttpServerResponse.text("Internal Server Error", { status: 500 });
-    return HttpServerResponse.uint8Array(data, {
-      status: 200,
-      contentType: Mime.getType(filePath) ?? "application/octet-stream",
-    });
+    const response = yield* serveStaticFile(filePath);
+    return response ?? HttpServerResponse.text("Internal Server Error", { status: 500 });
   }),
 );
 

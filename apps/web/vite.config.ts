@@ -5,6 +5,8 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import zlib from "node:zlib";
+import { promisify } from "node:util";
 import tailwindcss from "@tailwindcss/vite";
 import react, { reactCompilerPreset } from "@vitejs/plugin-react";
 import babel from "@rolldown/plugin-babel";
@@ -100,6 +102,61 @@ function centralIconPrunePlugin(): Plugin {
   };
 }
 
+const gzip = promisify(zlib.gzip);
+const brotliCompress = promisify(zlib.brotliCompress);
+
+const PRECOMPRESS_EXTENSIONS = new Set([".js", ".mjs", ".css", ".html", ".svg", ".json", ".map"]);
+// Below this size, compression savings don't beat the extra header bytes and
+// the sidecar file overhead.
+const PRECOMPRESS_MIN_BYTES = 1024;
+
+// Emits .gz and .br sidecars next to compressible build outputs so the server
+// can serve precompressed bytes by Accept-Encoding instead of compressing on
+// the request path (apps/server/src/http.ts static route).
+function precompressPlugin(): Plugin {
+  let resolvedOutDir = "dist";
+  return {
+    name: "synara-precompress",
+    apply: "build",
+    // Run after central-icon pruning so removed files don't get sidecars.
+    enforce: "post",
+    configResolved(config) {
+      resolvedOutDir = path.resolve(config.root, config.build.outDir);
+    },
+    async closeBundle() {
+      const files = (await listFiles(resolvedOutDir)).filter((file) =>
+        PRECOMPRESS_EXTENSIONS.has(path.extname(file)),
+      );
+      let sidecarCount = 0;
+      await Promise.all(
+        files.map(async (file) => {
+          const source = await fs.readFile(file);
+          if (source.byteLength < PRECOMPRESS_MIN_BYTES) return;
+          const [gzipped, brotlied] = await Promise.all([
+            gzip(source, { level: zlib.constants.Z_BEST_COMPRESSION }),
+            brotliCompress(source, {
+              params: {
+                [zlib.constants.BROTLI_PARAM_QUALITY]: zlib.constants.BROTLI_MAX_QUALITY,
+                [zlib.constants.BROTLI_PARAM_SIZE_HINT]: source.byteLength,
+              },
+            }),
+          ]);
+          await Promise.all([
+            gzipped.byteLength < source.byteLength
+              ? fs.writeFile(`${file}.gz`, gzipped)
+              : Promise.resolve(),
+            brotlied.byteLength < source.byteLength
+              ? fs.writeFile(`${file}.br`, brotlied)
+              : Promise.resolve(),
+          ]);
+          sidecarCount += 1;
+        }),
+      );
+      console.info(`[precompress] emitted gzip+brotli sidecars for ${sidecarCount} files.`);
+    },
+  };
+}
+
 export default defineConfig({
   plugins: [
     tanstackRouter({
@@ -117,6 +174,7 @@ export default defineConfig({
     }),
     tailwindcss(),
     centralIconPrunePlugin(),
+    precompressPlugin(),
   ],
   optimizeDeps: {
     include: [
