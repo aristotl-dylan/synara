@@ -2127,13 +2127,17 @@ describe("resume cursor lifecycle in projection transitions", () => {
     expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
   });
 
-  it("keeps the cursor when full syncs retain the thread", () => {
+  it("clears the cursor when a full read-model sync replaces retained detail", () => {
+    // A retained thread's detail is replaced wholesale by the read model, so a
+    // cursor ahead of the replacement would resume past history the new detail
+    // does not contain. This path is route recovery and "Repair local state"
+    // only, so the cost is one snapshot on an already-degraded path.
     const state = makeStateWithCursor();
     syncServerReadModel(state, {
       ...makeReadModel(makeReadModelThread({ id: threadId, projectId })),
       snapshotSequence: 60,
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(true);
+    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
   });
 
   it("clears the cursor when a tombstone rejects the thread's detail snapshot", () => {

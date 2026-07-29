@@ -227,6 +227,23 @@ export function isTerminalCompatibilityFailure(error: unknown): boolean {
   );
 }
 
+/**
+ * True when the server just reached is a different instance than the last one
+ * reached — the signal that cached resume cursors may belong to another event
+ * journal. Compared against the last *successful* identity rather than the
+ * current negotiation, which a failed reconnect clears: an outage longer than
+ * the first retry would otherwise erase the evidence of the change, which is
+ * exactly the restore-with-downtime case this guards against.
+ */
+export function serverIdentityChanged(
+  lastKnownServerInstanceId: string | null,
+  negotiatedServerInstanceId: string,
+): boolean {
+  return (
+    lastKnownServerInstanceId !== null && lastKnownServerInstanceId !== negotiatedServerInstanceId
+  );
+}
+
 export function getTerminalCompatibilityError(error: unknown): WsCompatibilityError | null {
   return Schema.is(WsCompatibilityError)(error) && error.retryable === false ? error : null;
 }
@@ -485,6 +502,11 @@ export class WsTransport {
   private shellSubscribed = false;
   private readonly threadSubscriptions = new Map<string, unknown>();
   private compatibility: WsBootstrapNegotiateResult | null = null;
+  // Survives failed reconnects, unlike `compatibility`, which is cleared on
+  // every failure. Journal identity must be compared against the last server
+  // we actually reached: an outage longer than the first retry would
+  // otherwise erase the evidence that the server came back different.
+  private lastKnownServerInstanceId: string | null = null;
   private compatibilityIssue: WsCompatibilityError | null = null;
 
   constructor(url?: string) {
@@ -732,20 +754,20 @@ export class WsTransport {
       const client = await featureRuntime.runPromise(Scope.provide(featureScope)(makeRpcClient));
       this.runtimeByClient.set(client, featureRuntime);
       if (!this.disposed && this.sessionVersion === sessionVersion) {
-        if (
-          this.compatibility &&
-          this.compatibility.serverInstanceId !== compatibility.serverInstanceId
-        ) {
+        if (serverIdentityChanged(this.lastKnownServerInstanceId, compatibility.serverInstanceId)) {
           this.latestPushByChannel.clear();
           this.sequence = 0;
           // A resume cursor is only valid against the journal that issued its
           // sequences. A new server instance may serve a different journal
           // (fresh install, restored backup), so every cursor must reset to
-          // force full snapshots. Interim tradeoff: this also drops resume
-          // across plain restarts of the same journal — acceptable until the
-          // protocol carries a durable journal epoch to validate against.
+          // force full snapshots. Compared against the last instance actually
+          // reached rather than `compatibility`, which a failed reconnect
+          // clears — the downtime case this exists to catch. Interim tradeoff:
+          // this also drops resume across plain restarts of the same journal,
+          // acceptable until the protocol carries a durable journal epoch.
           resetThreadDetailResumeCursors();
         }
+        this.lastKnownServerInstanceId = compatibility.serverInstanceId;
         this.compatibility = compatibility;
         this.setCompatibilityIssue(null);
         this.setState("open");

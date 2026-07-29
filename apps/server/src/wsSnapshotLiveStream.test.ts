@@ -234,6 +234,56 @@ describe("makeCursorSafeSnapshotLiveStream", () => {
     expect(Array.from(items)).toEqual([{ kind: "snapshot", snapshot: { snapshotSequence: 2 } }]);
   });
 
+  it("falls back to the snapshot when the resume subject no longer exists", async () => {
+    // A hard-purged thread leaves an in-range gap (unrelated events keep the
+    // journal head above the cursor) but nothing to replay, so the resume
+    // shortcut would stream silence forever instead of surfacing the deletion.
+    const replayRanges: Array<readonly [number, number]> = [];
+    const items = await Effect.runPromise(
+      Effect.scoped(
+        makeCursorSafeSnapshotLiveStream({
+          subscribeLive: Effect.succeed(Stream.empty),
+          snapshot: Effect.succeed({ snapshotSequence: 40 }),
+          snapshotSequence: (snapshot) => snapshot.snapshotSequence,
+          getHighWaterSequence: Effect.succeed(40),
+          resumeFromSequence: 30,
+          resumeSubjectExists: Effect.succeed(false),
+          replay: (fromSequenceExclusive, throughSequenceInclusive) => {
+            replayRanges.push([fromSequenceExclusive, throughSequenceInclusive]);
+            return Stream.empty;
+          },
+        }).pipe(Stream.take(1), Stream.runCollect),
+      ),
+    );
+
+    // The snapshot fence replayed, not the cursor gap.
+    expect(replayRanges).toEqual([[40, 40]]);
+    expect(Array.from(items)).toEqual([{ kind: "snapshot", snapshot: { snapshotSequence: 40 } }]);
+  });
+
+  it("resumes from the cursor when the subject still exists", async () => {
+    const replayRanges: Array<readonly [number, number]> = [];
+    const items = await Effect.runPromise(
+      Effect.scoped(
+        makeCursorSafeSnapshotLiveStream({
+          subscribeLive: Effect.succeed(Stream.empty),
+          snapshot: Effect.die("snapshot must not load on a valid resume"),
+          snapshotSequence: (snapshot: { snapshotSequence: number }) => snapshot.snapshotSequence,
+          getHighWaterSequence: Effect.succeed(40),
+          resumeFromSequence: 30,
+          resumeSubjectExists: Effect.succeed(true),
+          replay: (fromSequenceExclusive, throughSequenceInclusive) => {
+            replayRanges.push([fromSequenceExclusive, throughSequenceInclusive]);
+            return Stream.empty;
+          },
+        }).pipe(Stream.runCollect),
+      ),
+    );
+
+    expect(replayRanges).toEqual([[30, 40]]);
+    expect(Array.from(items)).toEqual([]);
+  });
+
   it("requires a fresh snapshot instead of replaying an unbounded attach gap", async () => {
     let replayStarted = false;
     const reports: Array<{

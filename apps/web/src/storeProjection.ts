@@ -15,6 +15,7 @@ import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
 import {
   clearThreadDetailResumeCursor,
+  clearThreadDetailResumeCursors,
   retainThreadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
 import { getThreadFromState, getThreadsFromState } from "./threadDerivation";
@@ -1413,6 +1414,11 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
   // thread must fall with its detail or a later resubscribe would gap-replay
   // on top of history this prune just discarded.
   retainThreadDetailResumeCursors(nextThreadIds);
+  // A surviving thread's detail is replaced wholesale by this read model, so a
+  // cursor ahead of the replacement would resume past history the new detail
+  // does not contain. Drop them all: the next subscribe takes a snapshot and
+  // re-establishes a cursor that matches what is actually cached.
+  clearThreadDetailResumeCursors([...nextThreadIds]);
   let normalizedState: AppState = {
     ...state,
     threadIds: reuseThreadIdRegistry(state.threadIds, nextThreadIds),

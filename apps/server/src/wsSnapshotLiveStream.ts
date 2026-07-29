@@ -27,6 +27,13 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
     throughSequenceInclusive: number,
   ) => Stream.Stream<OrchestrationEvent, E>;
   readonly resumeFromSequence?: number | undefined;
+  /**
+   * Guards the resume shortcut against a subject that no longer exists. A hard
+   * purge removes a thread's rows while unrelated events keep the journal head
+   * above the client's cursor, so the gap check alone would accept the resume
+   * and stream an empty replay forever instead of surfacing the deletion.
+   */
+  readonly resumeSubjectExists?: Effect.Effect<boolean, E>;
   readonly onResnapshotRequired?: (report: {
     readonly snapshotSequence: number;
     readonly highWaterSequence: number;
@@ -58,7 +65,9 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
         // full snapshot instead. Sequences themselves are never reused
         // (`sequence INTEGER PRIMARY KEY AUTOINCREMENT`), so a non-negative
         // gap cannot silently alias deleted history onto new events.
-        if (resumeGap >= 0 && resumeGap <= ORCHESTRATION_SNAPSHOT_REPLAY_LIMIT) {
+        const subjectExists =
+          input.resumeSubjectExists === undefined ? true : yield* input.resumeSubjectExists;
+        if (subjectExists && resumeGap >= 0 && resumeGap <= ORCHESTRATION_SNAPSHOT_REPLAY_LIMIT) {
           const replay = input.replay(resumeFromSequence, highWaterSequence).pipe(
             Stream.filter(
               (event) => event.sequence > resumeFromSequence && event.sequence <= highWaterSequence,
