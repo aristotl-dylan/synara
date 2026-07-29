@@ -408,9 +408,11 @@ describe("production Effect HTTP routes", () => {
     writeFileSync(path.join(staticDir, "assets", "leak-sidecar.js"), "inside root");
 
     await withEffectServer(makeConfig({ staticDir }), { kind: "static" }, async (origin) => {
-      // The escaping source falls through to the SPA shell, never the target.
+      // The escaping source is refused outright — the containment check runs
+      // before any read, so the link target's bytes never reach the response.
       const escaped = await fetch(`${origin}/assets/leak.js`);
       const escapedBody = await escaped.text();
+      expect(escaped.status).toBe(500);
       expect(escapedBody).not.toContain("outside root");
 
       // A sidecar that escapes is skipped; the in-root source is still served.

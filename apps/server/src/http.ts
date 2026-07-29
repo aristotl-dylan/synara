@@ -1216,7 +1216,15 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
         return HttpServerResponse.uint8Array(data, { status: 200, contentType, headers });
       });
       const preference = negotiateStaticEncodingPreference(request.headers["accept-encoding"]);
+      // Candidates are ranked by client weight with identity (null) in its own
+      // ranked position, so a client preferring identity over a coding is not
+      // handed a sidecar it ranked lower.
       for (const candidate of preference.candidates) {
+        if (candidate === null) {
+          const identityResponse = yield* respond(resolvedPath);
+          if (identityResponse) return identityResponse;
+          continue;
+        }
         const sidecarPath = `${resolvedPath}${candidate.sidecarExtension}`;
         // Sidecars share the traversal guard with their source file: appending
         // an extension cannot escape the root, but keep the invariant explicit.
@@ -1224,15 +1232,15 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
         const sidecarResponse = yield* respond(sidecarPath, candidate.encoding);
         if (sidecarResponse) return sidecarResponse;
       }
-      // No acceptable sidecar and the client excluded identity: RFC 9110
-      // §12.5.3 makes this a 406 rather than a body it said it cannot use.
+      // Nothing acceptable was servable. With identity excluded that is a 406
+      // per RFC 9110 §12.5.3; otherwise the file itself is missing.
       if (!preference.identityAcceptable) {
         return HttpServerResponse.text("Not Acceptable", {
           status: 406,
           headers: { Vary: "Accept-Encoding" },
         });
       }
-      return yield* respond(resolvedPath);
+      return null;
     });
 
     const fileInfo = yield* fileSystem

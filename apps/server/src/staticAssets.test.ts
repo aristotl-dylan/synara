@@ -75,6 +75,27 @@ describe("negotiateStaticEncodingPreference identity handling", () => {
   const identityOk = (header: string | undefined) =>
     negotiateStaticEncodingPreference(header).identityAcceptable;
 
+  const ranking = (header: string | undefined) =>
+    negotiateStaticEncodingPreference(header).candidates.map(
+      (candidate) => candidate?.encoding ?? "identity",
+    );
+
+  it("ranks identity among the codings rather than as a fallback", () => {
+    // A client preferring identity must not be handed a lower-ranked sidecar.
+    expect(ranking("gzip;q=0.1, identity;q=1")).toEqual(["identity", "gzip"]);
+    expect(ranking("gzip;q=1, identity;q=0.1")).toEqual(["gzip", "identity"]);
+    // Equal weights keep the smaller body first.
+    expect(ranking("gzip;q=1, identity;q=1")).toEqual(["gzip", "identity"]);
+    expect(ranking(undefined)).toEqual(["identity"]);
+  });
+
+  it("rejects q parameters with whitespace around the equals sign", () => {
+    // `q =0` is not a q-parameter: defaulting it to 1 would serve the very
+    // encoding the client was trying to refuse.
+    expect(ranking("gzip;q =0")).toEqual(["identity"]);
+    expect(ranking("gzip;q= 0.5")).toEqual(["identity"]);
+  });
+
   it("treats identity as acceptable unless explicitly excluded", () => {
     expect(identityOk(undefined)).toBe(true);
     expect(identityOk("gzip, br")).toBe(true);

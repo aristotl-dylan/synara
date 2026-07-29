@@ -41,34 +41,50 @@ const STATIC_ENCODING_CANDIDATES: readonly StaticEncodingCandidate[] = [
 // than silently treated as acceptable.
 const QVALUE_PATTERN = /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/;
 
+// RFC 9110 §5.6.6 permits no whitespace around the parameter `=`, so `q =0`
+// and `q= 0.5` are not q-parameters. Treating them loosely is worse than
+// strict: `gzip;q =0` would silently default gzip to weight 1 and serve the
+// client the encoding it was trying to refuse.
 function parseQValue(rawParams: readonly string[]): number | null {
-  const qParam = rawParams
-    .map((param) => param.trim().toLowerCase())
-    .find((param) => param.startsWith("q="));
-  if (!qParam) return 1;
-  const raw = qParam.slice(2).trim();
-  return QVALUE_PATTERN.test(raw) ? Number.parseFloat(raw) : null;
+  for (const param of rawParams) {
+    const normalized = param.trim().toLowerCase();
+    const separator = normalized.indexOf("=");
+    if (separator < 0) continue;
+    const name = normalized.slice(0, separator);
+    // Only a q-parameter decides the weight; other parameters are ignored.
+    if (name.trimEnd() !== "q") continue;
+    const value = normalized.slice(separator + 1);
+    // Whitespace around `=` makes this malformed rather than absent: falling
+    // back to the default weight would serve the very encoding a client wrote
+    // `q =0` to refuse.
+    if (name !== "q" || value !== value.trim()) return null;
+    return QVALUE_PATTERN.test(value) ? Number.parseFloat(value) : null;
+  }
+  return 1;
 }
 
 export interface StaticEncodingPreference {
-  /** Sidecar encodings the client accepts, best-weighted first. */
-  readonly candidates: readonly StaticEncodingCandidate[];
+  /**
+   * Encodings to try in order, best-weighted first. `null` marks identity's
+   * position in the ranking: a client weighting identity above a coding gets
+   * the uncompressed body rather than a sidecar it ranked lower.
+   */
+  readonly candidates: readonly (StaticEncodingCandidate | null)[];
   /** False when the client excluded identity (`identity;q=0` or `*;q=0`). */
   readonly identityAcceptable: boolean;
 }
 
 /**
- * Ranks sidecar encodings by client weight per RFC 9110 §12.5.3. A missing
- * header means only identity is reliably acceptable. Explicit weights beat the
- * `*` wildcard, q=0 excludes, and server preference (brotli over gzip) breaks
- * ties. `identityAcceptable` is false only when identity is explicitly
- * excluded, which makes an unservable request a 406 rather than a body the
- * client said it cannot use.
+ * Ranks every coding — identity included — by client weight per RFC 9110
+ * §12.5.3. A missing header means only identity is reliably acceptable.
+ * Explicit weights beat the `*` wildcard, q=0 excludes, and server preference
+ * (brotli, then gzip, then identity) breaks ties. When nothing is acceptable
+ * the caller answers 406 rather than sending a body the client refused.
  */
 export function negotiateStaticEncodingPreference(
   acceptEncoding: string | undefined,
 ): StaticEncodingPreference {
-  if (!acceptEncoding) return { candidates: [], identityAcceptable: true };
+  if (!acceptEncoding) return { candidates: [null], identityAcceptable: true };
   const explicit = new Map<string, number>();
   for (const rawEntry of acceptEncoding.split(",")) {
     const [rawName, ...rawParams] = rawEntry.trim().split(";");
@@ -80,27 +96,39 @@ export function negotiateStaticEncodingPreference(
     if (!explicit.has(name)) explicit.set(name, weight);
   }
   const wildcard = explicit.get("*");
-  const weightFor = (name: string): number | undefined => explicit.get(name) ?? wildcard;
-
+  // Identity is acceptable by default (§12.5.3) unless a weight excludes it.
   const identityWeight = explicit.get("identity") ?? wildcard ?? 1;
-  const candidates = STATIC_ENCODING_CANDIDATES.map((candidate) => ({
-    candidate,
-    weight: weightFor(candidate.encoding) ?? 0,
-    // Server preference decides equal weights: brotli first.
-    preference: candidate.encoding === "br" ? 0 : 1,
-  }))
-    .filter((entry) => entry.weight > 0)
-    .sort((a, b) => b.weight - a.weight || a.preference - b.preference)
-    .map((entry) => entry.candidate);
+  const ranked: {
+    readonly candidate: StaticEncodingCandidate | null;
+    readonly weight: number;
+    readonly preference: number;
+  }[] = [
+    ...STATIC_ENCODING_CANDIDATES.map((candidate, index) => ({
+      candidate: candidate as StaticEncodingCandidate | null,
+      weight: explicit.get(candidate.encoding) ?? wildcard ?? 0,
+      preference: index,
+    })),
+    // Identity ranks last among equals: a client that weights it the same as
+    // a coding still gets the smaller body.
+    { candidate: null, weight: identityWeight, preference: STATIC_ENCODING_CANDIDATES.length },
+  ];
 
-  return { candidates, identityAcceptable: identityWeight > 0 };
+  return {
+    candidates: ranked
+      .filter((entry) => entry.weight > 0)
+      .sort((a, b) => b.weight - a.weight || a.preference - b.preference)
+      .map((entry) => entry.candidate),
+    identityAcceptable: identityWeight > 0,
+  };
 }
 
-/** Convenience wrapper for callers that only need the ranked candidates. */
+/** Convenience wrapper for callers that only need the ranked sidecar codings. */
 export function negotiateStaticEncodings(
   acceptEncoding: string | undefined,
 ): readonly StaticEncodingCandidate[] {
-  return negotiateStaticEncodingPreference(acceptEncoding).candidates;
+  return negotiateStaticEncodingPreference(acceptEncoding).candidates.filter(
+    (candidate): candidate is StaticEncodingCandidate => candidate !== null,
+  );
 }
 
 // Sidecars are a negotiation detail, never addressable resources: a direct

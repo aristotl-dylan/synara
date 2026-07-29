@@ -136,8 +136,12 @@ function precompressPlugin(): Plugin {
       // sidecar mid-write would otherwise get a truncated compressed stream.
       // Rename is atomic within a directory, so readers see either the old
       // sidecar or the complete new one.
+      let tempSequence = 0;
       const writeSidecarAtomically = async (sidecarPath: string, data: Buffer) => {
-        const tempPath = `${sidecarPath}.tmp`;
+        // Unique per write so concurrent builds against one outDir cannot
+        // clobber each other's staging file.
+        tempSequence += 1;
+        const tempPath = `${sidecarPath}.${process.pid}.${tempSequence}.tmp`;
         await fs.writeFile(tempPath, data);
         await fs.rename(tempPath, sidecarPath);
       };
