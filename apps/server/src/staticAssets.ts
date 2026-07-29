@@ -76,6 +76,15 @@ export function isSidecarRequestPath(relativePath: string): boolean {
 // Weak validator derived from the served file's identity (size + mtime). Must
 // be computed from the sidecar when a sidecar is served: a shared cache keyed
 // on Vary: Accept-Encoding still requires validators to differ per encoding.
+// RFC 9110 §13.1.2: If-None-Match is a comma-separated list of entity tags or
+// the wildcard. Weak comparison — a stored W/ tag matches its own value.
+export function ifNoneMatchSatisfies(headerValue: string | undefined, etag: string): boolean {
+  if (!headerValue) return false;
+  const trimmed = headerValue.trim();
+  if (trimmed === "*") return true;
+  return trimmed.split(",").some((candidate) => candidate.trim() === etag);
+}
+
 export function staticEtag(size: number, mtimeMs: number, encoding?: string): string {
   return `W/"${size.toString(16)}-${Math.trunc(mtimeMs).toString(16)}${encoding ? `-${encoding}` : ""}"`;
 }

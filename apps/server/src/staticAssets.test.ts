@@ -8,6 +8,7 @@ import {
   STATIC_ICON_CACHE_CONTROL,
   STATIC_IMMUTABLE_CACHE_CONTROL,
   STATIC_REVALIDATE_CACHE_CONTROL,
+  ifNoneMatchSatisfies,
   isSidecarRequestPath,
   negotiateStaticEncodings,
   staticCacheControl,
@@ -75,6 +76,22 @@ describe("isSidecarRequestPath", () => {
     expect(isSidecarRequestPath("assets/app.js.gz")).toBe(true);
     expect(isSidecarRequestPath("assets/app.js")).toBe(false);
     expect(isSidecarRequestPath("archive.tar.gz.txt")).toBe(false);
+  });
+});
+
+describe("ifNoneMatchSatisfies", () => {
+  const etag = 'W/"3e8-18b2a4c5d00"';
+
+  it("matches a single tag, a list member, and the wildcard", () => {
+    expect(ifNoneMatchSatisfies(etag, etag)).toBe(true);
+    expect(ifNoneMatchSatisfies(`W/"other", ${etag}`, etag)).toBe(true);
+    expect(ifNoneMatchSatisfies("*", etag)).toBe(true);
+  });
+
+  it("rejects absent headers and non-matching lists", () => {
+    expect(ifNoneMatchSatisfies(undefined, etag)).toBe(false);
+    expect(ifNoneMatchSatisfies("", etag)).toBe(false);
+    expect(ifNoneMatchSatisfies('W/"other-a", W/"other-b"', etag)).toBe(false);
   });
 });
 

@@ -56,6 +56,7 @@ import {
 } from "./serverShutdown";
 import { resolveFavicon, tryParseHost } from "./siteFaviconCache";
 import {
+  ifNoneMatchSatisfies,
   isSidecarRequestPath,
   negotiateStaticEncodings,
   staticCacheControl,
@@ -1179,7 +1180,7 @@ export const staticAndDevEffectRouteLayer = HttpRouter.add(
         const etag = staticEtag(Number(info.size), info.mtime?.getTime() ?? 0, encoding);
         const encodingHeaders = encoding ? { "Content-Encoding": encoding } : {};
         const headers = { ...cacheHeaders, ...encodingHeaders, ETag: etag };
-        if (ifNoneMatch === etag) {
+        if (ifNoneMatchSatisfies(ifNoneMatch, etag)) {
           return HttpServerResponse.empty({ status: 304, headers });
         }
         const data = yield* fileSystem
