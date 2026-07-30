@@ -43,6 +43,8 @@ export function resetThreadEnvironmentClaims(): void {
 export interface ThreadOwnershipSource {
   /** Server-reported ownership, keyed by thread id. Absent means local. */
   readonly environmentIdByThreadId?: Record<string, string> | undefined;
+  /** Server-reported ownership, keyed by project id. Absent means local. */
+  readonly environmentIdByProjectId?: Record<string, string> | undefined;
 }
 
 function readOwnershipSource(): ThreadOwnershipSource {
@@ -64,6 +66,22 @@ export function resolveThreadEnvironmentId(
   const reported = source.environmentIdByThreadId?.[threadId];
   if (reported) return reported as EnvironmentId;
   return claimedEnvironmentIdByThreadId.get(threadId) ?? LOCAL_ENVIRONMENT_ID;
+}
+
+/**
+ * The environment that owns `projectId`.
+ *
+ * Project-scoped commands (`project.meta.update`, `project.delete`,
+ * `space.projects.assign`) carry no thread, so thread ownership cannot answer
+ * for them. Without this, pinning or deleting a project that lives on a remote
+ * host mutates the LOCAL server's copy instead.
+ */
+export function resolveProjectEnvironmentId(
+  projectId: string,
+  source: ThreadOwnershipSource = readOwnershipSource(),
+): EnvironmentId {
+  const reported = source.environmentIdByProjectId?.[projectId];
+  return reported ? (reported as EnvironmentId) : LOCAL_ENVIRONMENT_ID;
 }
 
 /**
