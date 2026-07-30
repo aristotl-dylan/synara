@@ -63,8 +63,26 @@ describe("posixShellQuote", () => {
     expect(shellArgvOf(`printf '%s\\0' ${posixShellJoin(["", "x"])}`)).toEqual(["", "x"]);
   });
 
+  /**
+   * Verifies a whole batch in ONE shell invocation. Batching is not only about
+   * speed: passing every value as a separate operand of the same `printf` also
+   * proves argv BOUNDARIES hold, which a one-value-per-call harness cannot
+   * observe at all.
+   */
+  function expectRoundTrip(values: readonly string[]): void {
+    // NUL cannot survive an argv by definition; validateSshArgs and the schema
+    // reject it separately (see the NUL rejection tests below).
+    const usable = values.filter((value) => !value.includes("\u0000"));
+    expect(shellArgvOf(`printf '%s\\0' ${posixShellJoin(usable)}`)).toEqual(usable);
+  }
+
   it("neutralises command substitution, expansion and terminators", () => {
-    for (const hostile of [
+    // One shell for the whole set, via the batching helper above. Spawning a
+    // process per payload made this security test take ~6.5s against a 5s
+    // default timeout, so it flaked — and a security test that flakes is a
+    // security test that gets ignored. Batching also strengthens it: the values
+    // must survive as SEPARATE argv entries, not merely unexpanded.
+    expectRoundTrip([
       "$(touch /tmp/pwned)",
       "`id`",
       "; rm -rf /",
@@ -76,23 +94,8 @@ describe("posixShellQuote", () => {
       "*",
       "~/notexpanded",
       "\\'; id; #",
-    ]) {
-      expect(shellArgvOf(`printf '%s\\0' ${posixShellQuote(hostile)}`)).toEqual([hostile]);
-    }
+    ]);
   });
-
-  /**
-   * Verifies a whole generated batch in ONE shell invocation. Batching is not
-   * only about speed: passing every sampled value as a separate operand of the
-   * same `printf` also proves argv BOUNDARIES hold, which a one-value-per-call
-   * harness cannot observe at all.
-   */
-  function expectRoundTrip(values: readonly string[]): void {
-    // NUL cannot survive an argv by definition; validateSshArgs and the schema
-    // reject it separately (see the NUL rejection tests below).
-    const usable = values.filter((value) => !value.includes("\u0000"));
-    expect(shellArgvOf(`printf '%s\\0' ${posixShellJoin(usable)}`)).toEqual(usable);
-  }
 
   it("round-trips arbitrary strings, preserving argv boundaries", () => {
     expectRoundTrip(
