@@ -152,10 +152,7 @@ export function readLatestWsBuildSkew(environmentId: EnvironmentId): WsBuildSkew
   return latestBuildSkewByEnvironmentId.get(environmentId) ?? null;
 }
 
-export function emitWsBuildSkew(
-  environmentId: EnvironmentId,
-  skew: WsBuildSkewState | null,
-): void {
+export function emitWsBuildSkew(environmentId: EnvironmentId, skew: WsBuildSkewState | null): void {
   latestBuildSkewByEnvironmentId.set(environmentId, skew);
   if (
     typeof window === "undefined" ||
@@ -195,5 +192,4 @@ export function resetWsTransportEventsForTests(): void {
   latestTransportStateByEnvironmentId.clear();
   latestCompatibilityIssueByEnvironmentId.clear();
   latestBuildSkewByEnvironmentId.clear();
-}
 }

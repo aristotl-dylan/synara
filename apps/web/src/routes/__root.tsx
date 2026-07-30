@@ -69,6 +69,7 @@ import {
   onThreadStreamFailure,
   onWsEnvironmentRegistryChange,
 } from "../wsEnvironmentRegistry";
+import { LOCAL_ENVIRONMENT_ID } from "~/environmentIdentity";
 import {
   addWsBuildSkewListener,
   addWsCompatibilityIssueListener,
@@ -271,8 +272,15 @@ function RootRouteView() {
  * for the whole session rather than being dismissible.
  */
 function TransportBuildSkewNotice() {
-  const [skew, setSkew] = useState<WsBuildSkewState | null>(() => readLatestWsBuildSkew());
-  useEffect(() => addWsBuildSkewListener(setSkew, { replayCurrent: true }), []);
+  // Skew is per-environment; this notice covers the local server, which is the
+  // only environment that can currently dispatch writes (see issue #18).
+  const [skew, setSkew] = useState<WsBuildSkewState | null>(() =>
+    readLatestWsBuildSkew(LOCAL_ENVIRONMENT_ID),
+  );
+  useEffect(
+    () => addWsBuildSkewListener(LOCAL_ENVIRONMENT_ID, setSkew, { replayCurrent: true }),
+    [],
+  );
   if (!skew) return null;
 
   return (
