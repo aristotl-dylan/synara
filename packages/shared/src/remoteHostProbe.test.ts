@@ -124,9 +124,13 @@ describe("renderRemoteProbeCommand", () => {
 });
 
 describe("probe script behaviour against a real shell", () => {
-  function runProbeScript(cwd: string, binary: string): RemoteProbeExecution {
+  function runProbeScript(
+    cwd: string,
+    binary: string,
+    versionArgs: readonly string[] = ["--version"],
+  ): RemoteProbeExecution {
     const script = buildRemoteScript({
-      target: { cwd, binary, args: [], versionArgs: ["--version"] },
+      target: { cwd, binary, args: [], versionArgs: [...versionArgs] },
       probe: PROBE_MARKERS,
     });
     const argv = buildLauncherArgv({ kind: "direct" }, script);
@@ -167,14 +171,17 @@ describe("probe script behaviour against a real shell", () => {
   });
 
   it("reports ok with the version when the real script succeeds", () => {
+    // `echo --version` is echoed verbatim by BSD echo but interpreted as a flag
+    // by GNU coreutils, so the probe's version argument here is one no echo
+    // implementation can claim: the assertion then holds on every platform.
     const result = classifyRemoteProbe({
-      execution: runProbeScript(tmpdir(), "/bin/echo"),
+      execution: runProbeScript(tmpdir(), "/bin/echo", ["synara-probe-version"]),
       signature: "sig",
       checkedAt: new Date(0).toISOString(),
       target: TARGET,
     });
     expect(result.outcome).toBe("ok");
-    expect(result.version).toBe("--version");
+    expect(result.version).toBe("synara-probe-version");
   });
 
   it("detects shell startup output as noisy-shell through a real login shell", () => {
