@@ -169,6 +169,19 @@ export function proxyEnvironmentHttpRequest(
         if (!response.destroyed) response.destroy();
         if (!upstreamResponse.destroyed) upstreamResponse.destroy();
       };
+      // Both listeners, deliberately, and NOT because they cover different
+      // failures — measured, they do not. A premature FIN and an ECONNRESET
+      // both emit `aborted` and then `error`, in that order, so on today's Node
+      // either listener alone would suffice and the mid-response test only
+      // fails when BOTH are removed. `truncate` is idempotent (it checks
+      // `destroyed`), so the double call is free.
+      //
+      // Keep both anyway: which of the two an errored `IncomingMessage` emits
+      // is a Node implementation detail, not a documented contract, and an
+      // unhandled `error` on a stream with no listener is a process-level
+      // throw. Relying on `aborted` always preceding it would make this file's
+      // safety depend on undocumented ordering. If you delete one because CI
+      // stays green, that is the test's blind spot, not evidence it is dead.
       upstreamResponse.on("error", (error) =>
         truncate("environment proxy upstream response failed", error),
       );
