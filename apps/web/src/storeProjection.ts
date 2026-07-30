@@ -1008,7 +1008,52 @@ function isStaleSnapshot(
   // Compared only against the same environment's high-water mark: sequences from
   // different servers are unrelated counters, and a shared one would reject a
   // second server's first snapshot as "stale".
-  return snapshotSequence < (state.shellSnapshotSequenceByEnvironmentId?.[environmentId] ?? 0);
+  return snapshotSequence < snapshotFenceFor(state, environmentId);
+}
+
+/**
+ * The high-water snapshot sequence for one environment.
+ *
+ * The local environment reads `shellSnapshotSequence` rather than carrying a
+ * duplicate entry in the per-environment map. Two fields holding the same fact
+ * can drift, and they did: any caller that reset `shellSnapshotSequence` alone
+ * (every store reset written before this map existed, including the browser
+ * suite's) left a stale local fence behind that silently rejected the next
+ * snapshot as out of date. Keeping one source of truth per environment makes
+ * that class of bug unrepresentable — the map holds remote environments only.
+ */
+function snapshotFenceFor(state: AppState, environmentId: EnvironmentId): number {
+  if (environmentId === LOCAL_ENVIRONMENT_ID) return state.shellSnapshotSequence ?? 0;
+  return state.shellSnapshotSequenceByEnvironmentId?.[environmentId] ?? 0;
+}
+
+/**
+ * Records an environment's new high-water mark. Local advances
+ * `shellSnapshotSequence`; remote environments advance their map entry.
+ */
+function advanceSnapshotFence(
+  state: AppState,
+  environmentId: EnvironmentId,
+  snapshotSequence: number,
+): Pick<AppState, "shellSnapshotSequence" | "shellSnapshotSequenceByEnvironmentId"> {
+  if (environmentId === LOCAL_ENVIRONMENT_ID) {
+    return {
+      shellSnapshotSequence: Math.max(state.shellSnapshotSequence ?? 0, snapshotSequence),
+      ...(state.shellSnapshotSequenceByEnvironmentId
+        ? { shellSnapshotSequenceByEnvironmentId: state.shellSnapshotSequenceByEnvironmentId }
+        : {}),
+    };
+  }
+  const previous = state.shellSnapshotSequenceByEnvironmentId ?? {};
+  return {
+    ...(state.shellSnapshotSequence === undefined
+      ? {}
+      : { shellSnapshotSequence: state.shellSnapshotSequence }),
+    shellSnapshotSequenceByEnvironmentId: {
+      ...previous,
+      [environmentId]: Math.max(previous[environmentId] ?? 0, snapshotSequence),
+    },
+  };
 }
 
 /**
@@ -1038,18 +1083,6 @@ function nextEnvironmentIdByThreadId(
   return recordsShallowEqual(previous, next) ? previous : next;
 }
 
-/** Advances the local environment's entry in the per-environment sequence map. */
-function withLocalSnapshotSequence(
-  state: AppState,
-  snapshotSequence: number,
-): Record<string, number> {
-  const previous = state.shellSnapshotSequenceByEnvironmentId ?? {};
-  return {
-    ...previous,
-    [LOCAL_ENVIRONMENT_ID]: Math.max(previous[LOCAL_ENVIRONMENT_ID] ?? 0, snapshotSequence),
-  };
-}
-
 /** Threads the store holds for environments other than `environmentId`. */
 function threadIdsOutsideEnvironment(
   state: AppState,
@@ -1077,7 +1110,7 @@ function retireConfirmedDeletionTombstones(
   presentProjectIds: ReadonlySet<string>,
   environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
 ): AppState {
-  if (snapshotSequence < (state.shellSnapshotSequenceByEnvironmentId?.[environmentId] ?? 0)) {
+  if (snapshotSequence < snapshotFenceFor(state, environmentId)) {
     return state;
   }
   const deletedThreadIdsById = retireDeletionTombstones(
@@ -1369,23 +1402,7 @@ export function syncServerShellSnapshot(
   return retireConfirmedDeletionTombstones(
     {
       ...normalizedState,
-      // The local value stays the local server's, because optimistic deletes
-      // derive tombstone sequences from it and those are local-only.
-      ...(environmentId === LOCAL_ENVIRONMENT_ID
-        ? {
-            shellSnapshotSequence: Math.max(
-              state.shellSnapshotSequence ?? 0,
-              snapshot.snapshotSequence,
-            ),
-          }
-        : {}),
-      shellSnapshotSequenceByEnvironmentId: {
-        ...(state.shellSnapshotSequenceByEnvironmentId ?? {}),
-        [environmentId]: Math.max(
-          state.shellSnapshotSequenceByEnvironmentId?.[environmentId] ?? 0,
-          snapshot.snapshotSequence,
-        ),
-      },
+      ...advanceSnapshotFence(state, environmentId, snapshot.snapshotSequence),
       spaces,
       projects,
       sidebarThreadSummaryById,
@@ -1607,10 +1624,6 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
         ? {
             ...state,
             shellSnapshotSequence: readModel.snapshotSequence,
-            shellSnapshotSequenceByEnvironmentId: withLocalSnapshotSequence(
-              state,
-              readModel.snapshotSequence,
-            ),
           }
         : state;
     return retireConfirmedDeletionTombstones(
@@ -1624,10 +1637,6 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     {
       ...normalizedState,
       shellSnapshotSequence: Math.max(state.shellSnapshotSequence ?? 0, readModel.snapshotSequence),
-      shellSnapshotSequenceByEnvironmentId: withLocalSnapshotSequence(
-        state,
-        readModel.snapshotSequence,
-      ),
       spaces,
       projects,
       sidebarThreadSummaryById,

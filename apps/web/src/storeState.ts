@@ -23,20 +23,23 @@ export type ThreadDetailSyncState = "synced" | "failed";
 
 export interface AppState {
   /**
-   * Highest authoritative snapshot integrated for the local server.
-   *
-   * Retained as the local environment's value because optimistic project/space
-   * deletes derive their tombstone sequence from it and those are local-only
-   * concepts. Cross-environment staleness is decided by
-   * `shellSnapshotSequenceByEnvironmentId`.
+   * Highest authoritative snapshot integrated for the local server, and the
+   * sole fence for it — the per-environment map below deliberately does not
+   * carry a local entry. Optimistic project/space deletes also derive their
+   * tombstone sequence from this value.
    */
   shellSnapshotSequence?: number;
   /**
-   * Highest snapshot integrated per environment. Snapshot sequences are
+   * Highest snapshot integrated per REMOTE environment. Snapshot sequences are
    * per-server SQLite autoincrement values, so comparing one environment's
    * sequence against another's is meaningless: two servers both emitting
    * snapshot 1 are unrelated events, and a single shared counter would make the
    * second look stale and drop it.
+   *
+   * The local server is excluded on purpose. Duplicating its fence here once
+   * caused a silent hydration failure: resets that predate this field zero
+   * `shellSnapshotSequence` alone, leaving a stale local entry behind that
+   * rejected every later snapshot. One source of truth per environment.
    */
   shellSnapshotSequenceByEnvironmentId?: Record<string, number>;
   /**

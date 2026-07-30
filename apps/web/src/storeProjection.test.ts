@@ -2340,6 +2340,50 @@ describe("multi-environment shell aggregation", () => {
     expect(afterRemoteLow.threadIds).toContain(remoteThreadId);
     expect(afterRemoteLow.threadIds).toContain(localThreadId);
     expect(afterRemoteLow.shellSnapshotSequenceByEnvironmentId?.[remoteEnvironmentId]).toBe(2);
-    expect(afterRemoteLow.shellSnapshotSequenceByEnvironmentId?.[LOCAL_ENVIRONMENT_ID]).toBe(500);
+    // The local fence lives in shellSnapshotSequence alone, never duplicated
+    // into the map, so a reset that only knows the old field fully clears it.
+    expect(afterRemoteLow.shellSnapshotSequence).toBe(500);
+    expect(
+      afterRemoteLow.shellSnapshotSequenceByEnvironmentId?.[LOCAL_ENVIRONMENT_ID],
+    ).toBeUndefined();
+  });
+
+  it("keeps the local fence in shellSnapshotSequence so a partial reset fully clears it", () => {
+    // Regression: the local fence was duplicated into the per-environment map.
+    // Every store reset written before that map existed zeroes
+    // shellSnapshotSequence alone, so the duplicate survived and silently
+    // rejected the next snapshot as stale — the browser suite stopped
+    // hydrating and 60 tests timed out waiting for UI that never rendered.
+    const hydrated = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 500,
+    });
+
+    // The local fence must live in exactly one place.
+    expect(hydrated.shellSnapshotSequence).toBe(500);
+    expect(hydrated.shellSnapshotSequenceByEnvironmentId?.[LOCAL_ENVIRONMENT_ID]).toBeUndefined();
+
+    // A reset that knows nothing about the per-environment map must be enough.
+    const afterReset = { ...hydrated, shellSnapshotSequence: 0, threadsHydrated: false };
+    const rehydrated = syncServerShellSnapshot(afterReset, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local again")),
+      snapshotSequence: 2,
+    });
+
+    expect(rehydrated.threadsHydrated).toBe(true);
+    expect(rehydrated.threadIds).toContain(localThreadId);
+  });
+
+  it("clears a remote fence with the environment's own registry teardown", () => {
+    // The remote half of the same concern: a remote fence lives in the map, and
+    // nothing in a local store reset should be expected to clear it.
+    const hydrated = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+
+    expect(hydrated.shellSnapshotSequenceByEnvironmentId?.[remoteEnvironmentId]).toBe(500);
+    expect(hydrated.shellSnapshotSequence).toBe(0);
   });
 });
