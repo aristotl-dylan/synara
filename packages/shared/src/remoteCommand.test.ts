@@ -8,11 +8,11 @@ import * as FastCheck from "effect/testing/FastCheck";
 import { describe, expect, it } from "vitest";
 
 import {
+  ALLOWED_SSH_OPTIONS,
   buildLauncherArgv,
   buildRemoteScript,
   buildSshArgv,
   DETACHING_LAUNCHER_COMMANDS,
-  FORBIDDEN_SSH_OPTIONS,
   posixShellJoin,
   posixShellQuote,
   PROBE_EXIT_BINARY_MISSING,
@@ -326,35 +326,106 @@ describe("buildSshArgv", () => {
     expect(args.indexOf("ConnectTimeout=45")).toBeLessThan(args.indexOf("ConnectTimeout=10"));
   });
 
-  it("refuses every ssh option that would weaken or hijack the connection", () => {
-    for (const option of FORBIDDEN_SSH_OPTIONS) {
+  it("accepts every option on the allowlist, in each spelling ssh understands", () => {
+    for (const option of ALLOWED_SSH_OPTIONS) {
       for (const spelling of [
-        [`-o`, `${option}=x`],
+        ["-o", `${option}=x`],
         [`-o${option}=x`],
-        [`-o`, `${option} x`],
-        [`-o`, `${option.toUpperCase()}=x`],
+        ["-o", `${option} x`],
+        ["-o", `${option.toUpperCase()}=x`],
       ]) {
-        expect(() => validateSshArgs(spelling)).toThrow(RemoteHostConfigError);
+        expect(() => validateSshArgs(spelling)).not.toThrow();
       }
     }
   });
 
-  it("refuses in particular to disable host-key checking through sshArgs", () => {
-    for (const spelling of [
-      ["-o", "StrictHostKeyChecking=no"],
-      ["-oStrictHostKeyChecking=no"],
-      ["-o", "stricthostkeychecking=no"],
-      ["-o", "UserKnownHostsFile=/dev/null"],
-      ["-o", "Include=/tmp/evil"],
+  it("accepts the allowlisted flags a user reaches for", () => {
+    for (const args of [
+      ["-p", "2222"],
+      ["-p2222"],
+      ["-i", "/home/dev/.ssh/id_ed25519"],
+      ["-J", "bastion.example.com"],
+      ["-l", "deploy"],
+      ["-c", "aes128-gcm@openssh.com"],
+      ["-b", "10.0.0.2"],
+      ["-m", "hmac-sha2-256"],
+      ["-4"],
+      ["-6"],
+      ["-C"],
+      ["-a"],
+      ["-x"],
+      // Several at once, mixing attached and separated values.
+      ["-4", "-p2222", "-i", "/k", "-o", "Compression=yes", "-J", "bastion"],
     ]) {
-      expect(() => validateSshArgs(spelling)).toThrow(/host-key|managed by Synara/i);
+      expect(() => validateSshArgs(args)).not.toThrow();
     }
   });
 
-  it("refuses ssh flags that break the stream or our multiplexing", () => {
-    for (const flag of ["-t", "-tt", "-f", "-N", "-n", "-M", "-S", "-L", "-R", "-D", "-W"]) {
-      expect(() => validateSshArgs([flag])).toThrow(RemoteHostConfigError);
+  it("refuses anything not on the allowlist, in every spelling ssh would accept", () => {
+    for (const args of [
+      // -F swaps in another config file, which is a bypass of the whole option
+      // allowlist at once. Both spellings.
+      ["-F/dev/null"],
+      ["-F", "/dev/null"],
+      // Executes a command on THIS machine before any connection.
+      ["-oProxyCommand=printf pwned"],
+      ["-o", "ProxyCommand=printf pwned"],
+      ["-o", "LocalCommand=printf pwned"],
+      ["-o", "PermitLocalCommand=yes"],
+      ["-o", "Match exec printf pwned"],
+      // Control socket, short flag and long option alike.
+      ["-S/tmp/attacker.sock"],
+      ["-S", "/tmp/attacker.sock"],
+      ["-o", "ControlPath=/tmp/attacker.sock"],
+      ["-M"],
+      // A pty corrupts the protocol stream.
+      ["-tt"],
+      ["-t"],
+      ["-vtt"],
+      ["-o", "RequestTTY=yes"],
+      // Host-key verification.
+      ["-o", "StrictHostKeyChecking=no"],
+      ["-oStrictHostKeyChecking=no"],
+      ["-o", "stricthostkeychecking=no"],
+      ["-o", "StrictHostKeyChecking no"],
+      ["-o", "UserKnownHostsFile=/dev/null"],
+      ["-o", "Include=/tmp/evil"],
+      ["-o", "BatchMode=no"],
+      // Detach, forwarding and stream redirection.
+      ["-f"],
+      ["-N"],
+      ["-n"],
+      ["-g"],
+      ["-L", "8080:localhost:80"],
+      ["-R", "8080:localhost:80"],
+      ["-D", "1080"],
+      ["-W", "host:22"],
+      ["-w", "0:0"],
+      // A flag hidden in the value position of an allowlisted flag.
+      ["-p", "-oProxyCommand=printf pwned"],
+      ["-i", "-F/dev/null"],
+      // An allowlisted value flag with nothing to consume.
+      ["-p"],
+      ["-o"],
+      // Repeated and long-form spellings.
+      ["-o", "Compression=yes", "-o", "ProxyCommand=printf pwned"],
+      ["--config=/dev/null"],
+    ]) {
+      expect(() => validateSshArgs(args)).toThrow(RemoteHostConfigError);
     }
+  });
+
+  it("refuses option names case-insensitively, since ssh compares them that way", () => {
+    for (const spelling of ["PROXYCOMMAND", "proxycommand", "ProxyCoMmAnD"]) {
+      expect(() => validateSshArgs(["-o", `${spelling}=printf pwned`])).toThrow(
+        RemoteHostConfigError,
+      );
+    }
+  });
+
+  it("points a refused user at the ~/.ssh/config escape hatch", () => {
+    expect(() => validateSshArgs(["-o", "ProxyCommand=printf pwned"])).toThrow(/~\/\.ssh\/config/);
+    expect(() => validateSshArgs(["-F", "/dev/null"])).toThrow(/~\/\.ssh\/config/);
   });
 
   it("refuses a destination that ssh would read as a flag or split into words", () => {

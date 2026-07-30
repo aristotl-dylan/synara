@@ -151,11 +151,12 @@ export const RemoteHostConfig = Schema.Struct({
   ),
   /**
    * Extra `ssh` arguments, placed BEFORE our defaults so ssh's first-value-wins
-   * rule lets a user genuinely override an option we set. Options that would
-   * weaken host-key verification, re-enable interactive prompts, allocate a tty,
-   * or seize our multiplexing sockets are refused by the decider in
-   * `@synara/shared/remoteCommand` — the ordering is a usability affordance, not
-   * an escape hatch.
+   * rule lets a user genuinely override an option we set. The decider in
+   * `@synara/shared/remoteCommand` accepts only an explicit allowlist of flags
+   * and `-o` options, so an argument nobody modelled is refused rather than
+   * passed through — the ordering is a usability affordance, not an escape
+   * hatch. The escape hatch is a `~/.ssh/config` Host alias used as the
+   * `destination`.
    */
   sshArgs: Schema.Array(Schema.String.check(Schema.isMaxLength(SSH_ARG_MAX_LENGTH)))
     .check(Schema.isMaxLength(SSH_ARGS_MAX_ITEMS))

@@ -90,66 +90,110 @@ export const DETACHING_LAUNCHER_FLAGS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * ssh options nobody may set through `sshArgs`.
+ * `sshArgs` is an ALLOWLIST, not a denylist.
  *
- * `sshArgs` are placed before our defaults so ssh's first-value-wins rule lets a
- * user genuinely override a timeout or a cipher. That ordering is a usability
- * affordance, and it is exactly why this list has to exist: without it, "before
- * ours" would also mean "can turn off host-key verification".
+ * The arguments are placed before our defaults so ssh's first-value-wins rule
+ * lets a user genuinely override a timeout or a cipher. That ordering is what
+ * makes the surface dangerous, and a denylist of option names cannot hold it:
+ * ssh spells the same capability several ways (`-S` is `ControlPath`, `-t` is
+ * `RequestTTY`, and `-F` replaces the config file wholesale — and with it every
+ * option name a denylist could ever enumerate), so any spelling nobody thought
+ * of sails through. An allowlist inverts that: an unmodelled spelling is simply
+ * not on the list, so it fails closed.
  *
- * Keys are compared lower-cased because ssh option names are case-insensitive.
+ * The escape hatch for anything not listed here is the user's own
+ * `~/.ssh/config`. `destination` accepts a Host alias, and ssh applies that
+ * host's ProxyCommand, ProxyJump, identities and forwards exactly as it does in
+ * a terminal. That file is the user's own trusted territory; `sshArgs` is a
+ * value persisted in Synara's state and writable by any route that can reach the
+ * state file, which is why it gets the narrower grammar.
  */
-export const FORBIDDEN_SSH_OPTIONS: ReadonlySet<string> = new Set([
-  // Host-key verification can never be silently disabled.
-  "stricthostkeychecking",
-  "userknownhostsfile",
-  "globalknownhostsfile",
-  "checkhostip",
-  "nohostauthenticationforlocalhost",
-  // BatchMode=no re-enables password/passphrase prompts, which hang forever on a
-  // non-interactive stdin instead of failing.
-  "batchmode",
-  // A pty turns the protocol stream into a terminal session (echo, CR/LF
-  // translation, signal characters) and silently corrupts it.
-  "requesttty",
-  // Multiplexing is ours; letting config point it elsewhere both breaks reuse and
-  // lets a socket path be chosen in a directory another user can write.
-  "controlmaster",
-  "controlpath",
-  "controlpersist",
-  // Runs an arbitrary command on THIS machine every time we connect.
-  "permitlocalcommand",
-  "localcommand",
-  // Include is evaluated where it appears. Placed before our options it would win
-  // first-value-wins, which is a complete bypass of every entry above.
-  "include",
+
+/**
+ * `-o Key=value` names a user may set. Every entry either tunes the transport or
+ * selects credentials. None can execute a local command (ProxyCommand,
+ * LocalCommand, PermitLocalCommand, `Match exec`), relocate the config,
+ * known-hosts or control state ssh reads and writes (Include, UserKnownHostsFile,
+ * ControlPath), or switch off a guarantee the rest of this module depends on
+ * (StrictHostKeyChecking, BatchMode, RequestTTY, our multiplexing).
+ *
+ * Compared lower-cased: ssh option names are case-insensitive.
+ */
+export const ALLOWED_SSH_OPTIONS: ReadonlySet<string> = new Set([
+  // Transport tuning.
+  "addressfamily",
+  "compression",
+  "connectionattempts",
+  "connecttimeout",
+  "ipqos",
+  "port",
+  "serveralivecountmax",
+  "serveraliveinterval",
+  "tcpkeepalive",
+  // Algorithm selection: a host that only speaks older or newer crypto than our
+  // client's default is a real reason to reach for sshArgs.
+  "ciphers",
+  "hostkeyalgorithms",
+  "kexalgorithms",
+  "macs",
+  "pubkeyacceptedalgorithms",
+  // Credentials and routing. ProxyJump is listed because ssh resolves it itself,
+  // by opening an inner ssh connection — unlike ProxyCommand, which hands a
+  // string to a local shell and therefore can never be listed.
+  "identitiesonly",
+  "identityfile",
+  "preferredauthentications",
+  "proxyjump",
+  "pubkeyauthentication",
+  "user",
+  // Environment, handed to the remote side only.
+  "sendenv",
+  "setenv",
 ]);
 
-/** ssh flags refused for the same reasons as the options above. */
-export const FORBIDDEN_SSH_FLAGS: ReadonlySet<string> = new Set([
-  "-t", // force pty
-  "-tt",
-  "-f", // background before command execution
-  "-N", // no remote command
-  "-n", // redirect stdin from /dev/null — we need stdin for the protocol
-  "-g",
-  "-M", // master mode; multiplexing is ours
-  "-S", // control socket path
-  "-W",
-  "-w",
-  "-L",
-  "-R",
-  "-D",
+/** Short flags taking a value, either as the next argv element or attached. */
+export const ALLOWED_SSH_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "-b", // bind address
+  "-c", // cipher spec
+  "-i", // identity file
+  "-J", // jump host, i.e. ProxyJump
+  "-l", // login user
+  "-m", // MAC spec
+  "-o", // option, gated by ALLOWED_SSH_OPTIONS
+  "-p", // port
 ]);
 
-function parseSshOptionKey(token: string, next: string | undefined): string | undefined {
-  const raw = token === "-o" ? next : token.startsWith("-o") ? token.slice(2) : undefined;
-  if (raw === undefined) return undefined;
-  // ssh accepts both `Key=value` and `Key value` inside a single -o argument.
+/** Short flags taking no value. Each one only ever restricts what ssh does. */
+export const ALLOWED_SSH_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
+  "-4", // force IPv4
+  "-6", // force IPv6
+  "-C", // compression
+  "-a", // disable agent forwarding
+  "-x", // disable X11 forwarding
+]);
+
+const SSH_ARGS_ESCAPE_HATCH =
+  "Anything else belongs in your own ~/.ssh/config: put the settings under a Host alias and use that alias as the destination.";
+
+function sortedList(values: Iterable<string>): string {
+  return [...values].sort().join(", ");
+}
+
+function refuseSshArg(reason: string): never {
+  throw new RemoteHostConfigError(
+    "sshArgs",
+    `${reason} Allowed ssh flags are ${sortedList([
+      ...ALLOWED_SSH_BOOLEAN_FLAGS,
+      ...ALLOWED_SSH_VALUE_FLAGS,
+    ])}. ${SSH_ARGS_ESCAPE_HATCH}`,
+  );
+}
+
+/** Lower-cased option name from a `-o` value, which is `Key=value` or `Key value`. */
+function parseSshOptionKey(raw: string): string {
   const trimmed = raw.trimStart();
   const separator = trimmed.search(/[=\s]/);
-  const key = separator === -1 ? trimmed : trimmed.slice(0, separator);
-  return key.toLowerCase();
+  return (separator === -1 ? trimmed : trimmed.slice(0, separator)).toLowerCase();
 }
 
 function assertNoLeadingDash(field: string, value: string, what: string): void {
@@ -159,27 +203,61 @@ function assertNoLeadingDash(field: string, value: string, what: string): void {
 }
 
 /**
- * Validates every user-supplied ssh argument. Returns the arguments unchanged so
- * callers cannot accidentally use the unvalidated list.
+ * Validates every user-supplied ssh argument against the allowlist above.
+ * Returns the arguments unchanged so callers cannot accidentally use the
+ * unvalidated list.
  */
 export function validateSshArgs(args: readonly string[]): readonly string[] {
-  for (let index = 0; index < args.length; index += 1) {
-    const token = args[index] as string;
+  // Every element, flag or value alike, before any of them is interpreted.
+  for (const token of args) {
     if (token.includes("\u0000")) {
       throw new RemoteHostConfigError("sshArgs", "ssh arguments may not contain NUL bytes.");
     }
-    if (FORBIDDEN_SSH_FLAGS.has(token)) {
-      throw new RemoteHostConfigError(
-        "sshArgs",
-        `The ssh flag "${token}" is not allowed: it would break the session stream or Synara's connection reuse.`,
-      );
+  }
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index] as string;
+    if (ALLOWED_SSH_BOOLEAN_FLAGS.has(token)) continue;
+
+    // A value flag is either its own argv element (`-p 2222`) or carries the
+    // value attached (`-p2222`). Only these two shapes are recognised, so a
+    // bundle like `-vtt` and an unlisted flag like `-F` fall through to the
+    // refusal below rather than being read as a listed flag plus a value.
+    let flag: string | undefined;
+    let value: string | undefined;
+    if (ALLOWED_SSH_VALUE_FLAGS.has(token)) {
+      flag = token;
+      value = args[index + 1];
+      if (value === undefined) refuseSshArg(`The ssh flag "${token}" needs a value.`);
+      // Consumed here as data: to ssh it is a value too, never a flag of its own.
+      index += 1;
+    } else {
+      for (const candidate of ALLOWED_SSH_VALUE_FLAGS) {
+        if (token.length > candidate.length && token.startsWith(candidate)) {
+          flag = candidate;
+          value = token.slice(candidate.length);
+          break;
+        }
+      }
     }
-    const optionKey = parseSshOptionKey(token, args[index + 1]);
-    if (optionKey !== undefined && FORBIDDEN_SSH_OPTIONS.has(optionKey)) {
-      throw new RemoteHostConfigError(
-        "sshArgs",
-        `The ssh option "${optionKey}" is managed by Synara and cannot be overridden. Host-key verification in particular can never be turned off.`,
-      );
+    if (flag === undefined || value === undefined) {
+      refuseSshArg(`The ssh argument "${token}" is not allowed.`);
+    }
+
+    // No port, path, user, cipher spec or jump host legitimately begins with a
+    // dash, so a dashed value is either a mistake or a flag smuggled in behind
+    // the one it hides under.
+    if (value.startsWith("-")) {
+      refuseSshArg(`The value for "${flag}" may not start with "-".`);
+    }
+    if (flag === "-o") {
+      const key = parseSshOptionKey(value);
+      if (!ALLOWED_SSH_OPTIONS.has(key)) {
+        throw new RemoteHostConfigError(
+          "sshArgs",
+          `The ssh option "${key}" is not allowed. Synara accepts only ${sortedList(ALLOWED_SSH_OPTIONS)}. ${SSH_ARGS_ESCAPE_HATCH}`,
+        );
+      }
     }
   }
   return args;
@@ -239,8 +317,9 @@ export function validateLauncher(launcher: RemoteLauncher): RemoteLauncher {
  * is built, so a config that slipped in by any other route still cannot run.
  */
 export function validateRemoteHostConfig(config: RemoteHostConfig): RemoteHostConfig {
-  // ssh has no `--` end-of-options marker, so a destination beginning with `-`
-  // would be consumed as a local ssh flag.
+  // buildSshArgv also passes `--`, but a dashed destination is refused here too:
+  // this is the gate a persisted config passes through, and it should never hold
+  // a value whose safety depends on one caller remembering a separator.
   assertNoLeadingDash("destination", config.destination, "An ssh destination");
   if (/\s/.test(config.destination) || config.destination.includes("\u0000")) {
     throw new RemoteHostConfigError(
@@ -435,7 +514,10 @@ export function buildSshArgv(input: BuildSshArgvInput): SshInvocation {
     );
   }
 
-  args.push(config.destination, ...input.remoteArgv.map(posixShellQuote));
+  // `--` ends ssh's own option parsing, so the destination is positional even if
+  // a dashed value ever reached here. validateRemoteHostConfig already refuses a
+  // dashed destination; this is the second, independent guarantee.
+  args.push("--", config.destination, ...input.remoteArgv.map(posixShellQuote));
 
   return { command: config.sshBinary ?? "ssh", args };
 }
