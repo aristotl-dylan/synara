@@ -26,6 +26,7 @@ import {
   type RuntimeMode,
   type ServerConfigShape,
 } from "./config";
+import { AUTH_TOKEN_FILE_ENV, AuthTokenFileError, resolveAuthToken } from "./authTokenFile";
 import { fixPath, resolveBaseDir } from "./os-jank";
 import { normalizeHttpsPublicOrigin, remoteAccessPolicyError } from "./remoteAccessPolicy";
 import { Open } from "./open";
@@ -86,6 +87,7 @@ interface CliInput {
   readonly allowInsecureRemote: BooleanFlagInput;
   readonly noBrowser: BooleanFlagInput;
   readonly authToken: Option.Option<string>;
+  readonly authTokenFile: Option.Option<string>;
   readonly autoBootstrapProjectFromCwd: BooleanFlagInput;
   readonly logProviderEvents: BooleanFlagInput;
   readonly logWebSocketEvents: BooleanFlagInput;
@@ -152,6 +154,10 @@ const CliEnvConfig = Config.all({
   allowInsecureRemote: optionalBooleanEnvironmentConfig("SYNARA_ALLOW_INSECURE_REMOTE"),
   noBrowser: optionalBooleanEnvironmentConfig("SYNARA_NO_BROWSER"),
   authToken: Config.string("SYNARA_AUTH_TOKEN").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  authTokenFile: Config.string(AUTH_TOKEN_FILE_ENV).pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
@@ -223,7 +229,24 @@ const ServerConfigLive = (input: CliInput) =>
           new StartupError({ message: "Failed to secure Synara's local state directory", cause }),
       });
       const noBrowser = resolveBooleanConfig(input.noBrowser, env.noBrowser, mode === "desktop");
-      const authToken = Option.getOrUndefined(input.authToken) ?? env.authToken;
+      // A credential FILE beats the environment: the supervisor unit sets the
+      // file, and a stale SYNARA_AUTH_TOKEN in an operator's shell must never
+      // win over the credential the broker provisioned and will present.
+      const authToken = yield* Effect.try({
+        try: () =>
+          resolveAuthToken({
+            authToken: Option.getOrUndefined(input.authToken) ?? env.authToken,
+            authTokenFile: Option.getOrUndefined(input.authTokenFile) ?? env.authTokenFile,
+          }),
+        catch: (cause) =>
+          new StartupError({
+            message:
+              cause instanceof AuthTokenFileError
+                ? cause.message
+                : `Failed to read the ${AUTH_TOKEN_FILE_ENV} credential`,
+            cause,
+          }),
+      });
       const desktopShutdownToken = env.desktopShutdownToken ?? liveProcessDesktopShutdownToken;
       const autoBootstrapProjectFromCwd = resolveBooleanConfig(
         input.autoBootstrapProjectFromCwd,
@@ -506,6 +529,12 @@ const authTokenFlag = Flag.string("auth-token").pipe(
   Flag.withAlias("token"),
   Flag.optional,
 );
+const authTokenFileFlag = Flag.string("auth-token-file").pipe(
+  Flag.withDescription(
+    `Path to a file containing the auth token (equivalent to ${AUTH_TOKEN_FILE_ENV}). Takes precedence over --auth-token; keeps the credential out of the process environment.`,
+  ),
+  Flag.optional,
+);
 const autoBootstrapProjectFromCwdFlag = optionalBooleanFlag("auto-bootstrap-project-from-cwd", {
   description: "Create a project for the current working directory on startup when missing.",
 });
@@ -541,6 +570,7 @@ const baseServerCommand = Command.make("synara", {
   allowInsecureRemote: allowInsecureRemoteFlag,
   noBrowser: noBrowserFlag,
   authToken: authTokenFlag,
+  authTokenFile: authTokenFileFlag,
   autoBootstrapProjectFromCwd: autoBootstrapProjectFromCwdFlag,
   logProviderEvents: logProviderEventsFlag,
   logWebSocketEvents: logWebSocketEventsFlag,
