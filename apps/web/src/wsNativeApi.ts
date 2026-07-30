@@ -1,7 +1,7 @@
 // FILE: wsNativeApi.ts
-// Purpose: NativeApi implementation backed by the browser WebSocket RPC transport.
+// Purpose: NativeApi implementation backed by one environment's WebSocket RPC transport.
 // Layer: Web transport adapter
-// Exports: createWsNativeApi and event subscription helpers for server push channels.
+// Exports: createWsEnvironmentClient, the per-environment client shape, and its channel registries.
 
 import {
   type AuthBearerBootstrapResult,
@@ -21,6 +21,7 @@ import {
   type ExternalMcpIntegration,
   type ExternalMcpRefreshPairingInput,
   type ExternalMcpRevokeIntegrationInput,
+  type EnvironmentId,
   type ThreadId,
   type ThreadBrowserState,
   type GitActionProgressEvent,
@@ -47,7 +48,15 @@ import { VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH } from "@synara/shared/binaryTran
 
 import { showConfirmDialogFallback } from "./confirmDialogFallback";
 import { showContextMenuFallback } from "./contextMenuFallback";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
+import {
+  createFallbackBrowserWorkspace,
+  cloneBrowserState,
+  createFallbackTab,
+  defaultBrowserTitle,
+} from "./fallbackBrowserWorkspace";
 import { requireHttpExternalUrl } from "./lib/externalUrl";
+import { createListenerRegistry, type ListenerRegistry } from "./listenerRegistry";
 import { WsTransport, type WsThreadStreamFailure } from "./wsTransport";
 import {
   emitWsBuildSkew,
@@ -58,58 +67,31 @@ import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
 
 export type { WsThreadStreamFailure } from "./wsTransport";
 
-let instance: { api: NativeApi; transport: WsTransport } | null = null;
-
-function createListenerRegistry<T>() {
-  const listeners = new Set<(payload: T) => void>();
-  return {
-    get size() {
-      return listeners.size;
-    },
-    subscribe(listener: (payload: T) => void) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
-    emit(payload: T) {
-      for (const listener of listeners) {
-        try {
-          listener(payload);
-        } catch {
-          // A listener must not prevent delivery to the remaining subscribers.
-        }
-      }
-    },
-    clear() {
-      listeners.clear();
-    },
-  };
+/**
+ * Per-environment push registries. Channel identity is `(environmentId,
+ * channel)`: each environment owns its own registries so a listener attached to
+ * one server never observes another's stream. The wire protocol is untouched —
+ * merging across environments is purely client-side.
+ */
+export interface WsEnvironmentChannels {
+  readonly welcome: ListenerRegistry<WsWelcomePayload>;
+  readonly serverConfigUpdated: ListenerRegistry<ServerConfigUpdatedPayload>;
+  readonly serverProviderStatusesUpdated: ListenerRegistry<ServerProviderStatusesUpdatedPayload>;
+  readonly serverMaintenanceUpdated: ListenerRegistry<ServerLifecycleStreamEvent>;
+  readonly serverSettingsUpdated: ListenerRegistry<ServerSettingsUpdatedPayload>;
+  readonly threadStreamFailure: ListenerRegistry<WsThreadStreamFailure>;
 }
 
-function subscribeWithReplay<T>(input: {
-  readonly registry: {
-    subscribe: (listener: (payload: T) => void) => () => unknown;
-  };
-  readonly listener: (payload: T) => void;
-  readonly latest: T | null;
-}): () => void {
-  const unsubscribe = input.registry.subscribe(input.listener);
-  if (input.latest) {
-    try {
-      input.listener(input.latest);
-    } catch {
-      // Replay follows the same listener isolation as live delivery.
-    }
-  }
-  return () => void unsubscribe();
+/** One connected server: its transport, its NativeApi, and its channel registries. */
+export interface WsEnvironmentClient {
+  readonly environmentId: EnvironmentId;
+  readonly api: NativeApi;
+  readonly transport: WsTransport;
+  readonly channels: WsEnvironmentChannels;
+  /** Latest cached push for a channel, used for replay to late subscribers. */
+  getLatestPush: WsTransport["getLatestPush"];
+  dispose(): Promise<void>;
 }
-
-const welcomeListeners = createListenerRegistry<WsWelcomePayload>();
-const serverConfigUpdatedListeners = createListenerRegistry<ServerConfigUpdatedPayload>();
-const serverProviderStatusesUpdatedListeners =
-  createListenerRegistry<ServerProviderStatusesUpdatedPayload>();
-const serverMaintenanceUpdatedListeners = createListenerRegistry<ServerLifecycleStreamEvent>();
-const serverSettingsUpdatedListeners = createListenerRegistry<ServerSettingsUpdatedPayload>();
-const gitActionProgressListeners = createListenerRegistry<GitActionProgressEvent>();
 
 function omitNullUserInputAnswers(
   command: Parameters<NativeApi["orchestration"]["dispatchCommand"]>[0],
@@ -127,55 +109,6 @@ function omitNullUserInputAnswers(
     ),
   };
 }
-const terminalEventListeners = createListenerRegistry<TerminalEvent>();
-const projectDevServerEventListeners = createListenerRegistry<ProjectDevServerEvent>();
-const automationEventListeners = createListenerRegistry<AutomationStreamEvent>();
-const orchestrationDomainEventListeners = createListenerRegistry<OrchestrationEvent>();
-const orchestrationShellEventListeners = createListenerRegistry<OrchestrationShellStreamItem>();
-const orchestrationThreadEventListeners = createListenerRegistry<OrchestrationThreadStreamItem>();
-const threadStreamFailureListeners = createListenerRegistry<WsThreadStreamFailure>();
-const fallbackBrowserStateListeners = createListenerRegistry<ThreadBrowserState>();
-const fallbackBrowserStates = new Map<ThreadId, ThreadBrowserState>();
-
-function clearWsNativeApiListeners(): void {
-  welcomeListeners.clear();
-  serverConfigUpdatedListeners.clear();
-  serverProviderStatusesUpdatedListeners.clear();
-  serverMaintenanceUpdatedListeners.clear();
-  serverSettingsUpdatedListeners.clear();
-  gitActionProgressListeners.clear();
-  terminalEventListeners.clear();
-  projectDevServerEventListeners.clear();
-  automationEventListeners.clear();
-  orchestrationDomainEventListeners.clear();
-  orchestrationShellEventListeners.clear();
-  orchestrationThreadEventListeners.clear();
-  threadStreamFailureListeners.clear();
-  fallbackBrowserStateListeners.clear();
-}
-
-function defaultBrowserState(threadId: ThreadId): ThreadBrowserState {
-  return {
-    threadId,
-    version: 0,
-    open: false,
-    activeTabId: null,
-    tabs: [],
-    lastError: null,
-  };
-}
-
-function defaultBrowserTitle(url: string): string {
-  if (url === "about:blank") {
-    return "New tab";
-  }
-  try {
-    return new URL(url).hostname || url;
-  } catch {
-    return url;
-  }
-}
-
 async function requestAuthJson<T>(
   path: string,
   options: {
@@ -242,181 +175,59 @@ async function requestVoiceTranscriptionUpload(
   return payload;
 }
 
-function createFallbackTab(url = "about:blank") {
-  return {
-    id: crypto.randomUUID(),
-    url,
-    title: defaultBrowserTitle(url),
-    status: "live" as const,
-    isLoading: false,
-    canGoBack: false,
-    canGoForward: false,
-    faviconUrl: null,
-    lastCommittedUrl: url,
-    lastError: null,
+export interface WsEnvironmentClientOptions {
+  readonly environmentId?: EnvironmentId;
+  /** Absolute WS URL for a remote environment; omitted for the page's own server. */
+  readonly url?: string | null;
+}
+
+export function createWsEnvironmentClient(
+  options: WsEnvironmentClientOptions = {},
+): WsEnvironmentClient {
+  const environmentId = options.environmentId ?? LOCAL_ENVIRONMENT_ID;
+  const transport = new WsTransport({
+    environmentId,
+    ...(options.url === undefined ? {} : { url: options.url }),
+  });
+
+  const channels: WsEnvironmentChannels = {
+    welcome: createListenerRegistry<WsWelcomePayload>(),
+    serverConfigUpdated: createListenerRegistry<ServerConfigUpdatedPayload>(),
+    serverProviderStatusesUpdated: createListenerRegistry<ServerProviderStatusesUpdatedPayload>(),
+    serverMaintenanceUpdated: createListenerRegistry<ServerLifecycleStreamEvent>(),
+    serverSettingsUpdated: createListenerRegistry<ServerSettingsUpdatedPayload>(),
+    threadStreamFailure: createListenerRegistry<WsThreadStreamFailure>(),
   };
-}
+  const gitActionProgressListeners = createListenerRegistry<GitActionProgressEvent>();
+  const terminalEventListeners = createListenerRegistry<TerminalEvent>();
+  const projectDevServerEventListeners = createListenerRegistry<ProjectDevServerEvent>();
+  const automationEventListeners = createListenerRegistry<AutomationStreamEvent>();
+  const orchestrationDomainEventListeners = createListenerRegistry<OrchestrationEvent>();
+  const orchestrationShellEventListeners = createListenerRegistry<OrchestrationShellStreamItem>();
+  const orchestrationThreadEventListeners = createListenerRegistry<OrchestrationThreadStreamItem>();
+  const fallbackBrowser = createFallbackBrowserWorkspace();
 
-function cloneBrowserState(state: ThreadBrowserState): ThreadBrowserState {
-  return {
-    ...state,
-    tabs: state.tabs.map((tab) => ({ ...tab })),
-  };
-}
-
-function getFallbackBrowserState(threadId: ThreadId): ThreadBrowserState {
-  const existing = fallbackBrowserStates.get(threadId);
-  if (existing) {
-    return existing;
-  }
-  const initial = defaultBrowserState(threadId);
-  fallbackBrowserStates.set(threadId, initial);
-  return initial;
-}
-
-function emitFallbackBrowserState(threadId: ThreadId): ThreadBrowserState {
-  const state = cloneBrowserState(getFallbackBrowserState(threadId));
-  fallbackBrowserStateListeners.emit(state);
-  return state;
-}
-
-function markFallbackBrowserStateChanged(state: ThreadBrowserState): void {
-  state.version += 1;
-}
-
-function ensureFallbackBrowserWorkspace(threadId: ThreadId): ThreadBrowserState {
-  const state = getFallbackBrowserState(threadId);
-  if (state.tabs.length === 0) {
-    const tab = createFallbackTab();
-    state.tabs = [tab];
-    state.activeTabId = tab.id;
-  }
-  state.open = true;
-  return state;
-}
-
-function resolveFallbackBrowserTab(state: ThreadBrowserState, tabId?: string) {
-  const existing =
-    (tabId ? state.tabs.find((tab) => tab.id === tabId) : undefined) ??
-    (state.activeTabId ? state.tabs.find((tab) => tab.id === state.activeTabId) : undefined) ??
-    state.tabs[0];
-  if (existing) {
-    return existing;
-  }
-  const tab = createFallbackTab();
-  state.tabs = [tab];
-  state.activeTabId = tab.id;
-  state.open = true;
-  return tab;
-}
-
-/**
- * Subscribe to the server welcome message. If a welcome was already received
- * before this call, the listener fires synchronously with the cached payload.
- * This avoids the race between WebSocket connect and React effect registration.
- */
-export function onServerWelcome(listener: (payload: WsWelcomePayload) => void): () => void {
-  const latestWelcome = instance?.transport.getLatestPush(WS_CHANNELS.serverWelcome)?.data ?? null;
-  return subscribeWithReplay({ registry: welcomeListeners, listener, latest: latestWelcome });
-}
-
-/**
- * Subscribe to server config update events. Replays the latest update for
- * late subscribers to avoid missing config validation feedback.
- */
-export function onServerConfigUpdated(
-  listener: (payload: ServerConfigUpdatedPayload) => void,
-): () => void {
-  const latestConfig =
-    instance?.transport.getLatestPush(WS_CHANNELS.serverConfigUpdated)?.data ?? null;
-  return subscribeWithReplay({
-    registry: serverConfigUpdatedListeners,
-    listener,
-    latest: latestConfig,
-  });
-}
-
-/**
- * Subscribe to provider status updates without forcing a full config reload.
- */
-export function onServerProviderStatusesUpdated(
-  listener: (payload: ServerProviderStatusesUpdatedPayload) => void,
-): () => void {
-  const latestProviderStatuses =
-    instance?.transport.getLatestPush(WS_CHANNELS.serverProviderStatusesUpdated)?.data ?? null;
-  return subscribeWithReplay({
-    registry: serverProviderStatusesUpdatedListeners,
-    listener,
-    latest: latestProviderStatuses,
-  });
-}
-
-export function onServerMaintenanceUpdated(
-  listener: (payload: ServerLifecycleStreamEvent) => void,
-): () => void {
-  const latestMaintenance =
-    instance?.transport.getLatestPush(WS_CHANNELS.serverMaintenanceUpdated)?.data ?? null;
-  return subscribeWithReplay({
-    registry: serverMaintenanceUpdatedListeners,
-    listener,
-    latest: latestMaintenance,
-  });
-}
-
-export function onServerSettingsUpdated(
-  listener: (payload: ServerSettingsUpdatedPayload) => void,
-): () => void {
-  const latestSettings =
-    instance?.transport.getLatestPush(WS_CHANNELS.serverSettingsUpdated)?.data ?? null;
-  return subscribeWithReplay({
-    registry: serverSettingsUpdatedListeners,
-    listener,
-    latest: latestSettings,
-  });
-}
-
-/**
- * Subscribe to unrecoverable per-thread stream failures (retries and reconnect
- * exhausted). Lets thread-detail consumers surface a failed hydration state
- * instead of rendering an empty conversation.
- */
-export function onThreadStreamFailure(
-  listener: (failure: WsThreadStreamFailure) => void,
-): () => void {
-  const unsubscribe = threadStreamFailureListeners.subscribe(listener);
-  return () => void unsubscribe();
-}
-
-export function createWsNativeApi(): NativeApi {
-  if (instance) {
-    if (instance.transport.getState() !== "disposed") {
-      return instance.api;
-    }
-    instance = null;
-  }
-
-  const transport = new WsTransport();
   let unsubscribeDomainEventTransport: (() => void) | null = null;
-  transport.onStateChange((state) => emitWsTransportState(state));
-  transport.onCompatibilityIssue((issue) => emitWsCompatibilityIssue(issue), {
+  transport.onStateChange((state) => emitWsTransportState(state, { environmentId }));
+  transport.onCompatibilityIssue((issue) => emitWsCompatibilityIssue(issue, { environmentId }), {
     replayCurrent: true,
   });
   transport.onBuildSkew((skew) => emitWsBuildSkew(skew), { replayCurrent: true });
 
   transport.subscribe(WS_CHANNELS.serverWelcome, (message) => {
-    welcomeListeners.emit(message.data);
+    channels.welcome.emit(message.data);
   });
   transport.subscribe(WS_CHANNELS.serverConfigUpdated, (message) => {
-    serverConfigUpdatedListeners.emit(message.data);
+    channels.serverConfigUpdated.emit(message.data);
   });
   transport.subscribe(WS_CHANNELS.serverProviderStatusesUpdated, (message) => {
-    serverProviderStatusesUpdatedListeners.emit(message.data);
+    channels.serverProviderStatusesUpdated.emit(message.data);
   });
   transport.subscribe(WS_CHANNELS.serverMaintenanceUpdated, (message) => {
-    serverMaintenanceUpdatedListeners.emit(message.data);
+    channels.serverMaintenanceUpdated.emit(message.data);
   });
   transport.subscribe(WS_CHANNELS.serverSettingsUpdated, (message) => {
-    serverSettingsUpdatedListeners.emit(message.data);
+    channels.serverSettingsUpdated.emit(message.data);
   });
   transport.subscribe(WS_CHANNELS.gitActionProgress, (message) => {
     gitActionProgressListeners.emit(message.data);
@@ -437,7 +248,7 @@ export function createWsNativeApi(): NativeApi {
     orchestrationThreadEventListeners.emit(message.data);
   });
   transport.onThreadStreamFailure((failure) => {
-    threadStreamFailureListeners.emit(failure);
+    channels.threadStreamFailure.emit(failure);
   });
   const api: NativeApi = {
     dialogs: {
@@ -748,27 +559,27 @@ export function createWsNativeApi(): NativeApi {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.open(input);
         }
-        const state = ensureFallbackBrowserWorkspace(input.threadId);
+        const state = fallbackBrowser.ensureWorkspace(input.threadId);
         if (input.initialUrl && state.tabs.length > 0) {
-          const activeTab = resolveFallbackBrowserTab(state);
+          const activeTab = fallbackBrowser.resolveTab(state);
           activeTab.url = input.initialUrl;
           activeTab.title = defaultBrowserTitle(input.initialUrl);
           activeTab.lastCommittedUrl = input.initialUrl;
         }
-        markFallbackBrowserStateChanged(state);
-        return emitFallbackBrowserState(input.threadId);
+        fallbackBrowser.markChanged(state);
+        return fallbackBrowser.emit(input.threadId);
       },
       close: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.close(input);
         }
-        const state = getFallbackBrowserState(input.threadId);
+        const state = fallbackBrowser.getState(input.threadId);
         state.open = false;
         state.activeTabId = null;
         state.tabs = [];
         state.lastError = null;
-        markFallbackBrowserStateChanged(state);
-        return emitFallbackBrowserState(input.threadId);
+        fallbackBrowser.markChanged(state);
+        return fallbackBrowser.emit(input.threadId);
       },
       hide: async (input) => {
         if (window.desktopBridge) {
@@ -779,7 +590,7 @@ export function createWsNativeApi(): NativeApi {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.getState(input);
         }
-        return cloneBrowserState(getFallbackBrowserState(input.threadId));
+        return cloneBrowserState(fallbackBrowser.getState(input.threadId));
       },
       setPanelBounds: async (input) => {
         if (window.desktopBridge) {
@@ -791,7 +602,7 @@ export function createWsNativeApi(): NativeApi {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.attachWebview(input);
         }
-        return cloneBrowserState(getFallbackBrowserState(input.threadId));
+        return cloneBrowserState(fallbackBrowser.getState(input.threadId));
       },
       detachWebview: async (input) => {
         if (window.desktopBridge) {
@@ -822,53 +633,53 @@ export function createWsNativeApi(): NativeApi {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.navigate(input);
         }
-        const state = ensureFallbackBrowserWorkspace(input.threadId);
-        const tab = resolveFallbackBrowserTab(state, input.tabId);
+        const state = fallbackBrowser.ensureWorkspace(input.threadId);
+        const tab = fallbackBrowser.resolveTab(state, input.tabId);
         tab.url = input.url;
         tab.title = defaultBrowserTitle(input.url);
         tab.lastCommittedUrl = input.url;
         tab.lastError = null;
         tab.status = "live";
         state.activeTabId = tab.id;
-        markFallbackBrowserStateChanged(state);
-        return emitFallbackBrowserState(input.threadId);
+        fallbackBrowser.markChanged(state);
+        return fallbackBrowser.emit(input.threadId);
       },
       reload: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.reload(input);
         }
-        return cloneBrowserState(getFallbackBrowserState(input.threadId));
+        return cloneBrowserState(fallbackBrowser.getState(input.threadId));
       },
       goBack: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.goBack(input);
         }
-        return cloneBrowserState(getFallbackBrowserState(input.threadId));
+        return cloneBrowserState(fallbackBrowser.getState(input.threadId));
       },
       goForward: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.goForward(input);
         }
-        return cloneBrowserState(getFallbackBrowserState(input.threadId));
+        return cloneBrowserState(fallbackBrowser.getState(input.threadId));
       },
       newTab: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.newTab(input);
         }
-        const state = ensureFallbackBrowserWorkspace(input.threadId);
+        const state = fallbackBrowser.ensureWorkspace(input.threadId);
         const tab = createFallbackTab(input.url);
         state.tabs = [...state.tabs, tab];
         if (input.activate !== false || !state.activeTabId) {
           state.activeTabId = tab.id;
         }
-        markFallbackBrowserStateChanged(state);
-        return emitFallbackBrowserState(input.threadId);
+        fallbackBrowser.markChanged(state);
+        return fallbackBrowser.emit(input.threadId);
       },
       closeTab: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.closeTab(input);
         }
-        const state = ensureFallbackBrowserWorkspace(input.threadId);
+        const state = fallbackBrowser.ensureWorkspace(input.threadId);
         const nextTabs = state.tabs.filter((tab) => tab.id !== input.tabId);
         if (nextTabs.length === state.tabs.length) {
           return cloneBrowserState(state);
@@ -882,18 +693,18 @@ export function createWsNativeApi(): NativeApi {
         } else if (!state.tabs.some((tab) => tab.id === state.activeTabId)) {
           state.activeTabId = state.tabs[0]?.id ?? null;
         }
-        markFallbackBrowserStateChanged(state);
-        return emitFallbackBrowserState(input.threadId);
+        fallbackBrowser.markChanged(state);
+        return fallbackBrowser.emit(input.threadId);
       },
       selectTab: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.selectTab(input);
         }
-        const state = ensureFallbackBrowserWorkspace(input.threadId);
-        const tab = resolveFallbackBrowserTab(state, input.tabId);
+        const state = fallbackBrowser.ensureWorkspace(input.threadId);
+        const tab = fallbackBrowser.resolveTab(state, input.tabId);
         state.activeTabId = tab.id;
-        markFallbackBrowserStateChanged(state);
-        return emitFallbackBrowserState(input.threadId);
+        fallbackBrowser.markChanged(state);
+        return fallbackBrowser.emit(input.threadId);
       },
       openDevTools: async (input) => {
         if (window.desktopBridge) {
@@ -932,7 +743,7 @@ export function createWsNativeApi(): NativeApi {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.onState(callback);
         }
-        return fallbackBrowserStateListeners.subscribe(callback);
+        return fallbackBrowser.onState(callback);
       },
       onCopyLink: (callback) => {
         if (window.desktopBridge) {
@@ -943,24 +754,27 @@ export function createWsNativeApi(): NativeApi {
     },
   };
 
-  instance = { api, transport };
-  return api;
-}
-
-// Browser-mode tests mount full app roots repeatedly in one page; reset the
-// singleton so each test gets a fresh WebSocket stream and cached push state.
-export async function resetWsNativeApiForTest(): Promise<void> {
-  const transport = instance?.transport;
-  instance = null;
-  clearWsNativeApiListeners();
-  fallbackBrowserStates.clear();
-  await transport?.dispose();
-}
-
-if (import.meta.hot) {
-  import.meta.hot.dispose(() => {
-    void instance?.transport.dispose();
-    instance = null;
-    clearWsNativeApiListeners();
-  });
+  return {
+    environmentId,
+    api,
+    transport,
+    channels,
+    getLatestPush: (channel) => transport.getLatestPush(channel),
+    dispose: async () => {
+      unsubscribeDomainEventTransport?.();
+      unsubscribeDomainEventTransport = null;
+      for (const registry of Object.values(channels)) {
+        registry.clear();
+      }
+      gitActionProgressListeners.clear();
+      terminalEventListeners.clear();
+      projectDevServerEventListeners.clear();
+      automationEventListeners.clear();
+      orchestrationDomainEventListeners.clear();
+      orchestrationShellEventListeners.clear();
+      orchestrationThreadEventListeners.clear();
+      fallbackBrowser.clear();
+      await transport.dispose();
+    },
+  };
 }

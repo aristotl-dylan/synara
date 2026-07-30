@@ -36,7 +36,7 @@ import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test
 import { getThreadFromState } from "../threadDerivation";
 import { resetThreadDetailResumeCursorsForTests } from "../threadDetailResumeCursors";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
-import { resetWsNativeApiForTest } from "../wsNativeApi";
+import { resetWsEnvironmentRegistry } from "../wsEnvironmentRegistry";
 
 const THREAD_ID = ThreadId.makeUnsafe("thread-root-browser-test");
 const OTHER_THREAD_ID = ThreadId.makeUnsafe("thread-other-browser-test");
@@ -425,12 +425,12 @@ describe("EventRouter scoped orchestration sync", () => {
   });
 
   afterAll(async () => {
-    await resetWsNativeApiForTest();
+    await resetWsEnvironmentRegistry();
     await worker.stop();
   });
 
   beforeEach(async () => {
-    await resetWsNativeApiForTest();
+    await resetWsEnvironmentRegistry();
     fixture = buildFixture();
     document.body.innerHTML = "";
     shellStreamRequestId = null;

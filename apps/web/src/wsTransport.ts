@@ -1,5 +1,5 @@
 // FILE: wsTransport.ts
-// Purpose: Browser-side Effect RPC transport over the Synara WebSocket endpoint.
+// Purpose: Browser-side Effect RPC transport over one environment's WebSocket endpoint.
 // Layer: Web transport
 // Exports: WsTransport plus stream-selection helpers used by tests.
 
@@ -37,6 +37,7 @@ import {
   type WsPush,
   type WsPushChannel,
   type WsPushMessage,
+  type EnvironmentId,
   ThreadId,
 } from "@synara/contracts";
 import {
@@ -57,9 +58,10 @@ import * as Socket from "effect/unstable/socket/Socket";
 import { classifyBuildSkew, isReadOnlySafeWsMethod } from "@synara/shared/buildSkew";
 
 import { APP_VERSION } from "./branding";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
 import {
-  buildThreadSubscribeInput,
-  resetThreadDetailResumeCursors,
+  threadDetailResumeCursors,
+  type ThreadDetailResumeCursorScope,
 } from "./threadDetailResumeCursors";
 import type { WsBuildSkewState, WsTransportState } from "./wsTransportEvents";
 
@@ -548,8 +550,34 @@ export function shouldKeepServerLifecycleStream(activeChannels: ReadonlySet<stri
   );
 }
 
+/**
+ * A silently-dead socket (NAT/CGNAT idle eviction, sleeping laptop, a tunnel
+ * whose far side vanished) never fires `close` or `error` in the browser, so
+ * the transport would sit in "open" forever. An application-level probe on the
+ * feature socket turns that into a normal reconnect. The interval is long
+ * enough not to matter on a WAN link and short enough to beat typical NAT idle
+ * timeouts (commonly 300s).
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+export const HEARTBEAT_TIMEOUT_MS = 10_000;
+
+export interface WsTransportOptions {
+  readonly url?: string | null;
+  /** Identity of the server this transport talks to; defaults to the local server. */
+  readonly environmentId?: EnvironmentId;
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatTimeoutMs?: number;
+}
+
 export class WsTransport {
+  readonly environmentId: EnvironmentId;
   private readonly explicitUrl: string | null;
+  /** This environment's cursor space. Sequences never cross environments. */
+  private readonly resumeCursors: ThreadDetailResumeCursorScope;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private heartbeatTimer: number | null = null;
+  private heartbeatInFlight = false;
   private readonly listeners = new Map<string, Set<(message: WsPush) => void>>();
   private readonly stateListeners = new Set<(state: WsTransportState) => void>();
   private readonly compatibilityListeners = new Set<(issue: WsCompatibilityError | null) => void>();
@@ -593,8 +621,14 @@ export class WsTransport {
   private lastServerInstanceId: string | null = null;
   private buildSkew: WsBuildSkewState | null = null;
 
-  constructor(url?: string) {
-    this.explicitUrl = url ?? null;
+  constructor(options?: string | WsTransportOptions) {
+    const resolved: WsTransportOptions =
+      typeof options === "string" ? { url: options } : (options ?? {});
+    this.explicitUrl = resolved.url ?? null;
+    this.environmentId = resolved.environmentId ?? LOCAL_ENVIRONMENT_ID;
+    this.resumeCursors = threadDetailResumeCursors(this.environmentId);
+    this.heartbeatIntervalMs = resolved.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
+    this.heartbeatTimeoutMs = resolved.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS;
     this.clientPromise = this.createSession().clientPromise;
   }
 
@@ -793,6 +827,7 @@ export class WsTransport {
     // than resolve later and build a runtime this teardown will not see.
     this.lifetime.abort();
     this.setState("disposed");
+    this.stopHeartbeat();
     this.resetAllStreamCapacityRetries();
     this.resetAllStreamCompletionRetries();
     for (const cleanup of this.streamCleanups.values()) cleanup();
@@ -919,8 +954,9 @@ export class WsTransport {
       // `compatibility`, so an outage longer than the first retry still
       // detects the change. Interim tradeoff: this also drops resume across
       // plain restarts of the same journal, acceptable until the protocol
-      // carries a durable journal epoch.
-      resetThreadDetailResumeCursors();
+      // carries a durable journal epoch. Scoped to this environment: another
+      // server's journal did not change, and its sequences are unrelated.
+      this.resumeCursors.resetAll();
     }
     this.lastServerInstanceId = compatibility.serverInstanceId;
     this.compatibility = compatibility;
@@ -938,6 +974,25 @@ export class WsTransport {
     client: RpcClientInstance,
     runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>,
   ): Promise<void> {
+    try {
+      await this.runLivenessProbe(client, runtime, FEATURE_CONNECTION_PROBE_TIMEOUT_MS);
+    } catch (error) {
+      this.compatibility = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Round trip on the feature socket that the server answers without side
+   * effects (`unsubscribeShell` resolves to `Effect.void` server-side). Called
+   * on the raw client rather than through `request`, whose client-side
+   * interception of that method would cancel the live shell stream.
+   */
+  private async runLivenessProbe(
+    client: RpcClientInstance,
+    runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>,
+    timeoutMs: number,
+  ): Promise<void> {
     const probe = (
       client as unknown as Record<
         string,
@@ -945,12 +1000,49 @@ export class WsTransport {
       >
     )[ORCHESTRATION_WS_METHODS.unsubscribeShell];
     if (!probe) return;
-    try {
-      await runtime.runPromise(probe({}).pipe(Effect.timeout(FEATURE_CONNECTION_PROBE_TIMEOUT_MS)));
-    } catch (error) {
-      this.compatibility = null;
-      throw error;
-    }
+    await runtime.runPromise(probe({}).pipe(Effect.timeout(timeoutMs)));
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer === null) return;
+    window.clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  /**
+   * Detects a socket that died without notifying the browser (NAT idle
+   * eviction, sleeping peer, collapsed tunnel): the connection stays readable
+   * and "open" forever, so only an unanswered application-level round trip
+   * distinguishes it from an idle-but-healthy link.
+   */
+  private scheduleHeartbeat(
+    client: RpcClientInstance,
+    runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>,
+    heartbeatSessionVersion: number,
+  ): void {
+    this.stopHeartbeat();
+    if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+    const timerId = window.setTimeout(() => {
+      if (this.heartbeatTimer !== timerId) return;
+      this.heartbeatTimer = null;
+      if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+      if (this.heartbeatInFlight) return;
+      this.heartbeatInFlight = true;
+      void this.runLivenessProbe(client, runtime, this.heartbeatTimeoutMs)
+        .then(() => {
+          this.heartbeatInFlight = false;
+          this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
+        })
+        .catch(() => {
+          this.heartbeatInFlight = false;
+          if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+          // A dead socket cannot be revived by retrying on it. Reconnecting
+          // re-establishes every registered stream and lets the server replay
+          // the persisted tail from this environment's cursors.
+          void this.reconnect().catch(() => undefined);
+        });
+    }, this.heartbeatIntervalMs);
+    this.heartbeatTimer = timerId;
   }
 
   private createSession() {
@@ -978,10 +1070,12 @@ export class WsTransport {
       if (!this.disposed && this.sessionVersion === sessionVersion) {
         this.adoptNegotiation(compatibility);
         this.setState("open");
+        this.scheduleHeartbeat(client, featureRuntime, sessionVersion);
       }
       return client;
     })().catch((error) => {
       if (!this.disposed && this.sessionVersion === sessionVersion) {
+        this.stopHeartbeat();
         this.compatibility = null;
         const compatibilityError = getTerminalCompatibilityError(error);
         if (compatibilityError) {
@@ -1023,6 +1117,7 @@ export class WsTransport {
     const oldClientScope = this.clientScope;
     this.runtime = null;
     this.clientScope = null;
+    this.stopHeartbeat();
     this.resetAllStreamCapacityRetries();
     this.resetAllStreamCompletionRetries();
     for (const cleanup of this.streamCleanups.values()) cleanup();
@@ -1381,7 +1476,9 @@ export class WsTransport {
   private refreshThreadSubscriptionInput(threadId: string): unknown {
     if (!this.threadSubscriptions.has(threadId)) return undefined;
     const existingInput = this.threadSubscriptions.get(threadId);
-    const rebuiltInput: unknown = buildThreadSubscribeInput(ThreadId.makeUnsafe(threadId));
+    const rebuiltInput: unknown = this.resumeCursors.buildSubscribeInput(
+      ThreadId.makeUnsafe(threadId),
+    );
     const input = threadStreamInputsEqual(existingInput, rebuiltInput)
       ? existingInput
       : rebuiltInput;

@@ -27,9 +27,8 @@ import {
   syncServerThreadDetailHotPath,
 } from "./storeProjection";
 import {
-  hasThreadDetailResumeCursor,
+  localThreadDetailResumeCursors,
   resetThreadDetailResumeCursorsForTests,
-  setThreadDetailResumeCursor,
 } from "./threadDetailResumeCursors";
 import type { AppState } from "./storeState";
 import { getThreadFromState } from "./threadDerivation";
@@ -2075,32 +2074,32 @@ describe("resume cursor lifecycle in projection transitions", () => {
 
   function makeStateWithCursor() {
     const state = makeState(makeThread({ id: threadId, projectId }));
-    setThreadDetailResumeCursor(threadId, 42);
+    localThreadDetailResumeCursors().set(threadId, 42);
     return state;
   }
 
   it("clears the cursor when the thread's detail is evicted", () => {
     const state = makeStateWithCursor();
     evictThreadDetailFromClientState(state, threadId);
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when the thread is deleted", () => {
     const state = makeStateWithCursor();
     removeDeletedThreadFromClientState(state, threadId);
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when the thread's project is deleted", () => {
     const state = makeStateWithCursor();
     removeDeletedProjectFromClientState(state, projectId);
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a shell thread-removed event drops the thread", () => {
     const state = makeStateWithCursor();
     applyShellEvent(state, { kind: "thread-removed", sequence: 50, threadId });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a shell snapshot prunes the thread", () => {
@@ -2112,7 +2111,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       projects: [],
       threads: [],
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a read-model repair prunes the thread", () => {
@@ -2124,7 +2123,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       snapshotSequence: 60,
       threads: [],
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a full read-model sync replaces retained detail", () => {
@@ -2137,7 +2136,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       ...makeReadModel(makeReadModelThread({ id: threadId, projectId })),
       snapshotSequence: 60,
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a tombstone rejects the thread's detail snapshot", () => {
@@ -2145,7 +2144,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       makeState(makeThread({ id: threadId, projectId })),
       threadId,
     );
-    setThreadDetailResumeCursor(threadId, 42);
+    localThreadDetailResumeCursors().set(threadId, 42);
 
     const next = syncServerThreadDetailHotPath(
       state,
@@ -2155,6 +2154,6 @@ describe("resume cursor lifecycle in projection transitions", () => {
     // The tombstone discarded the snapshot instead of applying it, so nothing
     // may vouch for detail that was never stored.
     expect(next.threadDetailSyncById?.[threadId]).toBeUndefined();
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 });

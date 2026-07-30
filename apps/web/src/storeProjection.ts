@@ -13,11 +13,7 @@ import {
 } from "@synara/contracts";
 import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
-import {
-  clearThreadDetailResumeCursor,
-  clearThreadDetailResumeCursors,
-  retainThreadDetailResumeCursors,
-} from "./threadDetailResumeCursors";
+import { localThreadDetailResumeCursors } from "./threadDetailResumeCursors";
 import { getThreadFromState, getThreadsFromState } from "./threadDerivation";
 import {
   arraysShallowEqual,
@@ -632,7 +628,7 @@ function clearThreadDetailSyncState(state: AppState, threadId: ThreadId): AppSta
   // let a resubscribe gap-replay on top of missing history. The full-sync
   // pruning paths cover their bulk removals with
   // `retainThreadDetailResumeCursors` instead.
-  clearThreadDetailResumeCursor(threadId);
+  localThreadDetailResumeCursors().clear(threadId);
   if (
     state.threadDetailSyncById === undefined ||
     !Object.hasOwn(state.threadDetailSyncById, threadId)
@@ -1240,7 +1236,7 @@ export function syncServerShellSnapshot(
   const nextThreadIds = new Set(snapshotThreads.map((thread) => thread.id));
   // The retains below prune detail slices down to the snapshot's threads; any
   // resume cursor for a pruned thread must fall with its detail.
-  retainThreadDetailResumeCursors(nextThreadIds);
+  localThreadDetailResumeCursors().retain(nextThreadIds);
 
   const normalizedState: AppState = {
     ...state,
@@ -1413,12 +1409,12 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
   // slices down to the read model's threads; any resume cursor for a pruned
   // thread must fall with its detail or a later resubscribe would gap-replay
   // on top of history this prune just discarded.
-  retainThreadDetailResumeCursors(nextThreadIds);
+  localThreadDetailResumeCursors().retain(nextThreadIds);
   // A surviving thread's detail is replaced wholesale by this read model, so a
   // cursor ahead of the replacement would resume past history the new detail
   // does not contain. Drop them all: the next subscribe takes a snapshot and
   // re-establishes a cursor that matches what is actually cached.
-  clearThreadDetailResumeCursors([...nextThreadIds]);
+  localThreadDetailResumeCursors().clearMany([...nextThreadIds]);
   let normalizedState: AppState = {
     ...state,
     threadIds: reuseThreadIdRegistry(state.threadIds, nextThreadIds),

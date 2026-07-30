@@ -14,6 +14,8 @@ import {
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
   WsCompatibilityError,
+  EnvironmentId,
+  ThreadId,
   type WsBootstrapNegotiateResult,
 } from "@synara/contracts";
 
@@ -40,6 +42,11 @@ import {
   WsTransport,
   type WsThreadStreamFailure,
 } from "./wsTransport";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
+import {
+  resetThreadDetailResumeCursorsForTests,
+  threadDetailResumeCursors,
+} from "./threadDetailResumeCursors";
 import {
   addWsCompatibilityIssueListener,
   emitWsCompatibilityIssue,
@@ -51,6 +58,7 @@ type WsEventType = "open" | "message" | "close" | "error";
 type WsListener = (event?: { data?: unknown }) => void;
 
 const sockets: MockWebSocket[] = [];
+const REMOTE_ENVIRONMENT_ID = EnvironmentId.makeUnsafe("remote-environment");
 
 class MockWebSocket {
   static readonly CONNECTING = 0;
@@ -1026,6 +1034,102 @@ describe("WsTransport", () => {
       "server-instance",
     );
   });
+
+  it("scopes resume-cursor reset to the transport's own environment", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const localCursors = threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID);
+    const remoteCursors = threadDetailResumeCursors(REMOTE_ENVIRONMENT_ID);
+    const thread = ThreadId.makeUnsafe("thread-shared");
+    localCursors.set(thread, 42);
+    remoteCursors.set(thread, 7);
+
+    const transport = new WsTransport({ url: "ws://localhost:3020" });
+    const internals = transport as unknown as {
+      createSession(): { clientPromise: Promise<unknown> };
+      compatibility: WsBootstrapNegotiateResult | null;
+    };
+    await waitForSockets(1);
+
+    // The local server restarted; only its journal changed, so only its
+    // cursors may be dropped. The remote environment's sequences are unrelated.
+    internals.compatibility = null;
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(200, { ...NEGOTIATION_RESULT, serverInstanceId: "server-instance-2" }),
+      ),
+    );
+    await internals.createSession().clientPromise;
+
+    expect(localCursors.get(thread)).toBeUndefined();
+    expect(remoteCursors.get(thread)).toBe(7);
+
+    await transport.dispose();
+    resetThreadDetailResumeCursorsForTests();
+  });
+
+  it("reconnects when the heartbeat goes unanswered on a silently-dead socket", async () => {
+    // A NAT-evicted socket stays readable and "open" forever, so only an
+    // unanswered application-level round trip distinguishes it from an idle
+    // healthy link.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+      heartbeatTimer: number | null;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+    internals.runLivenessProbe = vi.fn(() => Promise.reject(new Error("socket is a zombie")));
+
+    await vi.waitFor(() => expect(reconnect).toHaveBeenCalled());
+
+    await transport.dispose();
+  }, 10_000);
+
+  it("keeps probing on a healthy link and stops on dispose", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+      heartbeatTimer: number | null;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+    const probe = vi.fn(() => Promise.resolve());
+    internals.runLivenessProbe = probe;
+
+    // An answered probe must reschedule rather than settle after one round.
+    await vi.waitFor(() => expect(probe.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(reconnect).not.toHaveBeenCalled();
+
+    await transport.dispose();
+    // Disposal must cancel the timer; a surviving one would resurrect the
+    // transport after teardown returned.
+    expect(internals.heartbeatTimer).toBeNull();
+    const callsAfterDispose = probe.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(probe.mock.calls.length).toBe(callsAfterDispose);
+  }, 10_000);
 
   it("notifies state listeners and replays the current state on demand", async () => {
     const transport = new WsTransport();
