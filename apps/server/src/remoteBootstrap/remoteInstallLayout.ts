@@ -42,6 +42,8 @@ export interface RemoteInstallLayout {
   readonly stagingDirectory: string;
   readonly pidFile: string;
   readonly credentialFile: string;
+  /** The credential the previous release authenticates with; rollback needs it. */
+  readonly previousCredentialFile: string;
   readonly environmentIdFile: string;
   readonly logFile: string;
   readonly lockFile: string;
@@ -120,6 +122,7 @@ export function remoteInstallLayout(root: string): RemoteInstallLayout {
     stagingDirectory: `${normalizedRoot}/staging`,
     pidFile: `${normalizedRoot}/state/synara.pid`,
     credentialFile: `${normalizedRoot}/state/auth-token`,
+    previousCredentialFile: `${normalizedRoot}/state/auth-token.previous`,
     environmentIdFile: `${normalizedRoot}/state/environment-id`,
     logFile: `${normalizedRoot}/state/synara.log`,
     lockFile: `${normalizedRoot}/state/bootstrap.lock`,

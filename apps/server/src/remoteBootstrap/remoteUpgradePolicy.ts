@@ -5,7 +5,8 @@
 //          and drain-gated; nothing here ever restarts a server on its own.
 // Layer: Server / remote broker policy
 // Exports: RemoteEnvironmentPosture, classifyRemotePosture,
-//          UpgradeGate, evaluateUpgradeGate, DrainState, describePosture
+//          UpgradeGate, evaluateUpgradeGate, DrainState, describePosture,
+//          RequestedUpgrade, describeUpgradeGate
 
 import { classifyBuildSkew } from "@synara/shared/buildSkew";
 
@@ -71,6 +72,31 @@ export interface UpgradeGateInput {
   readonly drain: DrainState;
   readonly elapsedDrainMs: number;
   readonly drainTimeoutMs: number;
+}
+
+/**
+ * What the caller supplies when asking for an upgrade.
+ *
+ * The release ids are deliberately absent: `bootstrapRemoteServer` fills them
+ * from the host and the artifact set, so a caller cannot accidentally gate on a
+ * stale view of what is running.
+ */
+export type RequestedUpgrade = Omit<UpgradeGateInput, "currentReleaseId" | "targetReleaseId">;
+
+/** A user-facing explanation of why a swap did not happen. */
+export function describeUpgradeGate(gate: UpgradeGate): string {
+  switch (gate.decision) {
+    case "swap":
+      return "Upgrading the remote environment.";
+    case "already-current":
+      return "The remote environment already runs this release.";
+    case "wait":
+      return `Waiting for ${gate.activeTurnCount} active turn(s) to finish before upgrading.`;
+    case "drain-timeout":
+      return `${gate.activeTurnCount} turn(s) were still active when the drain deadline passed. Upgrade aborted; retry to force it.`;
+    case "refused":
+      return gate.reason;
+  }
 }
 
 export function evaluateUpgradeGate(input: UpgradeGateInput): UpgradeGate {

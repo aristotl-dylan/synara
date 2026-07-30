@@ -235,3 +235,49 @@ describe("launchd plan", () => {
     expect(plist).toContain("&lt;/string&gt;");
   });
 });
+
+describe("whitespace in the install root", () => {
+  // systemd splits an unquoted directive on whitespace, so a root containing a
+  // space silently truncates the value: SYNARA_AUTH_TOKEN_FILE would become
+  // "/home/deploy/My" plus a stray second assignment, and the server would
+  // start unable to read its credential.
+  const spacedLayout = remoteInstallLayout("/home/deploy/My Synara/remote");
+  const spacedInput = {
+    os: "linux",
+    layout: spacedLayout,
+    releaseId: "0.6.3",
+    nodePath: `${spacedLayout.currentLink}/node`,
+    entrypointPath: `${spacedLayout.currentLink}/dist/index.mjs`,
+    port: 45123,
+    instanceId: "env-abc123",
+    homeDirectory: "/home/deploy",
+    userId: 1000,
+  } as const;
+
+  it("keeps each Environment value a single token", () => {
+    const unit = renderSystemdUnit(spacedInput);
+    for (const line of unit.split("\n")) {
+      if (!line.startsWith("Environment=")) continue;
+      const assignment = line.slice("Environment=".length);
+      const value = assignment.slice(assignment.indexOf("=") + 1);
+      // Either quoted, or free of the whitespace that would split it.
+      expect(/^'.*'$/.test(value) || !/\s/.test(value)).toBe(true);
+      expect(value).toContain("My Synara");
+    }
+  });
+
+  it.each(["WorkingDirectory", "PIDFile"])("keeps %s a single token", (directive) => {
+    const unit = renderSystemdUnit(spacedInput);
+    const line = unit.split("\n").find((candidate) => candidate.startsWith(`${directive}=`));
+    expect(line).toBeDefined();
+    const value = line?.slice(directive.length + 1) ?? "";
+    expect(/^'.*'$/.test(value) || !/\s/.test(value)).toBe(true);
+    expect(value).toContain("My Synara");
+  });
+
+  it("does not emit a truncated credential path", () => {
+    const unit = renderSystemdUnit(spacedInput);
+    expect(unit).not.toMatch(/SYNARA_AUTH_TOKEN_FILE=\/home\/deploy\/My\s/);
+    expect(unit).not.toMatch(/SYNARA_AUTH_TOKEN_FILE=\/home\/deploy\/My$/m);
+  });
+});

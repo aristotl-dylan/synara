@@ -153,6 +153,8 @@ describe("uploadFile", () => {
       remotePath: "/remote/staging/local.tar.gz",
       mode: 0o700,
     });
+    // The path is a "safe token", so quoting leaves it byte-identical here; the
+    // hostile-path cases below are where the quoting actually shows.
     expect(invocationAt(invocations, 0).argv.at(-1)).toBe(
       "deploy@build-01.example.test:/remote/staging/local.tar.gz.partial",
     );
@@ -180,5 +182,112 @@ describe("uploadFile", () => {
         remotePath: "/remote/a",
       }),
     ).rejects.toThrow(/Failed to upload/);
+  });
+});
+
+describe("known_hosts pinning cannot be neutered", () => {
+  // The escape this closes: `accept-new` only means trust-on-FIRST-use if the
+  // pin can persist. Pointed at a sink, nothing is ever recorded, so a changed
+  // key never fails and a repeated MITM can capture the uploaded credential
+  // and answer the handshake. The old "never disables" test never passed a
+  // knownHostsFile at all, so it could not see this.
+  it.each(["none", "None", "NONE", "/dev/null", "/dev/zero", "null", "nul", " none "])(
+    "refuses knownHostsFile %j",
+    (knownHostsFile) => {
+      expect(() => sshConnectionOptionArgv({ ...target, knownHostsFile })).toThrow(
+        /never be pinned/,
+      );
+    },
+  );
+
+  it.each([
+    ["an empty string", ""],
+    ["whitespace only", "   "],
+  ])("refuses %s rather than emitting an empty option", (_label, knownHostsFile) => {
+    expect(() => sshConnectionOptionArgv({ ...target, knownHostsFile })).toThrow(
+      /must be a path|absolute path/,
+    );
+  });
+
+  it.each(["/home/me/known hosts", "/home/me/kh\nUserKnownHostsFile=/dev/null", "relative/kh"])(
+    "refuses a path that could split or forge an option: %j",
+    (knownHostsFile) => {
+      expect(() => sshConnectionOptionArgv({ ...target, knownHostsFile })).toThrow();
+    },
+  );
+
+  it("accepts a real path", () => {
+    const argv = sshConnectionOptionArgv({
+      ...target,
+      knownHostsFile: "/home/me/.ssh/known_hosts",
+    });
+    expect(argv).toContain("UserKnownHostsFile=/home/me/.ssh/known_hosts");
+  });
+
+  // Whatever a caller supplies, the emitted option must never name a sink.
+  it("never emits a non-persistent known_hosts option", () => {
+    const candidates: ReadonlyArray<SshTarget> = [
+      target,
+      { ...target, knownHostsFile: "/home/me/.ssh/known_hosts" },
+      { ...target, knownHostsFile: "~/.ssh/known_hosts" },
+    ];
+    for (const candidate of candidates) {
+      const argv = sshConnectionOptionArgv(candidate).join(" ");
+      expect(argv).not.toMatch(/UserKnownHostsFile=(none|\/dev\/null)/i);
+    }
+  });
+});
+
+describe("scp remote path injection", () => {
+  // Legacy scp runs a REMOTE SHELL over the target path. An install root
+  // containing $(...) would execute there, so the path is both transferred over
+  // SFTP (-s) and quoted in case the client ignores the flag.
+  it("requests the sftp protocol rather than the legacy remote-shell copy", async () => {
+    const { run, invocations } = recordingRun();
+    await createSshConnection(target, run).uploadFile({
+      localPath: "/tmp/a",
+      remotePath: "/remote/a",
+    });
+    expect(invocationAt(invocations, 0).argv).toContain("-s");
+  });
+
+  it.each([
+    ["command substitution", "/remote/$(id)/a"],
+    ["a backtick", "/remote/`id`/a"],
+    ["a command separator", "/remote/a; rm -rf /"],
+    ["a pipe", "/remote/a | tee /tmp/b"],
+    ["an ampersand", "/remote/a && curl evil"],
+    ["a space", "/remote/My Synara/a"],
+    ["a quote", "/remote/it's/a"],
+    ["a newline", "/remote/a\nrm -rf /"],
+    ["a glob", "/remote/*"],
+    ["a variable", "/remote/$HOME/a"],
+  ])("renders %s as one inert token in the scp target", async (_label, remotePath) => {
+    const { run, invocations } = recordingRun();
+    await createSshConnection(target, run).uploadFile({ localPath: "/tmp/a", remotePath });
+
+    const scpTarget = invocationAt(invocations, 0).argv.at(-1) ?? "";
+    expect(scpTarget.startsWith("deploy@build-01.example.test:")).toBe(true);
+    const encodedPath = scpTarget.slice("deploy@build-01.example.test:".length);
+    // Single-quoted end to end, so no metacharacter survives where a remote
+    // shell could act on it.
+    expect(encodedPath).toMatch(/^'(?:[^']|'\\'')*'$/);
+  });
+
+  // The mv/chmod that finalize the upload go through exec, which quotes; this
+  // pins that the hostile path never appears raw in ANY invocation.
+  it("never lets a hostile path reach a command unquoted", async () => {
+    const { run, invocations } = recordingRun();
+    await createSshConnection(target, run).uploadFile({
+      localPath: "/tmp/a",
+      remotePath: "/remote/$(id)/a",
+      mode: 0o700,
+    });
+    for (const invocation of invocations) {
+      const rendered = invocation.argv.join(" ");
+      if (rendered.includes("$(id)")) {
+        expect(rendered).toMatch(/'[^']*\$\(id\)[^']*'/);
+      }
+    }
   });
 });

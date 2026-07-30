@@ -57,6 +57,14 @@ export interface FakeRemoteHost {
    */
   stubExit(match: (argv: ReadonlyArray<string>) => boolean, result: RemoteExecResult): void;
   /**
+   * Registers a fault that fires PART WAY THROUGH a non-atomic command.
+   *
+   * `ln -sfn` unlinks the old link before creating the new one; a fault in that
+   * window is the only way to observe a `current` that points at nothing. An
+   * atomic `mv -T` has no such window, which is exactly what the swap must use.
+   */
+  failMidCommand(match: (argv: ReadonlyArray<string>) => boolean, fault: () => never): void;
+  /**
    * Makes the next upload to `remotePath` land different bytes while still
    * reporting success — a lossy link, not a dropped one. This is the only way
    * to exercise the post-upload remote checksum, because a fault that throws
@@ -65,6 +73,14 @@ export interface FakeRemoteHost {
   corruptNextUpload(remotePath: string, contents: string): void;
   /** Truncates a file to simulate a killed upload. */
   truncate(path: string, keepBytes: number): void;
+  /**
+   * Registers a running process, so `/proc/<pid>/exe` resolves to
+   * `executablePath` the way it does on Linux.
+   *
+   * Ownership checks read that link, so this is how a test distinguishes our
+   * own server from an unrelated process that inherited a recycled pid.
+   */
+  registerProcess(pid: number, executablePath: string): void;
 }
 
 const ok = (stdout = ""): RemoteExecResult => ({ exitCode: 0, stdout, stderr: "" });
@@ -86,6 +102,10 @@ export function createFakeRemoteHost(): FakeRemoteHost {
   const stubs: Array<{
     match: (argv: ReadonlyArray<string>) => boolean;
     result: RemoteExecResult;
+  }> = [];
+  const midCommandFaults: Array<{
+    match: (argv: ReadonlyArray<string>) => boolean;
+    fault: () => never;
   }> = [];
 
   const mkdirp = (path: string): void => {
@@ -131,6 +151,21 @@ export function createFakeRemoteHost(): FakeRemoteHost {
     return node?.kind === "file" ? node.contents : null;
   };
 
+  /**
+   * Fires a fault registered for the MIDDLE of a non-atomic command.
+   *
+   * `ln -sfn` unlinks before it creates; a fault here lands in that window,
+   * which is the only way to observe a dangling `current`.
+   */
+  const runMidCommandFaults = (argv: ReadonlyArray<string>): void => {
+    for (const [index, { match, fault }] of midCommandFaults.entries()) {
+      if (match(argv)) {
+        midCommandFaults.splice(index, 1);
+        fault();
+      }
+    }
+  };
+
   const run = (argv: ReadonlyArray<string>, options?: RemoteExecOptions): RemoteExecResult => {
     commands.push(argv);
     for (const [index, { match, fault }] of faults.entries()) {
@@ -156,6 +191,15 @@ export function createFakeRemoteHost(): FakeRemoteHost {
 
     switch (command) {
       case "mkdir": {
+        // Without `-p`, mkdir FAILS when the directory exists. That is what
+        // makes it usable as an atomic lock, so the fake must model it: a
+        // permissive mkdir would let two concurrent bootstraps both "acquire".
+        const parents = flags.some((flag) => flag.includes("p"));
+        for (const operand of operands) {
+          if (!parents && nodes.has(operand)) {
+            return fail(`mkdir: cannot create directory '${operand}': File exists`);
+          }
+        }
         for (const operand of operands) mkdirp(operand);
         return ok();
       }
@@ -190,6 +234,17 @@ export function createFakeRemoteHost(): FakeRemoteHost {
         const from = operand(0);
         const to = operand(1);
         if (!nodes.has(from)) return fail(`mv: no such file: ${from}`);
+        // `mv -T` is a single rename(2): the destination name never stops
+        // existing, it just points somewhere new. No mid-command fault hook
+        // here, deliberately — that is the property the swap relies on.
+        if (flags.some((flag) => flag.includes("T"))) {
+          const source = nodes.get(from);
+          if (source?.kind === "symlink") {
+            nodes.set(to, { kind: "symlink", target: source.target });
+            nodes.delete(from);
+            return ok();
+          }
+        }
         removeRecursive(to);
         for (const key of keysUnder(from)) {
           const node = nodes.get(key);
@@ -202,6 +257,14 @@ export function createFakeRemoteHost(): FakeRemoteHost {
         const target = operand(0);
         const link = operand(1);
         mkdirp(parent(link));
+        // `ln -sfn` is NOT atomic: coreutils unlinks the existing link and then
+        // creates the new one, so there is a window in which the name does not
+        // exist at all. Modelling it as a single map write is what hid the
+        // dangling-`current` bug, so the two halves are separated here and a
+        // fault can be injected between them.
+        const replacing = nodes.has(link);
+        if (replacing) nodes.delete(link);
+        runMidCommandFaults(argv);
         nodes.set(link, { kind: "symlink", target });
         return ok();
       }
@@ -306,12 +369,19 @@ export function createFakeRemoteHost(): FakeRemoteHost {
     stubExit(match, result) {
       stubs.push({ match, result });
     },
+    failMidCommand(match, fault) {
+      midCommandFaults.push({ match, fault });
+    },
     corruptNextUpload(remotePath, contents) {
       corruptions.set(remotePath, contents);
     },
     truncate(path, keepBytes) {
       const node = nodes.get(path);
       if (node?.kind === "file") node.contents = node.contents.slice(0, keepBytes);
+    },
+    registerProcess(pid, executablePath) {
+      mkdirp(`/proc/${pid}`);
+      nodes.set(`/proc/${pid}/exe`, { kind: "symlink", target: executablePath });
     },
   };
 }

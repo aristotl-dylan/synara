@@ -14,6 +14,7 @@ import {
   type BootstrapInput,
   readRemoteReleaseId,
   uninstallRemoteServer,
+  UpgradeRefusedError,
 } from "./remoteBootstrap";
 import {
   isPathInsideInstallRoot,
@@ -22,6 +23,7 @@ import {
   remoteInstallLayout,
 } from "./remoteInstallLayout";
 import { remoteSupervisorPlan } from "./remoteSupervisor";
+import type { RequestedUpgrade } from "./remoteUpgradePolicy";
 
 const ENVIRONMENT_ID = "6f9d0c6e-7a1f-4d2b-9a3c-0e5d1b2c3d4e";
 const layout = remoteInstallLayout("/home/deploy/.synara/remote");
@@ -204,8 +206,11 @@ describe("clean-host bootstrap", () => {
     const host = createFakeRemoteHost();
     await bootstrapRemoteServer(bootstrapInput(host));
     const chmods = host.commands.filter((argv) => argv[0] === "chmod");
-    expect(chmods).toContainEqual(["chmod", "600", "--", layout.credentialFile]);
+    // 0600 is set on the temp file BEFORE it is renamed into place, so the
+    // credential is never briefly world-readable at its real path.
+    expect(chmods).toContainEqual(["chmod", "600", "--", `${layout.credentialFile}.new`]);
     expect(chmods).toContainEqual(["chmod", "700", "--", layout.root, layout.stateDirectory]);
+    expect(host.readFile(layout.credentialFile)).not.toBeNull();
   });
 
   it("starts the supervisor and enables linger", async () => {
@@ -614,7 +619,7 @@ describe("interrupted activation does not leave current lying", () => {
     await bootstrapRemoteServer(bootstrapInput(host));
 
     host.failOn(
-      (argv) => argv[0] === "sh" && argv.includes(supervisor.unitPath),
+      (argv) => argv[0] === "sh" && argv.includes(`${supervisor.unitPath}.new`),
       () => {
         throw new InterruptionError("connection dropped writing the unit");
       },
@@ -628,6 +633,121 @@ describe("interrupted activation does not leave current lying", () => {
       ),
     ).rejects.toThrow(InterruptionError);
     expect(await readRemoteReleaseId(host.connection, layout)).toBe("0.6.3");
+  });
+});
+
+describe("activation is atomic", () => {
+  // `ln -sfn` unlinks before it creates, so an interruption in that window
+  // leaves `current` pointing at NOTHING and the supervisor with nothing to
+  // launch. The fake models that window explicitly (failMidCommand) — modelling
+  // ln as one map write is what hid this. `mv -T` is a single rename(2), so the
+  // name never stops resolving.
+  it("never leaves current dangling when interrupted mid-swap", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    // Any ln that targets `current` itself would be the non-atomic form.
+    host.failMidCommand(
+      (argv) => argv[0] === "ln" && argv.includes(layout.currentLink),
+      () => {
+        throw new InterruptionError("connection dropped mid-symlink-swap");
+      },
+    );
+
+    await bootstrapRemoteServer(
+      bootstrapInput(host, {
+        artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+        probeHandshake: (credential) =>
+          Promise.resolve({
+            environmentId: ENVIRONMENT_ID,
+            serverVersion: "0.7.0",
+            acceptedToken: credential.token,
+            authenticated: true,
+          }),
+      }),
+    );
+
+    // The mid-swap fault never fired, because no `ln` ever names `current`.
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.7.0`);
+  });
+
+  it("swaps current with an atomic rename rather than unlink-then-create", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    // Every ln writes a temp name; only mv -T ever names `current`.
+    for (const argv of host.commands) {
+      if (argv[0] === "ln") {
+        expect(argv).not.toContain(layout.currentLink);
+        expect(argv).not.toContain(layout.previousLink);
+      }
+    }
+    const swaps = host.commands.filter(
+      (argv) => argv[0] === "mv" && argv.includes(layout.currentLink),
+    );
+    expect(swaps).not.toHaveLength(0);
+    for (const argv of swaps) {
+      expect(argv.some((token) => token.startsWith("-") && token.includes("T"))).toBe(true);
+    }
+  });
+
+  it("rolls back with the same atomic swap", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    const before = host.commands.length;
+
+    await expect(
+      bootstrapRemoteServer(
+        bootstrapInput(host, {
+          artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+          probeHandshake: (credential) =>
+            Promise.resolve({
+              environmentId: ENVIRONMENT_ID,
+              serverVersion: "0.6.3",
+              acceptedToken: credential.token,
+              authenticated: true,
+            }),
+        }),
+      ),
+    ).rejects.toThrow(/not the one running/);
+
+    for (const argv of host.commands.slice(before)) {
+      if (argv[0] === "ln") expect(argv).not.toContain(layout.currentLink);
+    }
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+  });
+});
+
+describe("a retry of the running version never deletes it", () => {
+  // The bug: extractRelease removed releases/<id> before moving scratch into
+  // place, so re-running the SAME version after a post-activation interruption
+  // deleted the directory `current` resolves to — killing the running server.
+  it("keeps the active release intact when the same version is bootstrapped again", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    expect(host.readFile(`${layout.currentLink}/dist/index.mjs`)).toBe("// synara server\n");
+
+    // Same release id, same bytes: the resume case.
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+    expect(host.readFile(`${layout.currentLink}/dist/index.mjs`)).toBe("// synara server\n");
+    expect(host.readFile(`${layout.currentLink}/node`)).toBe(NODE_RUNTIME_BYTES);
+  });
+
+  it("never issues an rm against the directory current resolves to", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    const activeDirectory = host.readLink(layout.currentLink);
+    const before = host.commands.length;
+
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    for (const argv of host.commands.slice(before)) {
+      if (argv[0] === "rm") {
+        expect(argv).not.toContain(activeDirectory);
+      }
+    }
   });
 });
 
@@ -670,11 +790,13 @@ describe("uninstall", () => {
   });
 
   // Mutation guard: a `pkill -f synara` here would kill an unrelated Synara on
-  // the same host. Every kill must name a pid read from OUR pidfile.
-  it("kills only the pid in our own pidfile, and never by pattern", async () => {
+  // the same host. Every kill must name a pid read from OUR pidfile — AND that
+  // pid must be proven to be our process before it is signalled.
+  it("kills the pidfile's process when it is provably ours, and never by pattern", async () => {
     const host = createFakeRemoteHost();
     await bootstrapRemoteServer(bootstrapInput(host));
     host.nodes.set(layout.pidFile, { kind: "file", contents: "4242\n", mode: 0o600 });
+    host.registerProcess(4242, `${layout.releasesDirectory}/0.6.3/node`);
 
     const before = host.commands.length;
     await uninstallRemoteServer({ connection: host.connection, layout, supervisor });
@@ -686,10 +808,46 @@ describe("uninstall", () => {
     }
   });
 
-  it("does not kill anything when the pidfile is absent or unparseable", async () => {
-    for (const pidContents of [null, "", "not-a-pid", "0", "1", "-5"]) {
+  // The finding: pids are recycled, so a stale pidfile plus a reboot routinely
+  // names a live process belonging to someone else. The number alone proves
+  // nothing; the executable behind it is what establishes ownership.
+  it.each([
+    ["a system daemon", "/usr/sbin/sshd"],
+    ["another user's node", "/usr/bin/node"],
+    ["a different Synara install", "/home/other/.synara/remote/releases/0.6.3/node"],
+    ["a sibling path sharing our prefix", "/home/deploy/.synara/remote-backup/node"],
+  ])("refuses to signal a recycled pid running %s", async (_label, executablePath) => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    host.nodes.set(layout.pidFile, { kind: "file", contents: "4242\n", mode: 0o600 });
+    host.registerProcess(4242, executablePath);
+
+    const before = host.commands.length;
+    await uninstallRemoteServer({ connection: host.connection, layout, supervisor });
+    expect(host.commands.slice(before).filter((argv) => argv[0] === "kill")).toEqual([]);
+  });
+
+  it("does not signal a pid that no longer exists", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    host.nodes.set(layout.pidFile, { kind: "file", contents: "4242\n", mode: 0o600 });
+    // No registerProcess: /proc/4242/exe does not resolve.
+    const before = host.commands.length;
+    await uninstallRemoteServer({ connection: host.connection, layout, supervisor });
+    expect(host.commands.slice(before).filter((argv) => argv[0] === "kill")).toEqual([]);
+  });
+
+  // "4242garbage" must not parse as 4242 the way Number.parseInt does.
+  it.each([null, "", "   ", "not-a-pid", "0", "1", "-5", "4242garbage", "42 42", "0x10", "1e3"])(
+    "does not kill anything for pidfile contents %j",
+    async (pidContents) => {
       const host = createFakeRemoteHost();
       await bootstrapRemoteServer(bootstrapInput(host));
+      // Register a process at every pid these could be misread as, so a lax
+      // parser would find a live, owned target and actually signal it.
+      for (const pid of [0, 1, 5, 42, 1000, 4242]) {
+        host.registerProcess(pid, `${layout.releasesDirectory}/0.6.3/node`);
+      }
       if (pidContents === null) {
         host.nodes.delete(layout.pidFile);
       } else {
@@ -698,8 +856,8 @@ describe("uninstall", () => {
       const before = host.commands.length;
       await uninstallRemoteServer({ connection: host.connection, layout, supervisor });
       expect(host.commands.slice(before).filter((argv) => argv[0] === "kill")).toEqual([]);
-    }
-  });
+    },
+  );
 
   // The bug this locks down (F3): the old guard was
   // isPathInsideInstallRoot(layout, layout.root) — structurally `x === x`, so it
@@ -749,5 +907,244 @@ describe("uninstall", () => {
     await expect(
       uninstallRemoteServer({ connection: host2.connection, layout, supervisor }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("the drain policy actually gates the upgrade", () => {
+  // Before this, evaluateUpgradeGate was referenced only by its own tests: the
+  // policy passed while bootstrap ran `systemctl restart` unconditionally, so
+  // an upgrade could still preempt a streaming turn.
+  const requestedUpgrade: RequestedUpgrade = {
+    userInvoked: true,
+    drain: { activeTurnCount: 0 },
+    elapsedDrainMs: 0,
+    drainTimeoutMs: 120_000,
+  };
+
+  async function installBaseline(host: FakeRemoteHost): Promise<void> {
+    await bootstrapRemoteServer(bootstrapInput(host));
+  }
+
+  function upgradeInput(host: FakeRemoteHost, upgrade: Partial<RequestedUpgrade>): BootstrapInput {
+    return bootstrapInput(host, {
+      artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+      upgrade: { ...requestedUpgrade, ...upgrade },
+      probeHandshake: (credential) =>
+        Promise.resolve({
+          environmentId: ENVIRONMENT_ID,
+          serverVersion: "0.7.0",
+          acceptedToken: credential.token,
+          authenticated: true,
+        }),
+    });
+  }
+
+  it("refuses an upgrade nobody asked for", async () => {
+    const host = createFakeRemoteHost();
+    await installBaseline(host);
+    const before = host.commands.length;
+
+    await expect(bootstrapRemoteServer(upgradeInput(host, { userInvoked: false }))).rejects.toThrow(
+      UpgradeRefusedError,
+    );
+
+    // Nothing was restarted and current still points at the old release.
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+    expect(
+      host.commands
+        .slice(before)
+        .filter((argv) => argv[0] === "systemctl" && argv[2] === "restart"),
+    ).toEqual([]);
+  });
+
+  it("waits rather than preempting a streaming turn", async () => {
+    const host = createFakeRemoteHost();
+    await installBaseline(host);
+    const before = host.commands.length;
+
+    const error = await bootstrapRemoteServer(
+      upgradeInput(host, { drain: { activeTurnCount: 2 } }),
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(UpgradeRefusedError);
+    expect((error as UpgradeRefusedError).gate).toEqual({ decision: "wait", activeTurnCount: 2 });
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+    expect(
+      host.commands
+        .slice(before)
+        .filter((argv) => argv[0] === "systemctl" && argv[2] === "restart"),
+    ).toEqual([]);
+  });
+
+  it("reports a drain timeout instead of silently forcing the swap", async () => {
+    const host = createFakeRemoteHost();
+    await installBaseline(host);
+
+    const error = await bootstrapRemoteServer(
+      upgradeInput(host, {
+        drain: { activeTurnCount: 1 },
+        elapsedDrainMs: 120_000,
+        drainTimeoutMs: 120_000,
+      }),
+    ).catch((cause: unknown) => cause);
+
+    expect((error as UpgradeRefusedError).gate).toEqual({
+      decision: "drain-timeout",
+      activeTurnCount: 1,
+    });
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+  });
+
+  it("does no work when the target release already runs", async () => {
+    const host = createFakeRemoteHost();
+    await installBaseline(host);
+    const before = host.commands.length;
+
+    const error = await bootstrapRemoteServer(
+      bootstrapInput(host, { upgrade: requestedUpgrade }),
+    ).catch((cause: unknown) => cause);
+
+    expect((error as UpgradeRefusedError).gate).toEqual({ decision: "already-current" });
+    expect(host.commands.slice(before).filter((argv) => argv[0] === "scp")).toEqual([]);
+  });
+
+  it("proceeds when the user asked and nothing is in flight", async () => {
+    const host = createFakeRemoteHost();
+    await installBaseline(host);
+    const outcome = await bootstrapRemoteServer(upgradeInput(host, {}));
+    expect(outcome.releaseId).toBe("0.7.0");
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.7.0`);
+  });
+
+  // A refused gate must not have touched the box at all — not even an upload.
+  it("uploads nothing when the gate refuses", async () => {
+    const host = createFakeRemoteHost();
+    await installBaseline(host);
+    const before = host.commands.length;
+    await bootstrapRemoteServer(upgradeInput(host, { userInvoked: false })).catch(() => undefined);
+    expect(host.commands.slice(before).filter((argv) => argv[0] === "scp")).toEqual([]);
+    expect(host.exists(`${layout.releasesDirectory}/0.7.0`)).toBe(false);
+  });
+});
+
+describe("concurrent bootstraps are serialized", () => {
+  // Two runs share staging, .incoming, the credential file, the unit, and
+  // current. Interleaved, the second overwrites the first's credential and the
+  // first then rolls back a release the second just activated.
+  it("refuses to start while another bootstrap holds the lock", async () => {
+    const host = createFakeRemoteHost();
+    host.nodes.set(layout.lockFile, { kind: "directory" });
+
+    await expect(bootstrapRemoteServer(bootstrapInput(host))).rejects.toThrow(
+      /Another bootstrap is already running/,
+    );
+    expect(host.exists(layout.currentLink)).toBe(false);
+  });
+
+  it("releases the lock after a successful run", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    expect(host.exists(layout.lockFile)).toBe(false);
+    // Which means a subsequent run can take it.
+    await expect(bootstrapRemoteServer(bootstrapInput(host))).resolves.toBeDefined();
+  });
+
+  it("releases the lock even when the bootstrap fails", async () => {
+    const host = createFakeRemoteHost();
+    host.failOn(
+      (argv) => argv[0] === "tar",
+      () => {
+        throw new InterruptionError("connection dropped during extraction");
+      },
+    );
+    await expect(bootstrapRemoteServer(bootstrapInput(host))).rejects.toThrow(InterruptionError);
+    expect(host.exists(layout.lockFile)).toBe(false);
+  });
+
+  it("holds the lock for the whole run, not just the start", async () => {
+    const host = createFakeRemoteHost();
+    let heldDuringHandshake = false;
+    await bootstrapRemoteServer(
+      bootstrapInput(host, {
+        probeHandshake: (credential) => {
+          heldDuringHandshake = host.exists(layout.lockFile);
+          return Promise.resolve({
+            environmentId: ENVIRONMENT_ID,
+            serverVersion: "0.6.3",
+            acceptedToken: credential.token,
+            authenticated: true,
+          });
+        },
+      }),
+    );
+    expect(heldDuringHandshake).toBe(true);
+  });
+});
+
+describe("credential rotation is crash-safe", () => {
+  it("writes the credential through a temp file and renames it into place", async () => {
+    const host = createFakeRemoteHost();
+    const outcome = await bootstrapRemoteServer(bootstrapInput(host));
+
+    // The live path is only ever produced by a rename, never written directly.
+    for (const argv of host.commands) {
+      if (argv[0] === "sh") {
+        expect(argv).not.toContain(layout.credentialFile);
+      }
+    }
+    expect(host.commands).toContainEqual([
+      "mv",
+      "-fT",
+      "--",
+      `${layout.credentialFile}.new`,
+      layout.credentialFile,
+    ]);
+    expect(host.readFile(layout.credentialFile)?.trim()).toBe(outcome.credential.token);
+  });
+
+  it("keeps the outgoing credential recoverable across an upgrade", async () => {
+    const host = createFakeRemoteHost();
+    const first = await bootstrapRemoteServer(bootstrapInput(host));
+
+    const second = await bootstrapRemoteServer(
+      bootstrapInput(host, {
+        artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+        probeHandshake: (credential) =>
+          Promise.resolve({
+            environmentId: ENVIRONMENT_ID,
+            serverVersion: "0.7.0",
+            acceptedToken: credential.token,
+            authenticated: true,
+          }),
+      }),
+    );
+
+    expect(host.readFile(layout.credentialFile)?.trim()).toBe(second.credential.token);
+    expect(host.readFile(layout.previousCredentialFile)?.trim()).toBe(first.credential.token);
+  });
+
+  // Rolling the release back but leaving the NEW credential in place would
+  // restart the old server under a token the broker never gave it.
+  it("restores the previous credential when a failed upgrade rolls back", async () => {
+    const host = createFakeRemoteHost();
+    const first = await bootstrapRemoteServer(bootstrapInput(host));
+
+    await expect(
+      bootstrapRemoteServer(
+        bootstrapInput(host, {
+          artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+          probeHandshake: (credential) =>
+            Promise.resolve({
+              environmentId: ENVIRONMENT_ID,
+              serverVersion: "0.6.3",
+              acceptedToken: credential.token,
+              authenticated: true,
+            }),
+        }),
+      ),
+    ).rejects.toThrow(/not the one running/);
+
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+    expect(host.readFile(layout.credentialFile)?.trim()).toBe(first.credential.token);
   });
 });

@@ -16,7 +16,7 @@
 
 import { spawn } from "node:child_process";
 
-import { quotePosixShellCommand } from "@synara/shared/posixShell";
+import { quotePosixShellArgument, quotePosixShellCommand } from "@synara/shared/posixShell";
 
 import {
   type RemoteConnection,
@@ -45,6 +45,47 @@ export interface SshTarget {
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 /**
+ * Sinks that make a known_hosts file forget every key it is told to remember.
+ *
+ * OpenSSH treats `none` as "no known_hosts at all", and /dev/null discards
+ * writes, so either one turns `accept-new` from trust-on-first-use into
+ * trust-on-EVERY-use: nothing is ever pinned, so a CHANGED key never fails, and
+ * a repeated man-in-the-middle can impersonate the host, capture the credential
+ * we upload, and answer the provisioning handshake convincingly. There is no
+ * legitimate reason to bootstrap against an unpinnable host.
+ */
+const NON_PERSISTENT_KNOWN_HOSTS: ReadonlySet<string> = new Set([
+  "none",
+  "/dev/null",
+  "/dev/zero",
+  "nul",
+  "null",
+]);
+
+export function assertPersistentKnownHostsFile(knownHostsFile: string): string {
+  const trimmed = knownHostsFile.trim();
+  if (trimmed.length === 0) {
+    throw new Error("knownHostsFile must be a path; pass undefined to use OpenSSH's default.");
+  }
+  if (NON_PERSISTENT_KNOWN_HOSTS.has(trimmed.toLowerCase())) {
+    throw new Error(
+      `Refusing to use ${trimmed} as a known_hosts file: host keys would never be pinned, which defeats host-key verification.`,
+    );
+  }
+  // A value with whitespace or a newline would split into extra `-o` tokens, or
+  // append a second directive to the option OpenSSH parses.
+  if (/\s/.test(trimmed)) {
+    throw new Error(
+      `knownHostsFile must not contain whitespace: ${JSON.stringify(knownHostsFile)}`,
+    );
+  }
+  if (!trimmed.startsWith("/") && !trimmed.startsWith("~/")) {
+    throw new Error(`knownHostsFile must be an absolute path: ${JSON.stringify(knownHostsFile)}`);
+  }
+  return trimmed;
+}
+
+/**
  * The `-o` options every ssh/scp invocation carries.
  *
  * `StrictHostKeyChecking` is always emitted explicitly so a permissive value in
@@ -59,8 +100,8 @@ export function sshConnectionOptionArgv(target: SshTarget): ReadonlyArray<string
     "-o",
     "ConnectTimeout=15",
   ];
-  if (target.knownHostsFile) {
-    argv.push("-o", `UserKnownHostsFile=${target.knownHostsFile}`);
+  if (target.knownHostsFile !== undefined) {
+    argv.push("-o", `UserKnownHostsFile=${assertPersistentKnownHostsFile(target.knownHostsFile)}`);
   }
   if (target.identityFile) {
     argv.push("-o", "IdentitiesOnly=yes", "-i", target.identityFile);
@@ -147,7 +188,21 @@ export function createSshConnection(
       const scpPortArgv = target.port ? ["-P", String(target.port)] : [];
       const result = await run(
         "scp",
-        [...baseArgv, ...scpPortArgv, "--", localPath, `${destination}:${temporaryPath}`],
+        [
+          ...baseArgv,
+          ...scpPortArgv,
+          // Force the SFTP protocol. Legacy scp implements the remote side by
+          // running a REMOTE SHELL over the path, so the target below would be
+          // shell-interpreted; SFTP transfers the name as data. OpenSSH 9 makes
+          // this the default, but we do not get to choose the client's version.
+          "-s",
+          "--",
+          localPath,
+          // Quoted regardless, because `-s` only holds if the client honours
+          // it: an older scp that ignores the flag still gets a path its shell
+          // cannot take apart.
+          `${destination}:${quotePosixShellArgument(temporaryPath)}`,
+        ],
         undefined,
       );
       if (result.exitCode !== 0) {

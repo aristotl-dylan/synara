@@ -6,15 +6,23 @@
 //          to it. Interrupted runs resume; failed activations roll back.
 // Layer: Server / remote broker
 // Exports: bootstrapRemoteServer, uninstallRemoteServer, rollbackRemoteServer,
-//          readRemoteReleaseId, BootstrapOutcome, BootstrapProgress
+//          readRemoteReleaseId, BootstrapOutcome, BootstrapProgress,
+//          UpgradeRefusedError
 //
 // Crash safety model
 // ------------------
-// The only mutation that changes what runs is the `current` symlink swap, and
-// symlink replacement via `ln -sfn` + rename is atomic. Everything before it
-// (upload, checksum, extract) happens in `staging/` and `releases/<id>/`, which
-// are inert. So an interruption at any point leaves either the old release
-// running or nothing running — never a half-written tree behind `current`.
+// The only mutation that changes what runs is the `current` symlink swap. It is
+// done by creating a uniquely-named sibling link and `mv -T`-ing it over the
+// destination, which is a single rename(2) — NOT `ln -sfn`, which unlinks and
+// then re-creates, leaving a window where `current` resolves to nothing at all.
+// Everything before the swap (upload, checksum, extract) happens in `staging/`
+// and `releases/<id>/`, which are inert. So an interruption at any point leaves
+// either the old release running or the new one, never a half-written tree
+// behind `current`.
+//
+// The same rename discipline covers the credential: it is written to a temp
+// file and renamed into place, and the outgoing credential is copied aside
+// first so a rollback can restore the token the old release still expects.
 //
 // Resume is content-addressed rather than journalled: a re-run re-checksums the
 // remote staged file and skips the upload only when it already matches. A
@@ -48,6 +56,12 @@ import {
 } from "./remoteInstallLayout";
 import type { SupervisorPlan } from "./remoteSupervisor";
 import {
+  describeUpgradeGate,
+  evaluateUpgradeGate,
+  type RequestedUpgrade,
+  type UpgradeGate,
+} from "./remoteUpgradePolicy";
+import {
   normalizeEnvironmentId,
   normalizeReleaseId,
   normalizeRemoteFileName,
@@ -80,6 +94,26 @@ export interface BootstrapInput {
   readonly probeHandshake: (credential: RemoteCredential) => Promise<ProvisioningClaim>;
   readonly onProgress?: (progress: BootstrapProgress) => void;
   readonly mintCredential?: () => RemoteCredential;
+  /**
+   * The drain policy this upgrade must satisfy before it may swap the release.
+   *
+   * Omitted for a FIRST install, where there is no running server and so no
+   * turn to preempt. Supplying it on an upgrade is what makes the policy real:
+   * without it, `systemctl restart` runs unconditionally and a weekly release
+   * can kill a turn that is still streaming.
+   */
+  readonly upgrade?: RequestedUpgrade;
+}
+
+/** Thrown when the drain policy refuses or defers the release swap. */
+export class UpgradeRefusedError extends Error {
+  readonly gate: UpgradeGate;
+
+  constructor(gate: UpgradeGate, message: string) {
+    super(message);
+    this.name = "UpgradeRefusedError";
+    this.gate = gate;
+  }
 }
 
 const REMOTE_DIRECTORY_MODE = "700";
@@ -121,6 +155,42 @@ async function remoteDigest(
     }
   }
   return null;
+}
+
+/**
+ * Take the install's bootstrap lock for the duration of `body`.
+ *
+ * Two concurrent bootstraps share every path in the layout — staging names, the
+ * `.incoming` scratch tree, the credential file, the unit, and `current` — so
+ * without this they interleave: each mints a credential, the second overwrites
+ * the first, and the first's handshake then fails and rolls back a release the
+ * second just activated.
+ *
+ * `mkdir` is the primitive because it is atomic on every POSIX filesystem
+ * including NFS: it either creates the directory or fails, with no
+ * check-then-act window. `flock` would be nicer but is not universally present,
+ * and a lock FILE opened with `>` is not exclusive at all.
+ */
+async function withBootstrapLock<T>(
+  connection: RemoteConnection,
+  layout: RemoteInstallLayout,
+  body: () => Promise<T>,
+): Promise<T> {
+  const acquired = await connection.exec(["mkdir", "--", layout.lockFile]);
+  if (acquired.exitCode !== 0) {
+    throw new Error(
+      `Another bootstrap is already running against ${layout.root} (lock: ${layout.lockFile}). ` +
+        "If no bootstrap is in progress, remove that directory and retry.",
+    );
+  }
+  try {
+    return await body();
+  } finally {
+    // Released even when the body throws: a crashed run must not wedge the
+    // install permanently. A hard kill still leaves the lock behind, which is
+    // why the error above says how to clear it.
+    await connection.exec(["rm", "-rf", "--", layout.lockFile]);
+  }
 }
 
 async function ensureDirectories(input: BootstrapInput): Promise<void> {
@@ -178,15 +248,24 @@ async function stageArtifact(input: BootstrapInput, artifact: BootstrapArtifact)
   return remotePath;
 }
 
-/** Reads the release id `current` points at, or null when nothing is active. */
-export async function readRemoteReleaseId(
+/** The directory `current` resolves to, or null when nothing is active. */
+async function readRemoteCurrentTarget(
   connection: RemoteConnection,
   layout: RemoteInstallLayout,
 ): Promise<string | null> {
   const result = await connection.exec(["readlink", "--", layout.currentLink]);
   if (result.exitCode !== 0) return null;
   const target = result.stdout.trim();
-  if (target.length === 0) return null;
+  return target.length === 0 ? null : target;
+}
+
+/** Reads the release id `current` points at, or null when nothing is active. */
+export async function readRemoteReleaseId(
+  connection: RemoteConnection,
+  layout: RemoteInstallLayout,
+): Promise<string | null> {
+  const target = await readRemoteCurrentTarget(connection, layout);
+  if (target === null) return null;
   const name = target.split("/").findLast((segment) => segment.length > 0);
   if (!name) return null;
   try {
@@ -213,6 +292,18 @@ async function extractRelease(
   await expectRemoteSuccess(connection, ["rm", "-rf", "--", scratch]);
   await expectRemoteSuccess(connection, ["mkdir", "-p", "--", scratch]);
   await expectRemoteSuccess(connection, ["tar", "-xzf", tarballRemotePath, "-C", scratch, "--"]);
+  // Never delete the tree the supervisor is currently executing from. A retry
+  // of the SAME version after a post-activation interruption resolves `current`
+  // to this very directory, and removing it would stop the running server dead
+  // — the one release on the box that is definitely in use.
+  const activeReleaseDirectory = await readRemoteCurrentTarget(connection, input.layout);
+  if (activeReleaseDirectory === releaseDirectory) {
+    // Already extracted and live: the scratch tree is redundant, and the bytes
+    // are identical because the tarball's digest was verified before it was
+    // unpacked. Leaving `current` untouched is the safe resolution.
+    await expectRemoteSuccess(connection, ["rm", "-rf", "--", scratch]);
+    return;
+  }
   await expectRemoteSuccess(connection, ["rm", "-rf", "--", releaseDirectory]);
   await expectRemoteSuccess(connection, ["mv", "--", scratch, releaseDirectory]);
 }
@@ -244,17 +335,100 @@ async function installReleaseRuntime(
   await expectRemoteSuccess(connection, ["chmod", REMOTE_EXECUTABLE_MODE, "--", runtimePath]);
 }
 
+/**
+ * Write a 0600 file whose contents never travel through argv.
+ *
+ * The write is temp-then-rename: a crash partway through a direct write leaves
+ * a TRUNCATED credential, and a server that reads half a token refuses every
+ * connection while looking perfectly healthy. `mv -T` makes the file go from
+ * fully-old to fully-new with nothing observable in between.
+ */
 async function writeRemoteSecret(
   connection: RemoteConnection,
+  layout: RemoteInstallLayout,
   remotePath: string,
   contents: string,
 ): Promise<void> {
+  const temporaryPath = `${remotePath}.new`;
+  if (!isPathInsideInstallRoot(layout, temporaryPath)) {
+    throw new Error(`Refusing to write a secret outside the install root: ${temporaryPath}`);
+  }
   // The secret travels on stdin, never in argv: argv is visible in the remote
   // process table to every user on the host.
-  await expectRemoteSuccess(connection, ["sh", "-c", 'umask 077; cat > "$1"', "sh", remotePath], {
-    stdin: contents,
-  });
-  await expectRemoteSuccess(connection, ["chmod", REMOTE_SECRET_MODE, "--", remotePath]);
+  await expectRemoteSuccess(
+    connection,
+    ["sh", "-c", 'umask 077; cat > "$1"', "sh", temporaryPath],
+    { stdin: contents },
+  );
+  await expectRemoteSuccess(connection, ["chmod", REMOTE_SECRET_MODE, "--", temporaryPath]);
+  await expectRemoteSuccess(connection, ["mv", "-fT", "--", temporaryPath, remotePath]);
+}
+
+/**
+ * Install a freshly minted credential, keeping the outgoing one recoverable.
+ *
+ * The previous credential is copied aside before the new one lands. Without
+ * that, a crash after the write loses the new token locally while the OLD
+ * service — which may still be the one running — keeps authenticating with a
+ * credential the broker no longer holds, leaving an authenticated daemon nobody
+ * can talk to. Rollback restores this copy.
+ */
+async function installCredential(
+  connection: RemoteConnection,
+  layout: RemoteInstallLayout,
+  credential: RemoteCredential,
+): Promise<void> {
+  const existing = await connection.exec(["cat", "--", layout.credentialFile]);
+  if (existing.exitCode === 0 && existing.stdout.trim().length > 0) {
+    await expectRemoteSuccess(connection, [
+      "cp",
+      "-f",
+      "--",
+      layout.credentialFile,
+      layout.previousCredentialFile,
+    ]);
+    await expectRemoteSuccess(connection, [
+      "chmod",
+      REMOTE_SECRET_MODE,
+      "--",
+      layout.previousCredentialFile,
+    ]);
+  }
+  await writeRemoteSecret(connection, layout, layout.credentialFile, `${credential.token}\n`);
+}
+
+/** Puts the previous credential back, so the restored release stays reachable. */
+async function restorePreviousCredential(
+  connection: RemoteConnection,
+  layout: RemoteInstallLayout,
+): Promise<void> {
+  const previous = await connection.exec(["cat", "--", layout.previousCredentialFile]);
+  if (previous.exitCode !== 0 || previous.stdout.trim().length === 0) return;
+  await writeRemoteSecret(connection, layout, layout.credentialFile, `${previous.stdout.trim()}\n`);
+}
+
+/**
+ * Point a symlink at `target` without the name ever ceasing to exist.
+ *
+ * `ln -sfn` is NOT atomic — coreutils unlinks the existing link and then
+ * creates the new one, so an interruption in between leaves the name missing
+ * entirely, and for `current` that means a supervisor with nothing to launch.
+ * Creating a uniquely-named sibling link and `mv -T`-ing it over the
+ * destination is a single rename(2): observers see either the old target or the
+ * new one, never nothing.
+ */
+async function atomicSymlinkSwap(
+  connection: RemoteConnection,
+  layout: RemoteInstallLayout,
+  input: { readonly target: string; readonly linkPath: string },
+): Promise<void> {
+  const temporaryLink = `${input.linkPath}.swap`;
+  if (!isPathInsideInstallRoot(layout, temporaryLink)) {
+    throw new Error(`Refusing to create a symlink outside the install root: ${temporaryLink}`);
+  }
+  await expectRemoteSuccess(connection, ["rm", "-f", "--", temporaryLink]);
+  await expectRemoteSuccess(connection, ["ln", "-sfn", "--", input.target, temporaryLink]);
+  await expectRemoteSuccess(connection, ["mv", "-fT", "--", temporaryLink, input.linkPath]);
 }
 
 /** Points `current` at `releaseId`, recording the outgoing one as `previous`. */
@@ -267,15 +441,15 @@ async function activateRelease(
   input.onProgress?.({ step: "activating" });
   const releaseDirectory = remoteReleaseDirectory(layout, releaseId);
   if (previousReleaseId !== null) {
-    await expectRemoteSuccess(connection, [
-      "ln",
-      "-sfn",
-      "--",
-      remoteReleaseDirectory(layout, previousReleaseId),
-      layout.previousLink,
-    ]);
+    await atomicSymlinkSwap(connection, layout, {
+      target: remoteReleaseDirectory(layout, previousReleaseId),
+      linkPath: layout.previousLink,
+    });
   }
-  await expectRemoteSuccess(connection, ["ln", "-sfn", "--", releaseDirectory, layout.currentLink]);
+  await atomicSymlinkSwap(connection, layout, {
+    target: releaseDirectory,
+    linkPath: layout.currentLink,
+  });
 }
 
 async function runPlanCommands(
@@ -302,24 +476,61 @@ export async function rollbackRemoteServer(input: {
     await connection.exec(["rm", "-f", "--", layout.currentLink]);
     return;
   }
-  await expectRemoteSuccess(connection, [
-    "ln",
-    "-sfn",
-    "--",
-    remoteReleaseDirectory(layout, previousReleaseId),
-    layout.currentLink,
-  ]);
+  // The restored release authenticates with the credential it was installed
+  // with; restarting it under the newly minted one would leave a running server
+  // the broker cannot talk to.
+  await restorePreviousCredential(connection, layout);
+  await atomicSymlinkSwap(connection, layout, {
+    target: remoteReleaseDirectory(layout, previousReleaseId),
+    linkPath: layout.currentLink,
+  });
   await runPlanCommands(connection, supervisor.startArgv);
 }
 
+/**
+ * Bootstrap or upgrade a remote Synara, serialized against concurrent runs.
+ *
+ * Input validation happens BEFORE the lock is taken, so a malformed request
+ * fails without touching the remote host or creating a lock another run would
+ * then have to wait behind.
+ */
 export async function bootstrapRemoteServer(input: BootstrapInput): Promise<BootstrapOutcome> {
-  const { connection, layout, artifacts, supervisor } = input;
-  const releaseId = normalizeReleaseId(artifacts.releaseId);
+  const releaseId = normalizeReleaseId(input.artifacts.releaseId);
   const environmentId = normalizeEnvironmentId(input.environmentId);
-  input.onProgress?.({ step: "preparing" });
+  normalizeRemoteFileName(input.artifacts.serverTarball.remoteFileName);
+  normalizeRemoteFileName(input.artifacts.nodeRuntime.remoteFileName);
   await ensureDirectories(input);
+  return withBootstrapLock(input.connection, input.layout, () =>
+    runBootstrap(input, releaseId, environmentId),
+  );
+}
+
+async function runBootstrap(
+  input: BootstrapInput,
+  releaseId: string,
+  environmentId: string,
+): Promise<BootstrapOutcome> {
+  const { connection, layout, artifacts, supervisor } = input;
+  input.onProgress?.({ step: "preparing" });
 
   const previousReleaseId = await readRemoteReleaseId(connection, layout);
+
+  // Consult the drain policy BEFORE anything is uploaded or swapped. A "wait"
+  // or "refused" verdict must leave the remote host exactly as it was, so this
+  // sits ahead of every mutation rather than in front of the restart alone.
+  if (input.upgrade !== undefined) {
+    // currentReleaseId comes from the HOST, not the caller: the caller's view
+    // can be stale, and "already-current" is a decision about what is actually
+    // running.
+    const gate = evaluateUpgradeGate({
+      ...input.upgrade,
+      currentReleaseId: previousReleaseId,
+      targetReleaseId: releaseId,
+    });
+    if (gate.decision !== "swap") {
+      throw new UpgradeRefusedError(gate, describeUpgradeGate(gate));
+    }
+  }
 
   const tarballRemotePath = await stageArtifact(input, artifacts.serverTarball);
   const stagedRuntimePath = await stageArtifact(input, artifacts.nodeRuntime);
@@ -329,8 +540,8 @@ export async function bootstrapRemoteServer(input: BootstrapInput): Promise<Boot
   await installReleaseRuntime(input, stagedRuntimePath, releaseId);
 
   const credential = (input.mintCredential ?? mintRemoteCredential)();
-  await writeRemoteSecret(connection, layout.credentialFile, `${credential.token}\n`);
-  await writeRemoteSecret(connection, layout.environmentIdFile, `${environmentId}\n`);
+  await installCredential(connection, layout, credential);
+  await writeRemoteSecret(connection, layout, layout.environmentIdFile, `${environmentId}\n`);
 
   // Everything from the symlink swap onward is inside the rollback boundary.
   // Activation is the first step that changes what runs, so an interruption
@@ -342,7 +553,7 @@ export async function bootstrapRemoteServer(input: BootstrapInput): Promise<Boot
     await activateRelease(input, releaseId, previousReleaseId);
 
     input.onProgress?.({ step: "installing-supervisor" });
-    await writeRemoteSecret(connection, supervisor.unitPath, supervisor.unitContents);
+    await writeRemoteSecret(connection, layout, supervisor.unitPath, supervisor.unitContents);
     await runPlanCommands(connection, supervisor.installArgv);
     await runPlanCommands(connection, supervisor.startArgv);
 
@@ -374,6 +585,56 @@ export async function bootstrapRemoteServer(input: BootstrapInput): Promise<Boot
 }
 
 /**
+ * A pidfile names a number, not an identity.
+ *
+ * PIDs are recycled, and a stale pidfile from a machine that rebooted routinely
+ * names a live process belonging to someone else. So the number is only the
+ * first half: before signalling we confirm the process is actually OUR server,
+ * by checking that its executable is the Node binary inside our install root.
+ * `/proc/<pid>/exe` is the authoritative answer on Linux and cannot be forged by
+ * the target process the way `ps` output (an argv the process controls) can.
+ */
+const PID_PATTERN = /^\d{1,10}$/;
+
+function parseOwnedPid(contents: string): number | null {
+  const trimmed = contents.trim();
+  // `Number.parseInt` accepts "4242garbage"; a pidfile is exactly a number.
+  if (!PID_PATTERN.test(trimmed)) return null;
+  const pid = Number(trimmed);
+  // 0 signals the whole process group and 1 is init: neither is ever ours.
+  return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
+}
+
+/**
+ * SIGTERM the pidfile's process, but only after proving it belongs to us.
+ *
+ * Returns silently when the pid is absent, unparseable, or owned by anything
+ * other than this install — killing a stranger's process is far worse than
+ * leaving a dead pidfile behind, and the supervisor stop above has already done
+ * the orderly shutdown in every normal case.
+ */
+async function terminateOwnedProcess(
+  connection: RemoteConnection,
+  layout: RemoteInstallLayout,
+): Promise<void> {
+  const pidResult = await connection.exec(["cat", "--", layout.pidFile]);
+  if (pidResult.exitCode !== 0) return;
+  const pid = parseOwnedPid(pidResult.stdout);
+  if (pid === null) return;
+
+  // Resolve the executable behind the pid. A non-zero exit means the process is
+  // gone or unreadable; either way we have not established ownership.
+  const exe = await connection.exec(["readlink", "--", `/proc/${pid}/exe`]);
+  if (exe.exitCode !== 0) return;
+  const executablePath = exe.stdout.trim();
+  // A deleted binary shows as "<path> (deleted)"; compare only the path.
+  const resolved = executablePath.replace(/ \(deleted\)$/, "");
+  if (!isPathInsideInstallRoot(layout, resolved)) return;
+
+  await connection.exec(["kill", "-TERM", String(pid)]);
+}
+
+/**
  * Remove a remote install completely.
  *
  * Every command names the exact unit and the exact path. There is deliberately
@@ -397,12 +658,6 @@ export async function uninstallRemoteServer(input: {
     // forever.
     await connection.exec(argv);
   }
-  // Stop whatever the pidfile names, and only that. An unparseable or foreign
-  // pid is skipped rather than guessed at.
-  const pidResult = await connection.exec(["cat", "--", layout.pidFile]);
-  const pid = Number.parseInt(pidResult.stdout.trim(), 10);
-  if (pidResult.exitCode === 0 && Number.isInteger(pid) && pid > 1) {
-    await connection.exec(["kill", "-TERM", String(pid)]);
-  }
+  await terminateOwnedProcess(connection, layout);
   await expectRemoteSuccess(connection, ["rm", "-rf", "--", layout.root]);
 }

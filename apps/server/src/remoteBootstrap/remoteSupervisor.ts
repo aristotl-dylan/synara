@@ -138,6 +138,19 @@ function escapeSystemdValue(value: string): string {
   return value.replaceAll("%", "%%");
 }
 
+/**
+ * Render one `Environment=` assignment.
+ *
+ * systemd splits an unquoted Environment= directive on whitespace, so a value
+ * containing a space silently becomes a TRUNCATED variable plus a second
+ * assignment — an install root like `/home/deploy/My Synara/remote` would hand
+ * the server a credential path of `/home/deploy/My`. Quoting the value keeps it
+ * one token; PIDFile and WorkingDirectory have the same hazard.
+ */
+function systemdEnvironmentAssignment(name: string, value: string): string {
+  return `${name}=${escapeSystemdValue(quotePosixShellArgument(value))}`;
+}
+
 export function renderSystemdUnit(input: SupervisorInput): string {
   const releaseId = normalizeReleaseId(input.releaseId);
   const argv = serverArgv(input);
@@ -152,16 +165,16 @@ export function renderSystemdUnit(input: SupervisorInput): string {
     "",
     "[Service]",
     "Type=simple",
-    `WorkingDirectory=${escapeSystemdValue(input.layout.root)}`,
-    `Environment=SYNARA_AUTH_TOKEN_FILE=${escapeSystemdValue(input.layout.credentialFile)}`,
-    `Environment=SYNARA_HOME=${escapeSystemdValue(input.layout.stateDirectory)}`,
+    `WorkingDirectory=${escapeSystemdValue(quotePosixShellArgument(input.layout.root))}`,
+    `Environment=${systemdEnvironmentAssignment("SYNARA_AUTH_TOKEN_FILE", input.layout.credentialFile)}`,
+    `Environment=${systemdEnvironmentAssignment("SYNARA_HOME", input.layout.stateDirectory)}`,
     `ExecStart=${execStart}`,
     // A crashed server restarts; a server we deliberately stopped for an
     // upgrade stays stopped, which is what makes drain-then-upgrade a decision
     // the user gets to make rather than a race with the supervisor.
     "Restart=on-failure",
     "RestartSec=2",
-    `PIDFile=${escapeSystemdValue(input.layout.pidFile)}`,
+    `PIDFile=${escapeSystemdValue(quotePosixShellArgument(input.layout.pidFile))}`,
     "KillMode=mixed",
     // Long turns must survive a stop request long enough to drain.
     "TimeoutStopSec=120",
