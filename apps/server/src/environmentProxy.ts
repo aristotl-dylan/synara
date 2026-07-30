@@ -408,7 +408,12 @@ function relayDirection(options: RelayOptions): void {
     }
     for (const frame of frames) {
       const result = queue.enqueue({
-        priority: frame.isControl ? "control" : "data",
+        // Only `expedited` (Ping/Pong) jumps the queue. A Close is `terminal`
+        // and rides in the data lane: the peer stops processing the moment it
+        // sees one, so a Close that overtook queued data would silently discard
+        // it — on every slow-client disconnect, which is exactly when the queue
+        // is deep. `isControl` deliberately does NOT decide this.
+        priority: frame.relayIntent === "expedited" ? "control" : "data",
         payload: frame.bytes,
         byteLength: frame.bytes.byteLength,
       });

@@ -170,6 +170,16 @@ async function startLocalProxy(input: {
 
 const cookieNameOf = (setCookie: string) => setCookie.split("=")[0];
 
+/** Frames the way a CLIENT sends them: masked, as RFC 6455 §5.1 requires. */
+function clientFrame(opcode: number, payload: Buffer): Buffer {
+  const mask = Buffer.from([0xa1, 0xb2, 0xc3, 0xd4]);
+  const masked = Buffer.from(payload);
+  for (let index = 0; index < masked.byteLength; index += 1) {
+    masked[index] = masked[index]! ^ mask[index % 4]!;
+  }
+  return Buffer.concat([Buffer.from([0x80 | opcode, 0x80 | payload.byteLength]), mask, masked]);
+}
+
 const denyAll: EnvironmentProxyAuthorizer = async () => ({
   allowed: false,
   status: 401,
@@ -748,20 +758,26 @@ describe("environment proxy — flow control and head-of-line blocking", () => {
     };
   }
 
-  /** Frames the way a server sends them: unmasked, FIN set. */
-  function serverFrame(opcode: number, payload: Buffer): Buffer {
+  /**
+   * Frames the way a server sends them: unmasked, FIN set unless told otherwise.
+   *
+   * `fin: false` builds a fragment of a multi-frame MESSAGE, which is a
+   * different code path from a frame split across TCP chunks.
+   */
+  function serverFrame(opcode: number, payload: Buffer, options: { fin?: boolean } = {}): Buffer {
+    const first = (options.fin === false ? 0x00 : 0x80) | opcode;
     if (payload.byteLength < 126) {
-      return Buffer.concat([Buffer.from([0x80 | opcode, payload.byteLength]), payload]);
+      return Buffer.concat([Buffer.from([first, payload.byteLength]), payload]);
     }
     if (payload.byteLength <= 0xffff) {
       const header = Buffer.alloc(4);
-      header[0] = 0x80 | opcode;
+      header[0] = first;
       header[1] = 126;
       header.writeUInt16BE(payload.byteLength, 2);
       return Buffer.concat([header, payload]);
     }
     const header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
+    header[0] = first;
     header[1] = 127;
     header.writeBigUInt64BE(BigInt(payload.byteLength), 2);
     return Buffer.concat([header, payload]);
@@ -775,7 +791,15 @@ describe("environment proxy — flow control and head-of-line blocking", () => {
    * Drives `proxyEnvironmentWebSocket` directly with two controllable duplexes,
    * standing in for the browser socket and the tunnel socket.
    */
-  function makeControlledProxy(queueOptions?: { maxBytes?: number; maxFrames?: number }) {
+  function makeControlledProxy(
+    queueOptions?: { maxBytes?: number; maxFrames?: number },
+    /**
+     * Node's upgrade `head`: bytes it already read past the request headers.
+     * Defaults to empty, which is the common case — pass a value to exercise
+     * the replay path a fast client's first frames actually take.
+     */
+    head: Buffer = Buffer.alloc(0),
+  ) {
     const registry = makeEnvironmentProxyRegistry();
     registry.register({
       environmentId: EnvironmentId.makeUnsafe("host-a"),
@@ -796,12 +820,137 @@ describe("environment proxy — flow control and head-of-line blocking", () => {
       },
       request,
       client.socket,
-      Buffer.alloc(0),
+      head,
     );
     // Complete the handshake so the upstream direction starts framing.
     upstream.deliver(HANDSHAKE_101);
     return { upstream, client, proxyErrors };
   }
+
+  it("replays the bytes Node already read past the upgrade headers", async () => {
+    // Node hands the upgrade handler a `head` containing whatever it read past
+    // the request headers. A fast client's FIRST frames live there — it can
+    // send them in the same TCP segment as the handshake — so discarding it
+    // silently loses the opening of the session, which then looks like a
+    // client bug. Every other test here passes an empty head, so this replay
+    // path was previously never exercised at all.
+    const first = clientFrame(0x1, Buffer.from("from-the-head"));
+    const { upstream, client } = makeControlledProxy(undefined, first);
+    await delay(5);
+
+    // The upgrade request itself goes first, then the replayed head bytes.
+    const afterHandshake = Buffer.concat(upstream.written).subarray(
+      Buffer.concat(upstream.written).indexOf("\r\n\r\n") + 4,
+    );
+    expect(afterHandshake.byteLength, "the head bytes must reach the upstream").toBe(
+      first.byteLength,
+    );
+    // Byte for byte, mask included: the proxy must not unmask or re-frame them.
+    expect(afterHandshake).toEqual(first);
+
+    // ...and the socket is still live afterwards, so replaying the head did not
+    // desynchronise the splitter for what follows.
+    const second = clientFrame(0x1, Buffer.from("live"));
+    client.deliver(second);
+    await delay(5);
+    const all = Buffer.concat(upstream.written);
+    expect(all.subarray(all.indexOf("\r\n\r\n") + 4)).toEqual(Buffer.concat([first, second]));
+  });
+
+  it("does NOT let a Close frame overtake queued data", async () => {
+    // Close is terminal: once the browser sees it, it completes the closing
+    // handshake and stops processing. A Close that jumps ahead of queued data
+    // therefore DISCARDS that data silently — on every slow-client disconnect,
+    // which is exactly when a stall made the queue deep in the first place.
+    //
+    // Ping/Pong may reorder (a heartbeat is idempotent and time-critical).
+    // A terminal frame may not. That is the distinction under test.
+    const { upstream, client } = makeControlledProxy({ maxBytes: 32 * 1024 * 1024 });
+    await delay(5);
+    client.written.length = 0;
+    client.stall();
+
+    upstream.deliver(serverFrame(0x2, Buffer.alloc(500_000, 1)));
+    upstream.deliver(serverFrame(0x2, Buffer.alloc(500_000, 2)));
+    upstream.deliver(serverFrame(0x8, Buffer.from([0x03, 0xe8]))); // Close, 1000
+    await delay(5);
+    client.release();
+    await delay(20);
+
+    const opcodes = client.written.map((chunk) => chunk[0]! & 0x0f);
+    const closeIndex = opcodes.indexOf(0x8);
+    const dataIndexes = opcodes.flatMap((opcode, index) => (opcode === 0x2 ? [index] : []));
+    expect(closeIndex, "the Close must be delivered").toBeGreaterThanOrEqual(0);
+    expect(dataIndexes, "both data frames must be delivered").toHaveLength(2);
+    // Every data frame that arrived BEFORE the Close must be written before it.
+    for (const dataIndex of dataIndexes) {
+      expect(dataIndex, "data queued before a Close must not be dropped behind it").toBeLessThan(
+        closeIndex,
+      );
+    }
+  });
+
+  it("still lets a Ping and a Pong overtake queued data", async () => {
+    // The other half of the same rule. Narrowing the priority to exclude Close
+    // must not accidentally demote the heartbeat frames the optimisation exists
+    // for — that would reintroduce the reconnect churn.
+    for (const controlOpcode of [0x9, 0xa]) {
+      const { upstream, client } = makeControlledProxy({ maxBytes: 32 * 1024 * 1024 });
+      await delay(5);
+      client.written.length = 0;
+      client.stall();
+
+      upstream.deliver(serverFrame(0x2, Buffer.alloc(500_000, 1)));
+      upstream.deliver(serverFrame(0x2, Buffer.alloc(500_000, 2)));
+      upstream.deliver(serverFrame(controlOpcode, Buffer.from("beat")));
+      await delay(5);
+      client.release();
+      await delay(20);
+
+      const opcodes = client.written.map((chunk) => chunk[0]! & 0x0f);
+      const controlIndex = opcodes.indexOf(controlOpcode);
+      const dataIndexes = opcodes.flatMap((opcode, index) => (opcode === 0x2 ? [index] : []));
+      expect(controlIndex, `opcode ${controlOpcode} must be delivered`).toBeGreaterThanOrEqual(0);
+      expect(dataIndexes, `opcode ${controlOpcode}`).toHaveLength(2);
+      // The first write always escapes before backpressure is observable, so
+      // the property is that it overtakes what is still QUEUED.
+      expect(controlIndex, `opcode ${controlOpcode} must overtake queued data`).toBeLessThan(
+        dataIndexes[1]!,
+      );
+    }
+  });
+
+  it("does not let a Close jump ahead of the fragments of a message already queued", async () => {
+    // The worst shape of finding A: a fragmented message is split across
+    // frames, so a Close that overtakes them delivers a message the browser can
+    // never reassemble — it sees a start with no end and then a terminal frame.
+    const { upstream, client } = makeControlledProxy({ maxBytes: 32 * 1024 * 1024 });
+    await delay(5);
+    client.written.length = 0;
+    client.stall();
+
+    // FIN=0 text, FIN=0 continuation, FIN=1 continuation: one logical message.
+    upstream.deliver(serverFrame(0x1, Buffer.alloc(400_000, 1), { fin: false }));
+    upstream.deliver(serverFrame(0x0, Buffer.alloc(400_000, 2), { fin: false }));
+    upstream.deliver(serverFrame(0x0, Buffer.alloc(400_000, 3)));
+    upstream.deliver(serverFrame(0x8, Buffer.from([0x03, 0xe8])));
+    await delay(5);
+    client.release();
+    await delay(20);
+
+    const opcodes = client.written.map((chunk) => chunk[0]! & 0x0f);
+    const closeIndex = opcodes.indexOf(0x8);
+    const fragmentIndexes = opcodes.flatMap((opcode, index) =>
+      opcode === 0x1 || opcode === 0x0 ? [index] : [],
+    );
+    expect(fragmentIndexes, "all three fragments must be delivered").toHaveLength(3);
+    expect(closeIndex).toBeGreaterThanOrEqual(0);
+    expect(Math.max(...fragmentIndexes), "the whole message must precede the Close").toBeLessThan(
+      closeIndex,
+    );
+    // ...and in order: a reassembler cannot recover from reordered fragments.
+    expect(fragmentIndexes).toEqual(fragmentIndexes.toSorted((a, b) => a - b));
+  });
 
   it("delivers a Pong ahead of a queued multi-megabyte snapshot", async () => {
     // The symptom this prevents: a 15-byte Pong queued behind a multi-MB
@@ -874,7 +1023,14 @@ describe("environment proxy — flow control and head-of-line blocking", () => {
       closeFrame,
       `a Close frame must be sent; saw opcodes ${client.written.map((c) => c[0]! & 0x0f).join(",")}`,
     ).toBeDefined();
-    expect(closeFrame!.readUInt16BE(2)).toBe(WS_CLOSE_PROXY_RESYNC_REQUIRED);
+    // The NUMERIC LITERAL, deliberately — do NOT "helpfully" refactor this back
+    // to WS_CLOSE_PROXY_RESYNC_REQUIRED. Production computes the wire value
+    // from that same constant, so importing it here makes the assertion
+    // vacuous: changing 4002 to any other private-range value would leave this
+    // test green while every deployed client stopped recognising the signal.
+    // The literal is the contract; a deliberate change must update both.
+    expect(closeFrame!.readUInt16BE(2)).toBe(4002);
+    expect(WS_CLOSE_PROXY_RESYNC_REQUIRED, "the constant must still be the wire value").toBe(4002);
   });
 
   it("stops retaining bytes once it overflows, rather than growing without limit", async () => {
@@ -979,7 +1135,11 @@ describe("environment proxy — tunnel teardown and reattach", () => {
     // The tunnel dies, not the remote server.
     sockets[0]?.terminate();
     const { code } = await closed;
-    expect(code).toBe(WS_CLOSE_PROXY_TUNNEL_LOST);
+    // Numeric literal on purpose — see the note on the 4002 assertion above.
+    // Asserting against the imported constant would pass for ANY value, and
+    // this code is a wire contract with already-deployed clients.
+    expect(code).toBe(4003);
+    expect(WS_CLOSE_PROXY_TUNNEL_LOST, "the constant must still be the wire value").toBe(4003);
   });
 
   it("leaves the remote session untouched and allows a clean reattach", async () => {

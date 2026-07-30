@@ -23,15 +23,54 @@
 
 /** Opcodes 0x8-0xF are control frames (RFC 6455 §5.5). */
 const CONTROL_OPCODE_FLOOR = 0x8;
+/**
+ * Close (RFC 6455 §5.5.1). Numerically equal to CONTROL_OPCODE_FLOOR, but that
+ * is a coincidence of the opcode table, not a relationship: one is "the lowest
+ * control opcode", the other is "the terminal frame". Named separately so
+ * neither can be edited on the assumption it moves the other.
+ */
+const CLOSE_OPCODE = 0x8;
 const LENGTH_16BIT_MARKER = 126;
 const LENGTH_64BIT_MARKER = 127;
 const MAX_CONTROL_PAYLOAD_BYTES = 125;
+
+/**
+ * What a relay is allowed to DO with a frame, which is not the same question as
+ * what the frame IS.
+ *
+ * These three exist as named intents rather than an `isControl` boolean because
+ * that boolean conflated two frames with opposite scheduling requirements:
+ *
+ *  - `expedited` — Ping and Pong. Idempotent and time-critical: a heartbeat
+ *    stuck behind a multi-megabyte snapshot misses the peer's deadline and a
+ *    healthy connection churns through a reconnect. Safe to reorder ahead of
+ *    data precisely because losing ordering costs nothing.
+ *  - `terminal` — Close. Once the peer sees it, it completes the closing
+ *    handshake and stops processing, so ANY data still queued behind it is
+ *    silently discarded. Must keep FIFO with respect to data.
+ *  - `ordered` — everything else. The protocol's own ordering; never touched.
+ *
+ * `isControl` remains for the RFC payload cap, which genuinely means "is this
+ * a control frame" — but it is deliberately no longer what scheduling reads.
+ */
+export type WsFrameRelayIntent = "expedited" | "terminal" | "ordered";
 
 export interface SplitWsFrame {
   /** The complete frame, header and payload, byte-identical to the input. */
   readonly bytes: Uint8Array;
   readonly opcode: number;
+  /** RFC 6455 control frame (opcode >= 0x8). Governs the payload cap, NOT priority. */
   readonly isControl: boolean;
+  /**
+   * How a relay may schedule this frame. Read this, never `isControl`, when
+   * deciding queue priority — see the type's own comment for why.
+   */
+  readonly relayIntent: WsFrameRelayIntent;
+}
+
+function relayIntentOf(opcode: number, isControl: boolean): WsFrameRelayIntent {
+  if (!isControl) return "ordered";
+  return opcode === CLOSE_OPCODE ? "terminal" : "expedited";
 }
 
 export class WsFrameSplitError extends Error {
@@ -139,7 +178,7 @@ export class WsFrameSplitter {
     // copying one regardless of the subclass.
     const bytes = copyOf(buffer, 0, totalLength);
     this.#buffer = copyOf(buffer, totalLength, buffer.byteLength);
-    return { bytes, opcode, isControl };
+    return { bytes, opcode, isControl, relayIntent: relayIntentOf(opcode, isControl) };
   }
 }
 
