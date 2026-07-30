@@ -27,6 +27,20 @@ const remoteSubscribeThread = vi.fn(async () => undefined);
 const localGetSnapshot = vi.fn(async () => ({ threads: [] }));
 
 /**
+ * Non-routed members that live on a group the router DOES wrap, mirroring the
+ * real contract: `terminal.onEvent` sits beside 7 routed terminal methods, and
+ * `git.status` beside the single routed `git.handoffThread`.
+ *
+ * They exist so a test can prove the wrapper carries a group's other members
+ * across untouched. `terminal.onEvent` in particular is the subscription every
+ * terminal's output depends on.
+ */
+const NON_ROUTED_SIBLINGS: Readonly<Record<string, readonly string[]>> = {
+  terminal: ["onEvent"],
+  git: ["status", "onActionProgress"],
+};
+
+/**
  * A fake NativeApi covering every group the router touches.
  *
  * Built from `ROUTED_METHODS` so that a method added to the routing table is
@@ -42,6 +56,9 @@ function makeApi(
     const groupApi: Record<string, unknown> = {};
     for (const method of methods as readonly string[]) {
       groupApi[method] = vi.fn(async () => ({}));
+    }
+    for (const sibling of NON_ROUTED_SIBLINGS[group] ?? []) {
+      groupApi[sibling] = vi.fn(() => vi.fn());
     }
     api[group] = groupApi;
   }
@@ -366,6 +383,59 @@ describe("project-scoped commands", () => {
 
     expect(localDispatch).toHaveBeenCalledTimes(1);
     expect(remoteDispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe("non-routed members of a routed group", () => {
+  /**
+   * The wrapper rebuilds each routed group from a spread. Anything it fails to
+   * carry across becomes `undefined` on the returned API.
+   *
+   * `terminal` is the sharp case: 7 of its 8 methods are wrapped, and the 8th,
+   * `onEvent`, is the subscription every terminal's output depends on. Drop it
+   * and a terminal opens, accepts input, and shows nothing — plausible-looking
+   * and very hard to trace back to routing. Until now this was covered only
+   * incidentally by the app working, which is the coverage that disappears the
+   * moment someone refactors the wrapper.
+   */
+  it("carries them across with identity preserved", () => {
+    const api = createEnvironmentRoutedApi(localClient.api as never);
+    const routed = api as unknown as Record<string, Record<string, unknown>>;
+    const original = localClient.api as Record<string, Record<string, unknown>>;
+
+    for (const [group, siblings] of Object.entries(NON_ROUTED_SIBLINGS)) {
+      for (const sibling of siblings) {
+        // Identity, not just presence: a re-wrapped listener would still be a
+        // function while silently no longer being the registry's own.
+        expect(routed[group]?.[sibling]).toBe(original[group]?.[sibling]);
+      }
+    }
+  });
+
+  it("keeps a subscription live, returning a working unsubscribe", () => {
+    // The nastier variant of the same failure: a subscription that appears to
+    // register but hands back a dead unsubscribe leaks listeners and never
+    // reports an error.
+    const api = createEnvironmentRoutedApi(localClient.api as never);
+    const listener = vi.fn();
+
+    const unsubscribe = api.terminal.onEvent(listener);
+
+    expect(spyFor(localClient, "terminal", "onEvent")).toHaveBeenCalledTimes(1);
+    expect(spyFor(localClient, "terminal", "onEvent")).toHaveBeenCalledWith(listener);
+    expect(typeof unsubscribe).toBe("function");
+  });
+
+  it("still routes the wrapped methods on that same group", () => {
+    // Guards the reverse mistake: "preserve the siblings" must not become
+    // "preserve the whole group" and quietly un-route terminal.write.
+    registeredClients.set(REMOTE_ENVIRONMENT_ID, remoteClient);
+    storeState.environmentIdByThreadId = { [REMOTE_THREAD_ID]: REMOTE_ENVIRONMENT_ID };
+    const api = createEnvironmentRoutedApi(localClient.api as never);
+
+    expect(api.terminal.write).not.toBe(
+      (localClient.api as Record<string, Record<string, unknown>>).terminal?.write,
+    );
   });
 });
 
