@@ -121,6 +121,32 @@ describe("parseEnvironmentProxyTarget", () => {
       expect(expectRejected(target).reason, target).toBe("encoded-separator");
     }
   });
+
+  it("refuses percent-encoded dots and double-encoding in the path", () => {
+    // Each of these decodes to a traversal the LITERAL `..` check cannot see:
+    // `new URL()` normalizes `/env/a/%2e%2e/admin` to `/admin`, so an upstream
+    // with a normalizing router serves a different path than the proxy
+    // classified and logged. Table-driven so the spellings are the assertion.
+    for (const [target, reason] of [
+      ["/env/e1/%2e%2e/admin", "encoded-dot"],
+      ["/env/e1/%2E%2E/admin", "encoded-dot"],
+      ["/env/e1/.%2e/admin", "encoded-dot"],
+      ["/env/e1/%2e./admin", "encoded-dot"],
+      ["/env/e1/a/%2e", "encoded-dot"],
+      ["/env/e1/%252f/admin", "double-encoded"],
+      ["/env/e1/%252e%252e/admin", "double-encoded"],
+    ] as const) {
+      expect(expectRejected(target).reason, target).toBe(reason);
+    }
+  });
+
+  it("still forwards percent-encoding in the QUERY, where it changes no segment", () => {
+    // The refusal is about the segment structure the upstream router walks. A
+    // query value legitimately carries encoded dots and percent signs, and
+    // rejecting those would break real requests without closing anything.
+    expect(expectOk("/env/e1/a?path=%2e%2e").upstreamTarget).toBe("/a?path=%2e%2e");
+    expect(expectOk("/env/e1/a?raw=100%25").upstreamTarget).toBe("/a?raw=100%25");
+  });
 });
 
 describe("isEnvironmentProxyRequestTarget", () => {

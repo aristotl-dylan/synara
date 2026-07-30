@@ -137,6 +137,64 @@ describe("WebSocket frame splitting for the environment proxy", () => {
     expect(() => splitter().push(oversized)).toThrow(WsFrameSplitError);
   });
 
+  it("emits frames that own their memory rather than viewing the source chunk", () => {
+    // `Buffer.prototype.slice` is `subarray`, NOT a copy. A 5-byte frame carved
+    // out of a 64 KiB socket read would report byteLength 5 while retaining the
+    // whole 65536-byte ArrayBuffer — so the bounded queue's accounting says N
+    // bytes while true retention is thousands of times larger, and the memory
+    // ceiling that exists to bound the proxy can be overshot before it fires.
+    const built = frame({ opcode: 0x1, payload: text("small") });
+    const chunk = Buffer.alloc(64 * 1024);
+    built.forEach((byte, index) => (chunk[index] = byte));
+
+    // The FAST path: nothing retained beforehand, so `concat` takes its
+    // empty-left shortcut and `#takeOne` slices straight out of the input.
+    const fast = splitter();
+    const [fastFrame] = fast.push(chunk.subarray(0, built.byteLength));
+    expect(fastFrame!.bytes.buffer.byteLength).toBe(fastFrame!.bytes.byteLength);
+
+    // The SLOW path: a retained tail forces a real concat first. It already
+    // copied, which is exactly why no existing test caught the fast path.
+    const slow = splitter();
+    slow.push(chunk.subarray(0, 1));
+    const [slowFrame] = slow.push(chunk.subarray(1, built.byteLength));
+    expect(slowFrame!.bytes.buffer.byteLength).toBe(slowFrame!.bytes.byteLength);
+  });
+
+  it("leaves already-emitted frames unchanged when the source chunk is overwritten", () => {
+    // The consequence of aliasing that a byte-for-byte proxy cannot survive:
+    // Node reuses socket read buffers, so a frame that views one changes bytes
+    // after it was handed to the queue.
+    const built = frame({ opcode: 0x1, payload: text("hello") });
+    for (const label of ["fast", "slow"] as const) {
+      const chunk = Buffer.from(built);
+      const instance = splitter();
+      const frames =
+        label === "fast"
+          ? instance.push(chunk)
+          : (instance.push(chunk.subarray(0, 2)), instance.push(chunk.subarray(2)));
+      expect(frames, label).toHaveLength(1);
+      const emitted = frames[0]!.bytes;
+      const before = Uint8Array.prototype.slice.call(emitted);
+      chunk.fill(0xff);
+      expect(emitted, label).toEqual(before);
+    }
+  });
+
+  it("retains a partial tail that does not view the source chunk either", () => {
+    // The retained tail is held across pushes, so a view over the socket's read
+    // buffer both mutates under us and pins that buffer for as long as the
+    // frame is incomplete — the exact leak the frame ceiling exists to bound.
+    const built = frame({ opcode: 0x1, payload: text("incomplete payload") });
+    const chunk = Buffer.alloc(64 * 1024);
+    built.forEach((byte, index) => (chunk[index] = byte));
+    const instance = splitter();
+    instance.push(chunk.subarray(0, built.byteLength - 1));
+    chunk.fill(0xff);
+    const [completed] = instance.push(built.slice(built.byteLength - 1));
+    expect(completed!.bytes).toEqual(built);
+  });
+
   it("retains a partial frame rather than emitting it early", () => {
     const built = frame({ opcode: 0x1, payload: text("incomplete payload") });
     const instance = splitter();

@@ -128,15 +128,31 @@ export class WsFrameSplitter {
     }
     if (buffer.byteLength < totalLength) return undefined;
 
-    // `slice` copies, so the returned frame does not alias the retained tail.
-    const bytes = buffer.slice(0, totalLength);
-    this.#buffer = buffer.slice(totalLength);
+    // COPY, explicitly. `buffer.slice` is NOT enough: Node's Buffer overrides
+    // `slice` with `subarray` semantics, so on a Buffer input it returns a view
+    // that keeps the whole underlying ArrayBuffer alive and mutates when the
+    // source chunk does. A 5-byte frame carved out of a 64 KiB socket read
+    // would then report 5 bytes to the bounded queue while retaining 65536,
+    // letting true memory use overshoot the ceiling by orders of magnitude
+    // before it ever fires — and the emitted frame's bytes would still change
+    // if the source buffer were reused. `Uint8Array.prototype.slice` is the
+    // copying one regardless of the subclass.
+    const bytes = copyOf(buffer, 0, totalLength);
+    this.#buffer = copyOf(buffer, totalLength, buffer.byteLength);
     return { bytes, opcode, isControl };
   }
 }
 
+/** A real copy, even when `input` is a Node Buffer (whose `slice` aliases). */
+function copyOf(input: Uint8Array, start: number, end: number): Uint8Array {
+  return Uint8Array.prototype.slice.call(input, start, end);
+}
+
 function concat(left: Uint8Array, right: Uint8Array): Uint8Array {
-  if (left.byteLength === 0) return right.slice();
+  // Same reason as `copyOf` above: `right.slice()` on a Buffer returns a view
+  // over the socket's read buffer, and the retained tail must never alias
+  // memory the caller may reuse.
+  if (left.byteLength === 0) return copyOf(right, 0, right.byteLength);
   if (right.byteLength === 0) return left;
   const out = new Uint8Array(left.byteLength + right.byteLength);
   out.set(left, 0);

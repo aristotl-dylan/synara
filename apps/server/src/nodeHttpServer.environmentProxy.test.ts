@@ -13,6 +13,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { makeEnvironmentProxyDispatch } from "./environmentProxy";
+import type { EnvironmentProxyAuthorizer } from "./environmentProxyAuthorization";
 import { makeEnvironmentProxyRegistry } from "./environmentProxyTargets";
 import { makeBoundedNodeHttpServer } from "./nodeHttpServer";
 
@@ -29,6 +30,7 @@ afterEach(async () => {
 async function startServerWithProxy(input: {
   readonly upstreamPort: number;
   readonly environmentId: string;
+  readonly authorize?: EnvironmentProxyAuthorizer;
 }) {
   const registry = makeEnvironmentProxyRegistry();
   registry.register({
@@ -37,7 +39,10 @@ async function startServerWithProxy(input: {
     port: input.upstreamPort,
     credential: "provisioned",
   });
-  const environmentProxy = makeEnvironmentProxyDispatch({ registry });
+  const environmentProxy = makeEnvironmentProxyDispatch({
+    registry,
+    ...(input.authorize ? { authorize: input.authorize } : {}),
+  });
   const scope = await Effect.runPromise(Scope.make("sequential"));
   let nodeServer: http.Server | null = null;
   const localTargets: string[] = [];
@@ -124,6 +129,42 @@ describe("makeBoundedNodeHttpServer installs the environment proxy", () => {
     expect(local.body).toBe("local-router");
     expect(server.localTargets).toContain("/local/settings");
     expect(upstreamTargets).toEqual(["/api/threads"]);
+  });
+
+  it("runs the authorization gate through the real server construction path", async () => {
+    // The gate is only real if the SERVER installs it. A proxy that authorizes
+    // correctly in isolation but is wired up without an authorizer is the exact
+    // bug this whole file exists to catch, one layer up.
+    let upstreamConnections = 0;
+    const upstream = http.createServer((_request, response) => {
+      response.writeHead(200);
+      response.end("from-remote");
+    });
+    upstream.on("connection", () => {
+      upstreamConnections += 1;
+    });
+    const upstreamPort = await new Promise<number>((resolve) =>
+      upstream.listen(0, "127.0.0.1", () => resolve((upstream.address() as AddressInfo).port)),
+    );
+    teardown.push(
+      () =>
+        new Promise<void>((resolve) => {
+          upstream.closeAllConnections?.();
+          upstream.close(() => resolve());
+        }),
+    );
+
+    const server = await startServerWithProxy({
+      upstreamPort,
+      environmentId: "remote-1",
+      authorize: async () => ({ allowed: false, status: 401, message: "Unauthorized" }),
+    });
+
+    const denied = await get(server.port, "/env/remote-1/api/threads");
+    expect(denied.status).toBe(401);
+    // No upstream contact, and no fallthrough to the local router either.
+    expect(upstreamConnections).toBe(0);
+    expect(server.localTargets).toHaveLength(0);
   });
 
   it("serves every path locally when no proxy is installed", async () => {

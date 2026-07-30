@@ -33,7 +33,9 @@ export type EnvironmentProxyPathRejectionReason =
   | "environment-id-too-long"
   | "environment-id-charset"
   | "traversal-segment"
-  | "encoded-separator";
+  | "encoded-separator"
+  | "encoded-dot"
+  | "double-encoded";
 
 export interface EnvironmentProxyPathRejection {
   readonly ok: false;
@@ -57,6 +59,26 @@ const ENVIRONMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
  * keeps our classification and the upstream's parse in agreement.
  */
 const ENCODED_SEPARATOR_PATTERN = /%(?:2f|5c|00)/i;
+
+/**
+ * A percent-encoded dot, anywhere in the path.
+ *
+ * `%2e%2e` decodes to `..`, so the literal-`..` check below sees a segment it
+ * considers ordinary while `new URL()` — and any upstream router that
+ * normalizes — sees a traversal. That disagreement is the bug: the proxy would
+ * classify and LOG one path and deliver another. `%2e` has no legitimate use
+ * in a path segment (a dot needs no escaping), so it is refused outright rather
+ * than decoded and re-checked, which would only move the disagreement.
+ */
+const ENCODED_DOT_PATTERN = /%2e/i;
+
+/**
+ * A percent-encoded percent sign: `%252f` reaches an upstream that decodes
+ * twice as `/`. We cannot know how many decoding passes the far side performs,
+ * and a path that means different things at different depths is exactly what
+ * this parser refuses to forward.
+ */
+const DOUBLE_ENCODED_PATTERN = /%25/i;
 
 function isDotOnly(segment: string): boolean {
   return segment.length > 0 && /^\.+$/.test(segment);
@@ -119,6 +141,15 @@ export function parseEnvironmentProxyTarget(
   }
   if (ENCODED_SEPARATOR_PATTERN.test(afterPrefix) || ENCODED_SEPARATOR_PATTERN.test(suffix)) {
     return { ok: false, reason: "encoded-separator" };
+  }
+  // Path only, deliberately. A query VALUE may legitimately carry `%2e` or a
+  // literal `%` (as `%25`) — a file path parameter does — and none of it
+  // changes the segment structure the upstream router walks. Segments do.
+  if (ENCODED_DOT_PATTERN.test(afterPrefix)) {
+    return { ok: false, reason: "encoded-dot" };
+  }
+  if (DOUBLE_ENCODED_PATTERN.test(afterPrefix)) {
+    return { ok: false, reason: "double-encoded" };
   }
 
   const upstreamPath = rest.length === 0 ? "/" : `/${rest.join("/")}`;

@@ -24,7 +24,10 @@ import {
   makeEnvironmentProxyDispatch,
   MAX_WEBSOCKET_MESSAGE_BYTES_FOR_PROXY,
   proxyEnvironmentWebSocket,
+  serializeUpgradeRequest,
+  UpgradeRequestSerializationError,
 } from "./environmentProxy";
+import type { EnvironmentProxyAuthorizer } from "./environmentProxyAuthorization";
 import { makeEnvironmentProxyRegistry } from "./environmentProxyTargets";
 import { MAX_WEBSOCKET_MESSAGE_BYTES } from "./nodeHttpServer";
 
@@ -80,10 +83,13 @@ async function startFakeRemote(
   } = {},
 ) {
   const seenAuthorization: Array<string | undefined> = [];
+  const seenCookies: Array<string | undefined> = [];
   const seenTargets: string[] = [];
+  let connectionCount = 0;
   const server = http.createServer((request, response) => {
     seenTargets.push(request.url ?? "");
     seenAuthorization.push(request.headers.authorization);
+    seenCookies.push(request.headers.cookie);
     if (options.onRequest) {
       options.onRequest(request, response);
       return;
@@ -101,11 +107,26 @@ async function startFakeRemote(
   wss.on("connection", (socket, request) => {
     seenTargets.push(request.url ?? "");
     seenAuthorization.push(request.headers.authorization);
+    seenCookies.push(request.headers.cookie);
     options.onConnection?.(socket, request);
+  });
+  // Counted at the TCP layer, not the HTTP one: "the upstream was never
+  // contacted" must mean no socket was opened, not merely that no request was
+  // parsed.
+  server.on("connection", () => {
+    connectionCount += 1;
   });
   const port = await listen(server);
   track(server);
-  return { server, wss, port, seenTargets, seenAuthorization };
+  return {
+    server,
+    wss,
+    port,
+    seenTargets,
+    seenAuthorization,
+    seenCookies,
+    connections: () => connectionCount,
+  };
 }
 
 /** The local server: nothing but the proxy dispatch wired the way production wires it. */
@@ -113,11 +134,17 @@ async function startLocalProxy(input: {
   readonly registry: ReturnType<typeof makeEnvironmentProxyRegistry>;
   readonly queueOptions?: { maxBytes?: number; maxFrames?: number };
   readonly localResponseBody?: string;
+  readonly authorize?: EnvironmentProxyAuthorizer;
+  readonly upstreamTimeoutMs?: number;
 }) {
   const proxyErrors: string[] = [];
   const dispatch = makeEnvironmentProxyDispatch({
     registry: input.registry,
     ...(input.queueOptions ? { queueOptions: input.queueOptions } : {}),
+    ...(input.authorize ? { authorize: input.authorize } : {}),
+    ...(input.upstreamTimeoutMs !== undefined
+      ? { upstreamTimeoutMs: input.upstreamTimeoutMs }
+      : {}),
     onError: (message) => proxyErrors.push(message),
   });
   const localRequests: string[] = [];
@@ -140,6 +167,14 @@ async function startLocalProxy(input: {
   track(server);
   return { server, port, localRequests, localUpgrades, dispatch, proxyErrors };
 }
+
+const cookieNameOf = (setCookie: string) => setCookie.split("=")[0];
+
+const denyAll: EnvironmentProxyAuthorizer = async () => ({
+  allowed: false,
+  status: 401,
+  message: "Unauthorized",
+});
 
 function registryWith(id: string, port: number) {
   const registry = makeEnvironmentProxyRegistry();
@@ -282,6 +317,72 @@ describe("environment proxy — routing and isolation", () => {
     expect(cookies[0]).toContain("HttpOnly");
   });
 
+  it("never forwards the browser's LOCAL session cookie to a remote environment", async () => {
+    // The local session cookie is issued with Path=/, so the browser attaches
+    // it to every /env/<id>/* request. Relaying it hands the LOCAL session
+    // token — the credential that authenticates against THIS machine — to every
+    // remote environment operator.
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({ registry: registryWith("host-a", remote.port) });
+    await fetchText(local.port, "/env/host-a/api/threads", {
+      cookie: "synara_session=local-session-secret; env~host-a~synara_session=remote-token",
+    });
+    expect(remote.seenCookies).toHaveLength(1);
+    expect(remote.seenCookies[0] ?? "").not.toContain("local-session-secret");
+    // The environment's OWN cookie still crosses, under the name its server set.
+    expect(remote.seenCookies[0]).toBe("synara_session=remote-token");
+  });
+
+  it("never forwards the LOCAL session cookie on the WebSocket upgrade either", async () => {
+    // The upgrade path builds its request by hand, so it is a second, entirely
+    // separate opportunity to leak the same credential.
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({ registry: registryWith("host-a", remote.port) });
+    const client = openProxiedSocket(local.port, "/env/host-a/ws", {
+      headers: {
+        cookie: "synara_session=local-session-secret; env~host-a~synara_session=remote-token",
+      },
+    });
+    await waitForOpen(client);
+    expect(remote.seenCookies).toHaveLength(1);
+    expect(remote.seenCookies[0] ?? "").not.toContain("local-session-secret");
+    expect(remote.seenCookies[0]).toBe("synara_session=remote-token");
+  });
+
+  it("does not send one environment's cookies to another", async () => {
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({ registry: registryWith("host-a", remote.port) });
+    await fetchText(local.port, "/env/host-a/api/threads", {
+      cookie: "env~host-b~synara_session=other-environments-token",
+    });
+    expect(remote.seenCookies[0]).toBeUndefined();
+  });
+
+  it("namespaces an upstream Set-Cookie so two environments cannot collide in one jar", async () => {
+    // Both remotes call their cookie `synara_session`, and one origin serves
+    // both. Without a rename the second response overwrites the first token.
+    const remoteA = await startFakeRemote();
+    const remoteB = await startFakeRemote();
+    const registry = registryWith("host-a", remoteA.port);
+    registry.register({
+      environmentId: EnvironmentId.makeUnsafe("host-b"),
+      host: "127.0.0.1",
+      port: remoteB.port,
+      credential: "provisioned-host-b",
+    });
+    const local = await startLocalProxy({ registry });
+
+    const fromA = (await fetchText(local.port, "/env/host-a/api/auth/bootstrap")).headers[
+      "set-cookie"
+    ]!;
+    const fromB = (await fetchText(local.port, "/env/host-b/api/auth/bootstrap")).headers[
+      "set-cookie"
+    ]!;
+    expect(cookieNameOf(fromA[0]!)).not.toBe(cookieNameOf(fromB[0]!));
+    expect(fromA[0]).toContain("Path=/env/host-a");
+    expect(fromB[0]).toContain("Path=/env/host-b");
+  });
+
   it("answers 502 rather than hanging when the tunnel is down", async () => {
     const remote = await startFakeRemote();
     const registry = registryWith("host-a", remote.port);
@@ -289,6 +390,226 @@ describe("environment proxy — routing and isolation", () => {
     await new Promise<void>((resolve) => remote.server.close(() => resolve()));
     const response = await fetchText(local.port, "/env/host-a/api/threads");
     expect(response.status).toBe(502);
+  });
+
+  it("gives up on an upstream that accepts the request and never answers", async () => {
+    // Distinct from "tunnel down": the connection succeeds, so nothing errors —
+    // the client just waits forever. Over a WAN tunnel these accumulate until
+    // the socket budget is gone, and each one also pins a browser connection.
+    const remote = await startFakeRemote({
+      // Accepted, parsed, and then deliberately never answered.
+      onRequest: () => {},
+    });
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      upstreamTimeoutMs: 150,
+    });
+    const started = Date.now();
+    const response = await fetchText(local.port, "/env/host-a/api/threads");
+    expect(response.status).toBe(504);
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it("does not cut off a slow but healthy streaming response", async () => {
+    // The bound is time-to-first-byte, not a cap on how long a response may
+    // take. A remote turn that streams for minutes must not be severed.
+    const remote = await startFakeRemote({
+      onRequest: (_request, response) => {
+        response.writeHead(200, { "Content-Type": "text/plain" });
+        response.write("first");
+        setTimeout(() => response.end("-last"), 300);
+      },
+    });
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      upstreamTimeoutMs: 150,
+    });
+    const response = await fetchText(local.port, "/env/host-a/api/stream");
+    expect(response.status).toBe(200);
+    expect(response.body).toBe("first-last");
+  });
+});
+
+describe("environment proxy — local authorization", () => {
+  // Diverting to the proxy skips the Effect router, and with it the auth every
+  // local route runs — while the proxy goes on to attach the environment's
+  // provisioned credential. Without a gate here an unauthenticated local caller
+  // is UPGRADED into a fully authenticated remote one.
+
+  it("rejects an unauthenticated HTTP request before contacting any upstream", async () => {
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      authorize: denyAll,
+    });
+    const response = await fetchText(local.port, "/env/host-a/api/threads");
+    expect(response.status).toBe(401);
+    // Not one TCP connection, let alone a request: a denial must cost the
+    // remote host nothing and must not confirm that the environment exists.
+    expect(remote.connections()).toBe(0);
+    expect(remote.seenTargets).toHaveLength(0);
+  });
+
+  it("rejects an unauthenticated WebSocket upgrade before contacting any upstream", async () => {
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      authorize: denyAll,
+    });
+    const client = openProxiedSocket(local.port, "/env/host-a/ws");
+    await expect(waitForOpen(client)).rejects.toThrow();
+    expect(remote.connections()).toBe(0);
+    expect(remote.seenTargets).toHaveLength(0);
+  });
+
+  it("asks the authorizer for the request's own target and headers, on both paths", async () => {
+    // The gate can only be policy-driven if it sees what the caller sent. A
+    // wrapper that authorized some other request would pass every test above
+    // and still be wrong.
+    const seen: Array<{ url: string | undefined; kind: string; origin?: string }> = [];
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      authorize: async ({ request, kind }) => {
+        seen.push({
+          url: request.url,
+          kind,
+          ...(request.headers.origin ? { origin: String(request.headers.origin) } : {}),
+        });
+        return { allowed: true };
+      },
+    });
+    await fetchText(local.port, "/env/host-a/api/threads", { origin: "https://evil.example" });
+    const client = openProxiedSocket(local.port, "/env/host-a/ws");
+    await waitForOpen(client);
+
+    expect(seen).toEqual([
+      { url: "/env/host-a/api/threads", kind: "http", origin: "https://evil.example" },
+      { url: "/env/host-a/ws", kind: "upgrade" },
+    ]);
+  });
+
+  it("fails closed when the authorizer itself throws", async () => {
+    // A session store that is down must deny, not pass. An authorizer that
+    // rejects is an unanswered question, and the answer is never "yes".
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      authorize: async () => {
+        throw new Error("session store unavailable");
+      },
+    });
+    const response = await fetchText(local.port, "/env/host-a/api/threads");
+    expect(response.status).toBe(500);
+    expect(remote.connections()).toBe(0);
+  });
+
+  it("never lets a denied request fall through to the LOCAL router either", async () => {
+    // The other failure shape: refusing to proxy but then serving the path
+    // locally, so `/env/<id>/...` returns the local SPA instead of a refusal.
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      authorize: denyAll,
+    });
+    const response = await fetchText(local.port, "/env/host-a/api/threads");
+    expect(response.status).toBe(401);
+    expect(response.body).not.toContain("local-server");
+    expect(local.localRequests).toHaveLength(0);
+    // Nor did it quietly succeed against the remote, which is the shape the
+    // status assertion alone would not distinguish from a local answer.
+    expect(remote.seenTargets).toHaveLength(0);
+  });
+
+  it("still authorizes a target no environment is registered for", async () => {
+    // Authorization runs BEFORE the registry lookup, so an unauthenticated
+    // caller cannot use the 404-vs-401 difference to enumerate environment ids.
+    const remote = await startFakeRemote();
+    const local = await startLocalProxy({
+      registry: registryWith("host-a", remote.port),
+      authorize: denyAll,
+    });
+    const registered = await fetchText(local.port, "/env/host-a/api/threads");
+    const unregistered = await fetchText(local.port, "/env/does-not-exist/api/threads");
+    expect(unregistered.status).toBe(registered.status);
+  });
+});
+
+describe("environment proxy — upgrade request serialization", () => {
+  const upstream = {
+    host: "127.0.0.1",
+    port: 41_000,
+    credential: "cred",
+    environmentId: EnvironmentId.makeUnsafe("host-a"),
+  };
+
+  it("throws on CR, LF or NUL in a header value, a header name, or the target", () => {
+    // The request is built by CONCATENATION, so these characters are not data —
+    // they are structure. One \r\n in a value appends whatever follows as its
+    // OWN header, including a second Authorization ahead of the proxy's real
+    // one. Node's parser happens to reject these spellings first today, but
+    // this function is exported and must hold on its own.
+    for (const injection of ["\r\n", "\r", "\n", "\0"]) {
+      expect(() =>
+        serializeUpgradeRequest({
+          method: "GET",
+          target: "/ws",
+          headers: { "x-thing": `value${injection}authorization: Bearer attacker` },
+          upstream,
+        }),
+      ).toThrow(UpgradeRequestSerializationError);
+
+      expect(() =>
+        serializeUpgradeRequest({
+          method: "GET",
+          target: `/ws${injection}authorization: Bearer attacker`,
+          headers: {},
+          upstream,
+        }),
+      ).toThrow(UpgradeRequestSerializationError);
+
+      expect(() =>
+        serializeUpgradeRequest({
+          method: `GET${injection}`,
+          target: "/ws",
+          headers: {},
+          upstream,
+        }),
+      ).toThrow(UpgradeRequestSerializationError);
+
+      expect(() =>
+        serializeUpgradeRequest({
+          method: "GET",
+          target: "/ws",
+          headers: { [`x-name${injection}injected`]: "v" },
+          upstream,
+        }),
+      ).toThrow(UpgradeRequestSerializationError);
+
+      // Array-valued headers take a different code path to the wire.
+      expect(() =>
+        serializeUpgradeRequest({
+          method: "GET",
+          target: "/ws",
+          headers: { "x-multi": ["ok", `bad${injection}authorization: Bearer attacker`] },
+          upstream,
+        }),
+      ).toThrow(UpgradeRequestSerializationError);
+    }
+  });
+
+  it("still serializes an ordinary upgrade unchanged", () => {
+    // The guard must reject injection, not legitimate traffic.
+    const serialized = serializeUpgradeRequest({
+      method: "GET",
+      target: "/ws?token=abc",
+      headers: { "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==" },
+      upstream,
+    });
+    expect(serialized.startsWith("GET /ws?token=abc HTTP/1.1\r\n")).toBe(true);
+    expect(serialized).toContain("sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==");
+    expect(serialized).toContain("authorization: Bearer cred");
+    expect(serialized.endsWith("\r\n\r\n")).toBe(true);
   });
 });
 

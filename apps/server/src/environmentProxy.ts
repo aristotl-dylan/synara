@@ -44,6 +44,7 @@ import { makeWsFrameSplitter, WsFrameSplitError } from "@synara/shared/wsFrameSp
 
 import { isEnvironmentProxyRequestTarget } from "@synara/shared/environmentProxyPath";
 
+import type { EnvironmentProxyAuthorizer } from "./environmentProxyAuthorization";
 import {
   resolveEnvironmentProxyUpstream,
   type EnvironmentProxyRegistry,
@@ -72,13 +73,33 @@ const UPSTREAM_AUTHORIZATION_HEADER = "authorization";
 export const MAX_WEBSOCKET_MESSAGE_BYTES_FOR_PROXY = 2 * 1024 * 1024;
 const MAX_PROXIED_FRAME_BYTES = MAX_WEBSOCKET_MESSAGE_BYTES_FOR_PROXY + 1024;
 
+/**
+ * How long a proxied HTTP request may wait for the upstream to begin
+ * responding.
+ *
+ * Unbounded waiting is the failure mode of a WAN tunnel: a remote host that
+ * stops answering without closing leaves every request hanging, and each one
+ * pins a browser connection and a tunnel socket until something else gives out.
+ * Generous enough for a slow remote turn to start streaming; the timer covers
+ * time-to-first-byte, not the length of the response.
+ */
+export const ENVIRONMENT_PROXY_UPSTREAM_TIMEOUT_MS = 30_000;
+
 export interface EnvironmentProxyDeps {
   readonly registry: EnvironmentProxyRegistry;
+  /**
+   * Local authorization gate. Runs BEFORE any upstream is resolved or
+   * contacted, so an unauthenticated caller cannot even prove an environment
+   * exists. Optional only so tests can exercise transport behaviour in
+   * isolation; production always passes one (see effectServer.ts).
+   */
+  readonly authorize?: EnvironmentProxyAuthorizer;
   /** Test seam: opens the TCP connection to the upstream. */
   readonly connect?: (options: { host: string; port: number }) => Duplex;
   /** Test seam: issues the upstream HTTP request. */
   readonly request?: typeof Http.request;
   readonly queueOptions?: ProxyFrameQueueOptions;
+  readonly upstreamTimeoutMs?: number;
   readonly onError?: (message: string, cause: unknown) => void;
 }
 
@@ -121,12 +142,15 @@ export function proxyEnvironmentHttpRequest(
       method: request.method ?? "GET",
       path: target,
       headers: {
-        ...forwardableRequestHeaders(request.headers),
+        ...forwardableRequestHeaders(request.headers, upstream.environmentId),
         host: `${upstream.host}:${upstream.port}`,
         [UPSTREAM_AUTHORIZATION_HEADER]: `Bearer ${upstream.credential}`,
       },
     },
     (upstreamResponse) => {
+      // The response has begun; the rest is the upstream's own streaming pace,
+      // which a time-to-first-byte bound must not cut short.
+      upstreamRequest.setTimeout(0);
       response.writeHead(
         upstreamResponse.statusCode ?? 502,
         forwardableResponseHeaders(upstreamResponse.headers, upstream.environmentId),
@@ -134,16 +158,67 @@ export function proxyEnvironmentHttpRequest(
       upstreamResponse.pipe(response);
     },
   );
+  // An upstream that accepts the connection and then never answers must not
+  // hold a browser connection open forever; over a WAN tunnel those accumulate
+  // until the socket budget is gone.
+  let timedOut = false;
+  upstreamRequest.setTimeout(
+    deps.upstreamTimeoutMs ?? ENVIRONMENT_PROXY_UPSTREAM_TIMEOUT_MS,
+    () => {
+      timedOut = true;
+      deps.onError?.(
+        "environment proxy HTTP request timed out",
+        new Error(`environment ${upstream.environmentId}`),
+      );
+      upstreamRequest.destroy(new Error("Environment did not respond in time."));
+    },
+  );
   upstreamRequest.on("error", (error) => {
     deps.onError?.("environment proxy HTTP request failed", error);
-    if (!response.headersSent) respondPlain(response, 502, "Environment unreachable");
-    else response.destroy();
+    // 504 for "answered nothing in time", 502 for "could not be reached at
+    // all". They are different operational problems and the distinction is
+    // about the tunnel, not about the caller, so it is safe to report.
+    if (!response.headersSent) {
+      if (timedOut) respondPlain(response, 504, "Environment did not respond");
+      else respondPlain(response, 502, "Environment unreachable");
+    } else response.destroy();
   });
   // A client that disappears mid-request must not leave the upstream request
   // open: the tunnel has a finite number of sockets and this is the leak that
   // exhausts it.
   request.on("aborted", () => upstreamRequest.destroy());
   request.pipe(upstreamRequest);
+}
+
+export class UpgradeRequestSerializationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UpgradeRequestSerializationError";
+  }
+}
+
+/**
+ * Characters that terminate a line or a string in the HTTP wire format.
+ *
+ * This function builds a request by CONCATENATION, so any of these inside a
+ * name, value, method or target does not escape — it is structure. One `\r\n`
+ * in a header value appends whatever follows as ITS OWN header, including a
+ * second `Authorization` ahead of the proxy's real one.
+ */
+const HTTP_STRUCTURAL_CHARACTERS = ["\r", "\n", "\0"];
+
+function assertNoStructuralCharacters(label: string, value: string): void {
+  if (HTTP_STRUCTURAL_CHARACTERS.some((character) => value.includes(character))) {
+    // THROW rather than strip. Sanitizing would forward a request that is not
+    // the one the caller described, and the difference between those two is
+    // precisely what an injection attempt is trying to create. Today Node's
+    // own parser rejects these spellings before they reach here, but that is
+    // an incidental guard belonging to another layer — this function is
+    // exported and must hold on its own.
+    throw new UpgradeRequestSerializationError(
+      `Refusing to serialize an upgrade request: ${label} contains a CR, LF or NUL.`,
+    );
+  }
 }
 
 /**
@@ -156,23 +231,34 @@ export function proxyEnvironmentHttpRequest(
  * back the same way. That — not any code here — is what makes permessage-deflate
  * negotiate end to end: the proxy has no opinion about it and cannot get it
  * wrong.
+ *
+ * Hand-built means hand-validated: throws rather than emit a request whose
+ * structure differs from the one described (see
+ * `assertNoStructuralCharacters`).
  */
 export function serializeUpgradeRequest(input: {
   readonly method: string;
   readonly target: string;
   readonly headers: Readonly<Record<string, string | string[] | undefined>>;
-  readonly upstream: Pick<EnvironmentProxyUpstream, "host" | "port" | "credential">;
+  readonly upstream: Pick<
+    EnvironmentProxyUpstream,
+    "host" | "port" | "credential" | "environmentId"
+  >;
 }): string {
   const headers = {
-    ...forwardableRequestHeaders(input.headers),
+    ...forwardableRequestHeaders(input.headers, input.upstream.environmentId),
     host: `${input.upstream.host}:${input.upstream.port}`,
     connection: "Upgrade",
     upgrade: "websocket",
     [UPSTREAM_AUTHORIZATION_HEADER]: `Bearer ${input.upstream.credential}`,
   };
+  assertNoStructuralCharacters("the method", input.method);
+  assertNoStructuralCharacters("the request target", input.target);
   const lines = [`${input.method} ${input.target} HTTP/1.1`];
   for (const [name, value] of Object.entries(headers)) {
+    assertNoStructuralCharacters(`header name '${name}'`, name);
     for (const single of Array.isArray(value) ? value : [value]) {
+      assertNoStructuralCharacters(`the value of header '${name}'`, String(single));
       lines.push(`${name}: ${single}`);
     }
   }
@@ -367,6 +453,22 @@ export function proxyEnvironmentWebSocket(
     return;
   }
   const { upstream, target } = resolution;
+  // Serialize BEFORE connecting. A request we cannot render faithfully is not
+  // one to forward approximately, and refusing here costs the upstream not even
+  // a TCP connection.
+  let upgradeRequest: string;
+  try {
+    upgradeRequest = serializeUpgradeRequest({
+      method: request.method ?? "GET",
+      target,
+      headers: request.headers,
+      upstream,
+    });
+  } catch (error) {
+    deps.onError?.("environment proxy refused a malformed upgrade request", error);
+    clientSocket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    return;
+  }
   const open = deps.connect ?? ((options) => Net.connect(options));
   const upstreamSocket = open({ host: upstream.host, port: upstream.port });
 
@@ -397,14 +499,7 @@ export function proxyEnvironmentWebSocket(
     if (!upstreamSocket.destroyed) upstreamSocket.destroy();
   });
 
-  upstreamSocket.write(
-    serializeUpgradeRequest({
-      method: request.method ?? "GET",
-      target,
-      headers: request.headers,
-      upstream,
-    }),
-  );
+  upstreamSocket.write(upgradeRequest);
 
   const onOverflow = () => {
     deps.onError?.(
@@ -469,24 +564,89 @@ export interface EnvironmentProxyDispatch {
   readonly wrapUpgradeHandler: (next: NodeUpgradeHandler) => NodeUpgradeHandler;
 }
 
+const UPGRADE_REASON_PHRASES: Readonly<Record<number, string>> = {
+  400: "Bad Request",
+  401: "Unauthorized",
+  403: "Forbidden",
+  500: "Internal Server Error",
+};
+
 export function makeEnvironmentProxyDispatch(deps: EnvironmentProxyDeps): EnvironmentProxyDispatch {
   const handlesTarget = (requestTarget: string | undefined): boolean =>
     typeof requestTarget === "string" && isEnvironmentProxyRequestTarget(requestTarget);
+
+  /**
+   * Runs the LOCAL authorization gate before anything else happens.
+   *
+   * Diverting to the proxy skips the Effect router, and with it the auth and
+   * trusted-origin checks every local route runs — while the proxy goes on to
+   * attach the environment's provisioned credential. Without this call an
+   * unauthenticated local caller is upgraded into an authenticated remote one.
+   * It runs before the registry is consulted, so a denial reveals nothing about
+   * which environments exist and reaches no upstream.
+   *
+   * Fail closed on a rejected promise: an authorizer that throws denies.
+   */
+  const authorized = async (
+    request: Http.IncomingMessage,
+    kind: "http" | "upgrade",
+  ): Promise<
+    { readonly allowed: true } | { readonly status: number; readonly message: string }
+  > => {
+    if (!deps.authorize) return { allowed: true };
+    try {
+      const decision = await deps.authorize({ request, kind });
+      return decision.allowed
+        ? { allowed: true }
+        : { status: decision.status, message: decision.message };
+    } catch (error) {
+      deps.onError?.("environment proxy authorization failed", error);
+      return { status: 500, message: "Internal Server Error" };
+    }
+  };
+
   return {
     handlesTarget,
     wrapRequestHandler: (next) => (request, response) => {
-      if (handlesTarget(request.url)) {
-        proxyEnvironmentHttpRequest(deps, request, response);
+      if (!handlesTarget(request.url)) {
+        next(request, response);
         return;
       }
-      next(request, response);
+      void authorized(request, "http").then((decision) => {
+        // Authorization is async, so the client may have gone away in the
+        // meantime. Writing to a destroyed response throws, and there is
+        // nothing left to proxy for either.
+        if (response.destroyed || response.writableEnded) return;
+        if ("allowed" in decision) {
+          proxyEnvironmentHttpRequest(deps, request, response);
+          return;
+        }
+        respondPlain(response, decision.status, decision.message);
+      });
     },
     wrapUpgradeHandler: (next) => (request, socket, head) => {
-      if (handlesTarget(request.url)) {
-        proxyEnvironmentWebSocket(deps, request, socket, head);
+      if (!handlesTarget(request.url)) {
+        next(request, socket, head);
         return;
       }
-      next(request, socket, head);
+      // Pause first: bytes the client sends while authorization is in flight
+      // must not be lost, and must not be relayed if it is denied. The relay
+      // resumes the socket when it attaches its own `data` listener.
+      socket.pause();
+      void authorized(request, "upgrade").then((decision) => {
+        if (socket.destroyed) return;
+        if ("allowed" in decision) {
+          socket.resume();
+          proxyEnvironmentWebSocket(deps, request, socket, head);
+          return;
+        }
+        // A fixed reason phrase, not the message: an upgrade has no body to
+        // carry a detail, and the message may contain characters a status line
+        // cannot (it is a sentence, not a token).
+        socket.end(
+          `HTTP/1.1 ${decision.status} ${UPGRADE_REASON_PHRASES[decision.status] ?? "Error"}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+        );
+      });
     },
   };
 }
