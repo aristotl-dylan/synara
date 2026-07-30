@@ -1,0 +1,454 @@
+// FILE: remoteCommand.ts
+// Purpose: The single audited construction path for every command Synara runs on
+//          a remote host over ssh(1). Argv-style throughout; exactly one quoting
+//          function; every rejection decided here rather than in a UI.
+// Layer: Shared runtime (server + tests)
+// Exports: posixShellQuote, buildRemoteScript, buildLauncherArgv, buildSshArgv,
+//          validateRemoteHostConfig, remoteCommandSignature, sshControlPathFor
+
+import * as Crypto from "node:crypto";
+
+import type {
+  RemoteCommandTarget,
+  RemoteHostConfig,
+  RemoteLauncher,
+  RemoteShellInit,
+} from "@synara/contracts";
+
+// ── Quoting ──────────────────────────────────────────────────────────────────
+
+/**
+ * The ONE quoting function. Every string that reaches a remote shell — a path, an
+ * argument, an environment value, the whole project script as it is handed to a
+ * launcher — passes through here and nothing else.
+ *
+ * POSIX single quotes are the only quoting form with no escape processing at all:
+ * inside `'...'` every byte is literal, including backslashes, newlines, `$`,
+ * backticks and UTF-8 sequences. The only character that cannot appear is `'`
+ * itself, which we close, escape, and reopen around.
+ *
+ * The empty string must still produce a word (`''`), otherwise it would vanish
+ * from the command line and shift every argument after it.
+ */
+export function posixShellQuote(value: string): string {
+  if (value.length === 0) return "''";
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** Joins an argv into one shell-safe command line. Used for ssh's remote command. */
+export function posixShellJoin(argv: readonly string[]): string {
+  return argv.map(posixShellQuote).join(" ");
+}
+
+// ── Rejections ───────────────────────────────────────────────────────────────
+
+export class RemoteHostConfigError extends Error {
+  readonly field: string;
+  constructor(field: string, message: string) {
+    super(message);
+    this.name = "RemoteHostConfigError";
+    this.field = field;
+  }
+}
+
+/**
+ * Wrappers that detach the process they launch. If a session command is wrapped
+ * in one of these, ssh's stdout closes while the agent keeps running unattached:
+ * the turn never produces output and never ends — it hangs, and no timeout can
+ * tell it apart from a slow model.
+ *
+ * Refused HERE, at the decider, not in the UI: a config that would hang must be
+ * impossible to persist, so it cannot be written by an older client, restored
+ * from a backup, or hand-edited into the state file and then reappear.
+ */
+export const DETACHING_LAUNCHER_COMMANDS: ReadonlySet<string> = new Set([
+  "abduco",
+  "at",
+  "batch",
+  "byobu",
+  "daemonize",
+  "dtach",
+  "nohup",
+  "screen",
+  "setsid",
+  "start-stop-daemon",
+  "systemd-run",
+  "tmux",
+  "zellij",
+]);
+
+/** Flags that ask a wrapper to detach even when the wrapper itself is benign. */
+export const DETACHING_LAUNCHER_FLAGS: ReadonlySet<string> = new Set([
+  "-d",
+  "-D",
+  "--detach",
+  "--detach-keys",
+  "--daemon",
+  "--background",
+  "--fork",
+  "-bg",
+]);
+
+/**
+ * ssh options nobody may set through `sshArgs`.
+ *
+ * `sshArgs` are placed before our defaults so ssh's first-value-wins rule lets a
+ * user genuinely override a timeout or a cipher. That ordering is a usability
+ * affordance, and it is exactly why this list has to exist: without it, "before
+ * ours" would also mean "can turn off host-key verification".
+ *
+ * Keys are compared lower-cased because ssh option names are case-insensitive.
+ */
+export const FORBIDDEN_SSH_OPTIONS: ReadonlySet<string> = new Set([
+  // Host-key verification can never be silently disabled.
+  "stricthostkeychecking",
+  "userknownhostsfile",
+  "globalknownhostsfile",
+  "checkhostip",
+  "nohostauthenticationforlocalhost",
+  // BatchMode=no re-enables password/passphrase prompts, which hang forever on a
+  // non-interactive stdin instead of failing.
+  "batchmode",
+  // A pty turns the protocol stream into a terminal session (echo, CR/LF
+  // translation, signal characters) and silently corrupts it.
+  "requesttty",
+  // Multiplexing is ours; letting config point it elsewhere both breaks reuse and
+  // lets a socket path be chosen in a directory another user can write.
+  "controlmaster",
+  "controlpath",
+  "controlpersist",
+  // Runs an arbitrary command on THIS machine every time we connect.
+  "permitlocalcommand",
+  "localcommand",
+  // Include is evaluated where it appears. Placed before our options it would win
+  // first-value-wins, which is a complete bypass of every entry above.
+  "include",
+]);
+
+/** ssh flags refused for the same reasons as the options above. */
+export const FORBIDDEN_SSH_FLAGS: ReadonlySet<string> = new Set([
+  "-t", // force pty
+  "-tt",
+  "-f", // background before command execution
+  "-N", // no remote command
+  "-n", // redirect stdin from /dev/null — we need stdin for the protocol
+  "-g",
+  "-M", // master mode; multiplexing is ours
+  "-S", // control socket path
+  "-W",
+  "-w",
+  "-L",
+  "-R",
+  "-D",
+]);
+
+function parseSshOptionKey(token: string, next: string | undefined): string | undefined {
+  const raw = token === "-o" ? next : token.startsWith("-o") ? token.slice(2) : undefined;
+  if (raw === undefined) return undefined;
+  // ssh accepts both `Key=value` and `Key value` inside a single -o argument.
+  const trimmed = raw.trimStart();
+  const separator = trimmed.search(/[=\s]/);
+  const key = separator === -1 ? trimmed : trimmed.slice(0, separator);
+  return key.toLowerCase();
+}
+
+function assertNoLeadingDash(field: string, value: string, what: string): void {
+  if (value.startsWith("-")) {
+    throw new RemoteHostConfigError(field, `${what} may not start with "-".`);
+  }
+}
+
+/**
+ * Validates every user-supplied ssh argument. Returns the arguments unchanged so
+ * callers cannot accidentally use the unvalidated list.
+ */
+export function validateSshArgs(args: readonly string[]): readonly string[] {
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index] as string;
+    if (token.includes("\u0000")) {
+      throw new RemoteHostConfigError("sshArgs", "ssh arguments may not contain NUL bytes.");
+    }
+    if (FORBIDDEN_SSH_FLAGS.has(token)) {
+      throw new RemoteHostConfigError(
+        "sshArgs",
+        `The ssh flag "${token}" is not allowed: it would break the session stream or Synara's connection reuse.`,
+      );
+    }
+    const optionKey = parseSshOptionKey(token, args[index + 1]);
+    if (optionKey !== undefined && FORBIDDEN_SSH_OPTIONS.has(optionKey)) {
+      throw new RemoteHostConfigError(
+        "sshArgs",
+        `The ssh option "${optionKey}" is managed by Synara and cannot be overridden. Host-key verification in particular can never be turned off.`,
+      );
+    }
+  }
+  return args;
+}
+
+function validateLauncherCommand(field: string, command: string, args: readonly string[]): void {
+  assertNoLeadingDash(field, command, "A launcher command");
+  const basename = command.split(/[/\\]/).pop() ?? command;
+  if (DETACHING_LAUNCHER_COMMANDS.has(basename.toLowerCase())) {
+    throw new RemoteHostConfigError(
+      field,
+      `"${basename}" detaches the process it starts, so the session would produce no output and never finish. Run the agent in the foreground instead.`,
+    );
+  }
+  for (const arg of args) {
+    if (DETACHING_LAUNCHER_FLAGS.has(arg)) {
+      throw new RemoteHostConfigError(
+        field,
+        `The launcher flag "${arg}" detaches the process, which would hang the session.`,
+      );
+    }
+  }
+}
+
+export function validateLauncher(launcher: RemoteLauncher): RemoteLauncher {
+  switch (launcher.kind) {
+    case "direct":
+      break;
+    case "login-shell":
+      if (launcher.loginShell !== undefined) {
+        assertNoLeadingDash("launcher.loginShell", launcher.loginShell, "A login shell");
+      }
+      break;
+    case "container":
+      assertNoLeadingDash("launcher.container", launcher.container, "A container name");
+      // `-d`/`--detach` detaches exactly like tmux; `-t` allocates a pty that
+      // corrupts the protocol stream.
+      validateLauncherCommand("launcher.execArgs", launcher.runtime, launcher.execArgs);
+      for (const arg of launcher.execArgs) {
+        if (arg === "-t" || arg === "--tty" || arg === "-dt" || arg === "-td") {
+          throw new RemoteHostConfigError(
+            "launcher.execArgs",
+            `"${arg}" allocates a terminal, which corrupts the session stream.`,
+          );
+        }
+      }
+      break;
+    case "custom-wrapper":
+      validateLauncherCommand("launcher.command", launcher.command, launcher.args);
+      break;
+  }
+  return launcher;
+}
+
+/**
+ * Full config gate. Called both when a host is persisted and again when a command
+ * is built, so a config that slipped in by any other route still cannot run.
+ */
+export function validateRemoteHostConfig(config: RemoteHostConfig): RemoteHostConfig {
+  // ssh has no `--` end-of-options marker, so a destination beginning with `-`
+  // would be consumed as a local ssh flag.
+  assertNoLeadingDash("destination", config.destination, "An ssh destination");
+  if (/\s/.test(config.destination) || config.destination.includes("\u0000")) {
+    throw new RemoteHostConfigError(
+      "destination",
+      "An ssh destination may not contain whitespace or NUL bytes.",
+    );
+  }
+  if (config.sshBinary !== undefined) {
+    assertNoLeadingDash("sshBinary", config.sshBinary, "An ssh binary path");
+  }
+  if (config.binaryPath !== undefined) {
+    assertNoLeadingDash("binaryPath", config.binaryPath, "A remote binary path");
+  }
+  validateSshArgs(config.sshArgs);
+  validateLauncher(config.launcher);
+  return config;
+}
+
+// ── Remote script ────────────────────────────────────────────────────────────
+
+export interface RemoteScriptProbeMarkers {
+  /** Printed on stdout immediately before exec; stdout before it is shell noise. */
+  readonly begin: string;
+  readonly cwdMissing: string;
+  readonly binaryMissing: string;
+}
+
+export const PROBE_EXIT_CWD_MISSING = 91;
+export const PROBE_EXIT_BINARY_MISSING = 92;
+
+export interface BuildRemoteScriptInput {
+  readonly target: RemoteCommandTarget;
+  readonly shellInit?: RemoteShellInit | undefined;
+  readonly defaultBinary?: string | undefined;
+  /**
+   * When present the script becomes the probe: the SAME cd, the SAME shell-init,
+   * the SAME binary, with the turn's arguments replaced by the version check and
+   * classification markers added. A probe that passed therefore cannot have
+   * passed for a different command than the one that will run.
+   */
+  readonly probe?: RemoteScriptProbeMarkers | undefined;
+}
+
+export function resolveRemoteBinary(input: BuildRemoteScriptInput): string {
+  const binary = input.target.binary ?? input.defaultBinary;
+  if (binary === undefined || binary.length === 0) {
+    throw new RemoteHostConfigError("binary", "No remote binary is configured for this host.");
+  }
+  assertNoLeadingDash("binary", binary, "A remote binary path");
+  return binary;
+}
+
+export function buildRemoteScript(input: BuildRemoteScriptInput): string {
+  const binary = resolveRemoteBinary(input);
+  const lines: string[] = [];
+
+  for (const [name, value] of Object.entries(input.shellInit?.env ?? {})) {
+    // Names are constrained by ProcessEnvRecord's schema pattern; values are data
+    // and go through the quoting function like everything else.
+    lines.push(`export ${name}=${posixShellQuote(value)}`);
+  }
+  for (const file of input.shellInit?.sourceFiles ?? []) {
+    const quoted = posixShellQuote(file);
+    // A missing init file is normal (a host without nvm), so it must not abort the
+    // session; a readable file that fails is the user's own script erroring.
+    lines.push(`if [ -r ${quoted} ]; then . ${quoted}; fi`);
+  }
+
+  const cwd = posixShellQuote(input.target.cwd);
+  const quotedBinary = posixShellQuote(binary);
+
+  if (input.probe) {
+    lines.push(
+      `cd -- ${cwd} 2>/dev/null || { printf '%s\\n' ${posixShellQuote(input.probe.cwdMissing)} >&2; exit ${PROBE_EXIT_CWD_MISSING}; }`,
+    );
+    lines.push(
+      `command -v ${quotedBinary} >/dev/null 2>&1 || { printf '%s\\n' ${posixShellQuote(input.probe.binaryMissing)} >&2; exit ${PROBE_EXIT_BINARY_MISSING}; }`,
+    );
+    lines.push(`printf '%s\\n' ${posixShellQuote(input.probe.begin)}`);
+    lines.push(`exec ${quotedBinary} ${posixShellJoin(input.target.versionArgs)}`.trimEnd());
+    return lines.join("\n");
+  }
+
+  lines.push(`cd -- ${cwd}`);
+  lines.push(`exec ${quotedBinary} ${posixShellJoin(input.target.args)}`.trimEnd());
+  return lines.join("\n");
+}
+
+// ── Launcher ─────────────────────────────────────────────────────────────────
+
+/**
+ * Every launcher receives the project script as ONE argument. The script is never
+ * re-split, re-quoted or concatenated per launcher, so switching launcher changes
+ * only which process interprets the script — never what the script means.
+ */
+export function buildLauncherArgv(launcher: RemoteLauncher, script: string): readonly string[] {
+  validateLauncher(launcher);
+  switch (launcher.kind) {
+    case "direct":
+      return ["/bin/sh", "-c", script];
+    case "login-shell":
+      return [launcher.loginShell ?? "/bin/sh", "-lc", script];
+    case "container":
+      return [
+        launcher.runtime,
+        "exec",
+        "-i",
+        ...launcher.execArgs,
+        launcher.container,
+        "/bin/sh",
+        "-c",
+        script,
+      ];
+    case "custom-wrapper":
+      return [launcher.command, ...launcher.args, script];
+  }
+}
+
+// ── ssh argv ─────────────────────────────────────────────────────────────────
+
+export interface BuildSshArgvInput {
+  readonly config: RemoteHostConfig;
+  readonly remoteArgv: readonly string[];
+  /**
+   * Absolute directory for multiplexing sockets. Must be created 0700 by the
+   * caller: a control socket in a directory another local user can write lets
+   * that user ride our authenticated connection.
+   */
+  readonly controlDirectory?: string | undefined;
+  /** Deadline for the whole ssh invocation, used by the probe. */
+  readonly connectTimeoutSecondsOverride?: number | undefined;
+}
+
+export interface SshInvocation {
+  readonly command: string;
+  readonly args: readonly string[];
+}
+
+/**
+ * A control socket path is derived, never taken from config: it must be stable
+ * per host, unpredictable to other local users, and short enough for the ~104
+ * byte sockaddr_un limit that `%h/%p/%r` templates routinely blow past.
+ */
+export function sshControlPathFor(controlDirectory: string, config: RemoteHostConfig): string {
+  const digest = Crypto.createHash("sha256")
+    .update(`${config.hostId} ${config.destination}`)
+    .digest("hex")
+    .slice(0, 16);
+  return `${controlDirectory.replace(/\/+$/, "")}/s-${digest}`;
+}
+
+export function buildSshArgv(input: BuildSshArgvInput): SshInvocation {
+  const config = validateRemoteHostConfig(input.config);
+  const connectTimeout = input.connectTimeoutSecondsOverride ?? config.connectTimeoutSeconds;
+
+  const args: string[] = [
+    // USER ARGS FIRST. ssh takes the first value it sees for an option, so this
+    // position is what makes an override real. Everything that must not be
+    // overridable was already refused by validateSshArgs.
+    ...validateSshArgs(config.sshArgs),
+    // No prompts: stdin carries the protocol, so a password or passphrase prompt
+    // would block forever. BatchMode turns that hang into an immediate error.
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    `StrictHostKeyChecking=${config.hostKeyVerification === "strict" ? "yes" : "accept-new"}`,
+    "-o",
+    `ConnectTimeout=${connectTimeout}`,
+    // Without keepalives a dead TCP connection never returns: the read just never
+    // completes. These turn an invisible hang into a reported failure.
+    "-o",
+    `ServerAliveInterval=${config.keepalive.intervalSeconds}`,
+    "-o",
+    `ServerAliveCountMax=${config.keepalive.countMax}`,
+    "-o",
+    "RequestTTY=no",
+    "-o",
+    "ExitOnForwardFailure=yes",
+  ];
+
+  if (config.connectionReuse.enabled && input.controlDirectory !== undefined) {
+    // Connection reuse is ours, not the user's ssh config: N concurrent sessions
+    // to one host share one handshake by default instead of paying a full SSH
+    // handshake (TCP + KEX + auth, often > 1s over WAN) per thread.
+    args.push(
+      "-o",
+      "ControlMaster=auto",
+      "-o",
+      `ControlPath=${sshControlPathFor(input.controlDirectory, config)}`,
+      "-o",
+      `ControlPersist=${config.connectionReuse.persistSeconds}`,
+    );
+  }
+
+  args.push(config.destination, ...input.remoteArgv.map(posixShellQuote));
+
+  return { command: config.sshBinary ?? "ssh", args };
+}
+
+// ── Signature ────────────────────────────────────────────────────────────────
+
+/**
+ * Identity of a rendered command. A probe result is only ever reused for an
+ * identical signature, so editing a field that changes the command — the
+ * destination, an ssh arg, the launcher, the cwd, the binary, shell-init —
+ * discards a stale "ready" instead of vouching for a command that will never run.
+ */
+export function remoteCommandSignature(invocation: SshInvocation): string {
+  const payload = [invocation.command, ...invocation.args].join(" ");
+  return Crypto.createHash("sha256").update(payload).digest("hex");
+}
