@@ -155,6 +155,29 @@ export function proxyEnvironmentHttpRequest(
         upstreamResponse.statusCode ?? 502,
         forwardableResponseHeaders(upstreamResponse.headers, upstream.environmentId),
       );
+      // `pipe` does NOT forward source errors to the destination, and the
+      // status line is already spent, so 502 is no longer available. A tunnel
+      // that dies mid-body must therefore truncate the client's response
+      // rather than leave it waiting: a graceful FIN short of the declared
+      // Content-Length raises nothing on `upstreamRequest` at all, so without
+      // this the browser hangs until it gives up on its own.
+      const truncate = (message: string, cause: unknown) => {
+        deps.onError?.(message, cause);
+        // destroy(), not end(): ending would look like a COMPLETE body of the
+        // wrong length, and the browser would treat a truncated response as
+        // the whole thing.
+        if (!response.destroyed) response.destroy();
+        if (!upstreamResponse.destroyed) upstreamResponse.destroy();
+      };
+      upstreamResponse.on("error", (error) =>
+        truncate("environment proxy upstream response failed", error),
+      );
+      upstreamResponse.on("aborted", () =>
+        truncate(
+          "environment proxy upstream response aborted",
+          new Error(`environment ${upstream.environmentId}`),
+        ),
+      );
       upstreamResponse.pipe(response);
     },
   );
@@ -183,10 +206,26 @@ export function proxyEnvironmentHttpRequest(
       else respondPlain(response, 502, "Environment unreachable");
     } else response.destroy();
   });
-  // A client that disappears mid-request must not leave the upstream request
-  // open: the tunnel has a finite number of sockets and this is the leak that
-  // exhausts it.
+  // A client that disappears must not leave the upstream request open: the
+  // tunnel has a finite number of sockets and this is the leak that exhausts
+  // it.
+  //
+  // `aborted` covers only a request cut off mid-BODY. The commoner shape is a
+  // COMPLETED GET whose response streams for a long time: the browser goes
+  // away, and because the request itself finished, `aborted` never fires —
+  // Node merely unpipes, and the remote keeps producing into a socket nobody
+  // reads, forever. `response`'s `close` fires in BOTH cases, so it is the one
+  // that actually bounds the lifetime.
   request.on("aborted", () => upstreamRequest.destroy());
+  response.on("close", () => {
+    // Only when the exchange did not finish normally. `close` fires on every
+    // response, successful ones included, and Node has already released the
+    // upstream request by then — so this condition is defensive rather than
+    // load-bearing, and no test pins it (destroying a finished request is
+    // observably a no-op). It stays because "tear down the upstream" should
+    // never read as something this code does on the success path.
+    if (!response.writableFinished) upstreamRequest.destroy();
+  });
   request.pipe(upstreamRequest);
 }
 
@@ -305,6 +344,14 @@ interface RelayOptions {
   readonly expectHandshakeResponse?: boolean;
   /** Called once when this direction overflows its bound. */
   readonly onOverflow: () => void;
+  /**
+   * Called when a Close frame is relayed in this direction.
+   *
+   * The endpoints' own Close is authoritative. Once one has crossed, the proxy
+   * must not add a synthetic one on top of it — the peer would receive two
+   * contradictory terminal frames and act on whichever it read last.
+   */
+  readonly onTerminalFrame?: () => void;
   readonly onError: (error: unknown) => void;
 }
 
@@ -421,6 +468,10 @@ function relayDirection(options: RelayOptions): void {
         signalOverflow();
         return;
       }
+      // Report it as ENQUEUED, not as written: from here on the endpoints have
+      // agreed on how this connection ends, and the proxy must not append a
+      // terminal frame of its own even while this one is still draining.
+      if (frame.relayIntent === "terminal") options.onTerminalFrame?.();
     }
     drain();
   };
@@ -477,12 +528,36 @@ export function proxyEnvironmentWebSocket(
   const open = deps.connect ?? ((options) => Net.connect(options));
   const upstreamSocket = open({ host: upstream.host, port: upstream.port });
 
+  /**
+   * True once the upstream has relayed a Close of its own.
+   *
+   * A Close the remote sent carries meaning the proxy must not overwrite: 1000
+   * says the session ended deliberately, and replacing it with the synthetic
+   * "tunnel lost" code would send the client reattaching to a session that
+   * finished normally. Destroying the upstream after relaying its Close fires
+   * the `close` listener below, which is exactly where that overwrite happened.
+   */
+  let upstreamClosedGracefully = false;
+
+  /**
+   * True once a terminal frame has been written to the browser.
+   *
+   * Teardown is reachable from several directions at once — overflow destroys
+   * the upstream, whose `close` then re-enters here — and a WebSocket peer must
+   * see exactly ONE Close. A second frame contradicts the first, and the client
+   * acts on whichever it happens to read last.
+   */
+  let terminated = false;
+
   const teardown = (code: number, reason: string) => {
     // Closing the browser side does NOT disturb the remote session: the remote
     // server owns the turn and its journal, and the client reattaches by
     // cursor. That durability is the reason for this architecture, so the proxy
     // must never interpret its own failure as a reason to stop the turn.
-    if (!clientSocket.destroyed) writeCloseFrame(clientSocket, code, reason);
+    if (!terminated && !upstreamClosedGracefully && !clientSocket.destroyed) {
+      terminated = true;
+      writeCloseFrame(clientSocket, code, reason);
+    }
     if (!upstreamSocket.destroyed) upstreamSocket.destroy();
   };
 
@@ -538,6 +613,12 @@ export function proxyEnvironmentWebSocket(
     // permessage-deflate negotiate end to end through the proxy.
     expectHandshakeResponse: true,
     onOverflow,
+    // The remote's own Close is authoritative and reaches the browser verbatim.
+    // Recording it here stops the upstream `close` that follows from writing a
+    // synthetic "tunnel lost" on top of a session that ended normally.
+    onTerminalFrame: () => {
+      upstreamClosedGracefully = true;
+    },
     onError: (error) => fail("environment proxy upstream relay failed", error),
   });
 }

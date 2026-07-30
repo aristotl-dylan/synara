@@ -8,7 +8,7 @@
 // behaves as written.
 
 import http, { type IncomingMessage } from "node:http";
-import { AddressInfo } from "node:net";
+import net, { AddressInfo } from "node:net";
 import { Duplex } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -420,6 +420,106 @@ describe("environment proxy — routing and isolation", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
   });
 
+  it("does not leave the client hanging when the tunnel dies MID-response", async () => {
+    // Distinct from both cases above: headers and part of the body already
+    // reached the browser, so 502 is no longer available — the status line is
+    // spent. A graceful FIN short of the declared Content-Length is the shape
+    // that hangs: nothing errors, `upstreamRequest` never fires, and the
+    // browser waits forever for bytes that are never coming.
+    const upstream = net.createServer((socket) => {
+      socket.on("data", () => {
+        socket.write(
+          "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: text/plain\r\n\r\npartial",
+        );
+        setTimeout(() => socket.end(), 40);
+      });
+    });
+    const upstreamPort = await new Promise<number>((resolve) =>
+      upstream.listen(0, "127.0.0.1", () => resolve((upstream.address() as AddressInfo).port)),
+    );
+    cleanups.push(() => new Promise<void>((resolve) => upstream.close(() => resolve())));
+
+    const local = await startLocalProxy({ registry: registryWith("host-a", upstreamPort) });
+
+    const outcome = await new Promise<string>((resolve) => {
+      const hung = setTimeout(() => resolve("hung"), 3_000);
+      const request = http.request(
+        { host: "127.0.0.1", port: local.port, path: "/env/host-a/api/stream" },
+        (response) => {
+          response.on("data", () => {});
+          response.on("end", () => {
+            clearTimeout(hung);
+            // `complete` false means the browser KNOWS the body was truncated,
+            // which is the honest outcome once the status line is spent.
+            resolve(response.complete ? "ended-complete" : "ended-truncated");
+          });
+          response.on("error", () => {
+            clearTimeout(hung);
+            resolve("errored");
+          });
+        },
+      );
+      request.on("error", () => {
+        clearTimeout(hung);
+        resolve("errored");
+      });
+      request.end();
+    });
+
+    // Either honest ending is acceptable; hanging forever is not.
+    expect(outcome, "the client must not wait forever for a truncated body").not.toBe("hung");
+    expect(["ended-truncated", "errored"]).toContain(outcome);
+  });
+
+  it("releases the tunnel socket when the browser abandons a streaming response", async () => {
+    // The leak is on a COMPLETED request: the browser sent a whole GET, so
+    // `aborted` never fires, and only the response is still streaming. Nothing
+    // then destroys the upstream request — the remote keeps producing into a
+    // socket nobody reads. Repeat against a streaming endpoint and the tunnel
+    // runs out of sockets.
+    let liveUpstreamResponses = 0;
+    const tickers: NodeJS.Timeout[] = [];
+    const upstream = http.createServer((_request, response) => {
+      liveUpstreamResponses += 1;
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      const ticker = setInterval(() => {
+        if (!response.writableEnded && !response.destroyed) response.write("tick\n");
+      }, 25);
+      tickers.push(ticker);
+      response.on("close", () => {
+        liveUpstreamResponses -= 1;
+        clearInterval(ticker);
+      });
+    });
+    const upstreamPort = await new Promise<number>((resolve) =>
+      upstream.listen(0, "127.0.0.1", () => resolve((upstream.address() as AddressInfo).port)),
+    );
+    cleanups.push(async () => {
+      for (const ticker of tickers) clearInterval(ticker);
+      // `closeAllConnections` first: a LEAKED upstream socket keeps `close()`
+      // waiting forever, which would surface as a 90s hook timeout instead of
+      // as this test's own assertion. Teardown must not be what reports the bug.
+      upstream.closeAllConnections?.();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    });
+
+    const local = await startLocalProxy({ registry: registryWith("host-a", upstreamPort) });
+
+    // A raw socket so the request completes but the response is abandoned.
+    const browser = net.connect({ host: "127.0.0.1", port: local.port });
+    await new Promise<void>((resolve) => browser.on("connect", () => resolve()));
+    browser.write("GET /env/host-a/api/stream HTTP/1.1\r\nHost: local\r\n\r\n");
+    await delay(200);
+    expect(liveUpstreamResponses, "the upstream should be streaming by now").toBe(1);
+
+    browser.destroy();
+    await delay(500);
+    expect(
+      liveUpstreamResponses,
+      "the tunnel socket must be released when the browser goes away",
+    ).toBe(0);
+  });
+
   it("does not cut off a slow but healthy streaming response", async () => {
     // The bound is time-to-first-byte, not a cap on how long a response may
     // take. A remote turn that streams for minutes must not be severed.
@@ -783,6 +883,42 @@ describe("environment proxy — flow control and head-of-line blocking", () => {
     return Buffer.concat([header, payload]);
   }
 
+  /**
+   * Every Close code written to a socket, in order.
+   *
+   * Walks the frame headers rather than scanning for a byte whose low nibble is
+   * 8 — the handshake's leading `H` is 0x48, which a naive scan reports as a
+   * Close frame. Skipping the HTTP head and then honouring each frame's length
+   * is what makes "exactly one terminal frame" a trustworthy assertion.
+   */
+  function closeCodesWritten(written: readonly Buffer[]): number[] {
+    const all = Buffer.concat([...written]);
+    const headEnd = all.indexOf(HEADER_TERMINATOR_BYTES);
+    const body = headEnd === -1 ? all : all.subarray(headEnd + HEADER_TERMINATOR_BYTES.byteLength);
+    const codes: number[] = [];
+    let offset = 0;
+    while (offset + 2 <= body.byteLength) {
+      const opcode = body[offset]! & 0x0f;
+      const marker = body[offset + 1]! & 0x7f;
+      let headerLength = 2;
+      let payloadLength = marker;
+      if (marker === 126) {
+        payloadLength = body.readUInt16BE(offset + 2);
+        headerLength = 4;
+      } else if (marker === 127) {
+        payloadLength = Number(body.readBigUInt64BE(offset + 2));
+        headerLength = 10;
+      }
+      if (opcode === 0x8) {
+        codes.push(payloadLength >= 2 ? body.readUInt16BE(offset + headerLength) : -1);
+      }
+      offset += headerLength + payloadLength;
+    }
+    return codes;
+  }
+
+  const HEADER_TERMINATOR_BYTES = Buffer.from("\r\n\r\n");
+
   const HANDSHAKE_101 = Buffer.from(
     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n",
   );
@@ -1031,6 +1167,54 @@ describe("environment proxy — flow control and head-of-line blocking", () => {
     // The literal is the contract; a deliberate change must update both.
     expect(closeFrame!.readUInt16BE(2)).toBe(4002);
     expect(WS_CLOSE_PROXY_RESYNC_REQUIRED, "the constant must still be the wire value").toBe(4002);
+    // EXACTLY ONE terminal frame, not "a 4002 appears somewhere". Destroying the
+    // upstream during teardown fires its own `close` listener, and without a
+    // one-shot guard that emits a SECOND Close — so the client is told to
+    // resync and then told the tunnel was lost, and acts on whichever it reads
+    // last. "Find a 4002" passes happily while that happens.
+    expect(closeCodesWritten(client.written), "one terminal frame, and only one").toEqual([4002]);
+  });
+
+  it("still signals tunnel loss after the upstream has sent a Ping", async () => {
+    // The re-conflation hazard in the fix for the previous test: "the upstream
+    // already closed" must be set by a CLOSE, never by any control frame. If a
+    // Ping set it, a heartbeat followed by a dead tunnel would produce NO
+    // terminal frame at all — the client would sit on a socket that is never
+    // coming back, which is worse than the double-close this guard replaced.
+    const { upstream, client } = makeControlledProxy();
+    await delay(5);
+    client.written.length = 0;
+
+    upstream.deliver(serverFrame(0x9, Buffer.from("heartbeat")));
+    await delay(10);
+    upstream.socket.destroy();
+    await delay(60);
+
+    expect(
+      closeCodesWritten(client.written),
+      "a Ping must not suppress the tunnel-lost signal",
+    ).toEqual([4003]);
+  });
+
+  it("emits exactly one terminal frame, and preserves the upstream's own close code", async () => {
+    // A graceful close carries information: 1000 means the remote finished
+    // deliberately. Overwriting it with the proxy's synthetic 4003 tells the
+    // client the TUNNEL failed, so it reattaches to a session that ended
+    // normally. The upstream's code must survive, and nothing may follow it.
+    const { upstream, client } = makeControlledProxy();
+    await delay(5);
+    client.written.length = 0;
+
+    // The remote closes normally: its own Close frame, then the socket.
+    upstream.deliver(serverFrame(0x8, Buffer.from([0x03, 0xe8]))); // 1000
+    await delay(10);
+    upstream.socket.destroy();
+    await delay(60);
+
+    expect(
+      closeCodesWritten(client.written),
+      "the upstream's 1000 must reach the client, with no synthetic code after it",
+    ).toEqual([1000]);
   });
 
   it("stops retaining bytes once it overflows, rather than growing without limit", async () => {
