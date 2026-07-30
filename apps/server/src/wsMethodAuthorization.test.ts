@@ -46,6 +46,23 @@ describe("owner-only enforcement", () => {
 });
 
 describe("local-only enforcement", () => {
+  // Every local-only method is also owner-only. Without this, a method could be
+  // restricted to loopback deployments yet reachable by a non-owner client on
+  // that same loopback box, which is not the intent of either table.
+  it("keeps LOCAL_ONLY a subset of OWNER_ONLY", () => {
+    for (const method of LOCAL_ONLY_WS_METHODS) {
+      expect(OWNER_ONLY_WS_METHODS.has(method), `${method} is local-only but not owner-only`).toBe(
+        true,
+      );
+    }
+  });
+
+  it("refuses every local-only method for a non-owner even on a loopback bind", () => {
+    for (const method of LOCAL_ONLY_WS_METHODS) {
+      expect(authorizeWsMethod({ method, role: "client", config: loopback })).not.toBeNull();
+    }
+  });
+
   it.each([...LOCAL_ONLY_WS_METHODS])(
     "rejects %s on a remote-reachable bind even for an owner",
     (method) => {
@@ -111,14 +128,17 @@ describe("server-side version skew", () => {
     }
   });
 
-  it("refuses server.listWorktrees from a skewed client because it prunes", () => {
+  // Mutating methods stay refused under skew regardless of how read-like the
+  // name is. server.listWorktrees is deliberately NOT in this list anymore: its
+  // handler was made a pure scan (see managedWorktrees.test.ts).
+  it.each([
+    WS_METHODS.gitCheckout,
+    WS_METHODS.gitRemoveWorktree,
+    WS_METHODS.projectsWriteFile,
+    WS_METHODS.terminalWrite,
+  ])("refuses mutating %s from a skewed client", (method) => {
     expect(
-      authorizeWsMethod({
-        method: WS_METHODS.serverListWorktrees,
-        role: "owner",
-        config: loopback,
-        buildSkewed: true,
-      }),
+      authorizeWsMethod({ method, role: "owner", config: loopback, buildSkewed: true }),
     ).not.toBeNull();
   });
 

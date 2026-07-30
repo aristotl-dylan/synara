@@ -134,6 +134,7 @@ describe("read-only method allowlist", () => {
         WS_METHODS.serverGetEnvironment,
         WS_METHODS.serverGetSettings,
         WS_METHODS.serverListExternalMcpIntegrations,
+        WS_METHODS.serverListWorktrees,
         WS_METHODS.serverListLocalServers,
         WS_METHODS.serverGetProviderUsageSnapshot,
         WS_METHODS.serverListProviderUsage,
@@ -160,7 +161,11 @@ describe("read-only method allowlist", () => {
     );
   });
 
-  it("refuses server.listWorktrees, whose handler prunes and removes worktrees", () => {
-    expect(isReadOnlySafeWsMethod(WS_METHODS.serverListWorktrees)).toBe(false);
+  // server.listWorktrees is allowlisted ONLY because its handler was made a
+  // pure scan; the retention pruning it used to run moved to thread.archive.
+  // This pairs with managedWorktrees.test.ts, which asserts the list path
+  // performs no removal — together they pin the reason, not just the entry.
+  it("allowlists server.listWorktrees only as a pure read", () => {
+    expect(isReadOnlySafeWsMethod(WS_METHODS.serverListWorktrees)).toBe(true);
   });
 });

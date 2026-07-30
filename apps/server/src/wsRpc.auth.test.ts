@@ -229,3 +229,56 @@ it.effect(
       assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
     }),
 );
+
+// Second assertions for predicates that were otherwise pinned by exactly one
+// test each. A single test edit should not be able to silently unpin the
+// implicit-owner path or the legacy query-token gate.
+it.effect("refuses the implicit-owner path when the legacy token does not match", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = failingUpgrade();
+
+    const error = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "127.0.0.1",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        allowInsecureRemote: false,
+      },
+      legacyToken: "wrong-secret",
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://127.0.0.1:3773/ws"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    }).pipe(Effect.flip);
+
+    assert.equal(error.status, 401);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
+  }),
+);
+
+it.effect("refuses the implicit-owner path when a configured token is not presented", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = failingUpgrade();
+
+    const error = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "127.0.0.1",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        allowInsecureRemote: false,
+      },
+      legacyToken: null,
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://127.0.0.1:3773/ws"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    }).pipe(Effect.flip);
+
+    assert.equal(error.status, 401);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
+  }),
+);

@@ -7,6 +7,7 @@ import {
 } from "./managedAttachmentPrincipal.ts";
 import {
   CurrentWsSessionRole,
+  DEFAULT_WS_SESSION_ROLE,
   makeWsConnectionSessions,
   provideWsConnectionSession,
   type WsConnectionSession,
@@ -78,5 +79,23 @@ describe("WsConnectionSessions", () => {
       role: "client",
       principal: LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
     });
+  });
+});
+
+/**
+ * These defaults are the fail-safe for a connection whose session cannot be
+ * resolved. They are asserted directly (not only through the middleware) so a
+ * single edit elsewhere cannot silently unpin them.
+ */
+describe("unresolved connection session fail-safes", () => {
+  it("defaults the session role to client, never owner", () => {
+    expect(DEFAULT_WS_SESSION_ROLE).toBe("client");
+    expect(DEFAULT_WS_SESSION_ROLE).not.toBe("owner");
+  });
+
+  it("resolves an unknown or absent session key to undefined", async () => {
+    const sessions = await Effect.runPromise(makeWsConnectionSessions);
+    expect(sessions.lookup(undefined)).toBeUndefined();
+    expect(sessions.lookup("not-a-registered-key")).toBeUndefined();
   });
 });

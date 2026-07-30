@@ -94,9 +94,11 @@ export const READ_ONLY_SAFE_WS_METHODS: ReadonlySet<string> = new Set<string>([
   WS_METHODS.serverGetEnvironment,
   WS_METHODS.serverGetSettings,
   WS_METHODS.serverListExternalMcpIntegrations,
-  // NOTE: serverListWorktrees is deliberately absent. Despite the "list" name
-  // its handler runs retention pruning, which snapshots and force-removes
-  // archived worktrees — a filesystem mutation a skewed client must not cause.
+  // Safe only because its handler is a pure inventory scan. It previously ran
+  // retention pruning (snapshot + force-remove) despite the "list" name; that
+  // side effect now lives on the thread.archive path. If listing ever mutates
+  // again, remove this entry.
+  WS_METHODS.serverListWorktrees,
   WS_METHODS.serverListLocalServers,
   WS_METHODS.serverGetProviderUsageSnapshot,
   WS_METHODS.serverListProviderUsage,

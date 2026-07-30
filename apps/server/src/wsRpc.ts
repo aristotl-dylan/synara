@@ -67,7 +67,11 @@ import {
 import { Keybindings } from "./keybindings";
 import { createLocalPreviewGrant } from "./localImageFiles";
 import { listLocalServers, stopLocalServer } from "./localServerMonitor";
-import { listManagedWorktrees, pruneProjectedArchivedManagedWorktrees } from "./managedWorktrees";
+import {
+  listManagedWorktrees,
+  listProjectedManagedWorktrees as listProjectedManagedWorktreesEffect,
+  pruneProjectedArchivedManagedWorktrees,
+} from "./managedWorktrees";
 import {
   attachmentPrincipalForSession,
   CurrentManagedAttachmentPrincipal,
@@ -685,6 +689,19 @@ const makeWsRpcHandlersLayer = () =>
               ),
             ),
           ),
+        ),
+      );
+      // Pure read used by server.listWorktrees. Falls back to an empty list on
+      // scan failure rather than surfacing an error, matching the prune path's
+      // behavior for a failed inventory scan.
+      const listProjectedManagedWorktrees = listProjectedManagedWorktreesEffect({
+        worktreesDir: config.worktreesDir,
+        git,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("managed worktree inventory scan failed", {
+            cause: String(cause),
+          }).pipe(Effect.as([])),
         ),
       );
       const getOrchestrationHighWaterSequence = orchestrationEngine.getEventHighWaterSequence.pipe(
@@ -1393,9 +1410,13 @@ const makeWsRpcHandlersLayer = () =>
           ),
         [WS_METHODS.serverRefreshExternalMcpPairing]: (input) =>
           rpcEffect(externalMcp.refreshPairing(input), "Failed to refresh external MCP pairing"),
+        // A method named "list" must not delete anything. Retention pruning is
+        // triggered by thread.archive, which is what actually creates archived
+        // worktrees; listing is a pure read, so a version-skewed or read-only
+        // client hydrating its UI cannot cause filesystem removal.
         [WS_METHODS.serverListWorktrees]: () =>
           rpcEffect(
-            pruneManagedWorktrees.pipe(Effect.map((worktrees) => ({ worktrees }))),
+            listProjectedManagedWorktrees.pipe(Effect.map((worktrees) => ({ worktrees }))),
             "Failed to list managed worktrees",
           ),
         [WS_METHODS.serverListLocalServers]: () =>

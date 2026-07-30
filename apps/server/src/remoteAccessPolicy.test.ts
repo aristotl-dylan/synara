@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { resolveBindHost } from "./startupAccess";
 import {
   isLocalOnlyDeployment,
   isRemoteReachableDeployment,
@@ -176,6 +177,64 @@ describe("remote access startup policy", () => {
       "https://synara.example.test/#fragment",
     ]) {
       expect(normalizeHttpsPublicOrigin(new URL(value))).toBeNull();
+    }
+  });
+});
+
+/**
+ * Cross-module invariant. The critical auth bypass existed because host
+ * resolution and policy classification lived in separate modules and
+ * disagreed: `isLoopbackHost("")` said loopback while the listener bound
+ * 0.0.0.0. Neither module's own tests could see that. This asserts the two
+ * agree for every host we might bind — the address actually bound must be
+ * loopback if and only if the policy treated the deployment as local-only.
+ */
+describe("bind host and policy classification agree", () => {
+  const LOOPBACK_BIND_ADDRESSES = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+  const hostVectors = [
+    undefined,
+    "",
+    " ",
+    "\t",
+    "  \n ",
+    "127.0.0.1",
+    " 127.0.0.1 ",
+    "localhost",
+    "::1",
+    "[::1]",
+    "0.0.0.0",
+    " 0.0.0.0 ",
+    "::",
+    "[::]",
+    "192.168.1.50",
+    "10.0.0.7",
+    "127.0.0.2",
+    "::ffff:127.0.0.1",
+    "2130706433",
+    "0177.0.0.1",
+    "localhost.evil.com",
+  ] as const;
+
+  it.each(hostVectors)("binds host %j consistently with how policy classified it", (host) => {
+    const boundAddress = resolveBindHost(host);
+    const config = { ...loopbackBase, host };
+
+    const bindsLoopbackOnly = LOOPBACK_BIND_ADDRESSES.has(boundAddress);
+    const policySaysLocalOnly = isLocalOnlyDeployment(config);
+
+    expect(
+      policySaysLocalOnly,
+      `host ${JSON.stringify(host)} binds ${boundAddress} but policy said localOnly=${policySaysLocalOnly}`,
+    ).toBe(bindsLoopbackOnly);
+
+    // The consequence that matters: anything not bound to a loopback address
+    // must demand a session credential, with no auth token configured.
+    if (!bindsLoopbackOnly) {
+      expect(requiresSessionAuthentication(config)).toBe(true);
+      expect(remoteAccessPolicyError({ ...remoteBase, host, authToken: undefined })).toContain(
+        "Refusing",
+      );
     }
   });
 });
