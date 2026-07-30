@@ -69,6 +69,25 @@ export function resolveThreadEnvironmentId(
 }
 
 /**
+ * Ownership of `threadId` when some server or the composer has actually stated
+ * it, and `null` when nobody has.
+ *
+ * `resolveThreadEnvironmentId` cannot express "nobody knows" — it answers LOCAL
+ * for an unknown thread, which is the right default for a thread being read but
+ * the wrong one for a thread being CREATED. `thread.create` carries a brand-new
+ * `threadId` no snapshot has reported, so a caller that needs to fall back to
+ * another key (the owning project) must be able to tell the two apart.
+ */
+export function findThreadEnvironmentId(
+  threadId: ThreadId,
+  source: ThreadOwnershipSource = readOwnershipSource(),
+): EnvironmentId | null {
+  const reported = source.environmentIdByThreadId?.[threadId];
+  if (reported) return reported as EnvironmentId;
+  return claimedEnvironmentIdByThreadId.get(threadId) ?? null;
+}
+
+/**
  * The environment that owns `projectId`.
  *
  * Project-scoped commands (`project.meta.update`, `project.delete`,

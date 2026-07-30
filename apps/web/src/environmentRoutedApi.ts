@@ -13,6 +13,7 @@ import type { NativeApi, ThreadId } from "@synara/contracts";
 import {
   environmentNativeApi,
   EnvironmentUnavailableError,
+  findThreadEnvironmentId,
   resolveProjectEnvironmentId,
   resolveThreadEnvironmentId,
 } from "./environmentRouting";
@@ -133,19 +134,36 @@ function readStringField(argument: unknown, field: string): string | null {
  * The environment a call belongs to, or `null` when the call is not scoped to
  * one and should stay on the local (server-wide) client.
  *
- * `threadId` wins when present. `projectId`/`spaceId` are consulted only for
- * `dispatchCommand`, whose union includes project- and space-scoped commands
- * that carry no thread: without this, pinning, renaming, or deleting a REMOTE
- * project would be applied to the local server's copy of it.
+ * Keys are tried in order of how specifically they identify a host: a KNOWN
+ * thread, then the owning project, then the projects a space command names.
+ *
+ * The thread step uses `findThreadEnvironmentId`, which distinguishes "owned by
+ * local" from "nobody has said". That distinction is load-bearing for
+ * `thread.create`, which carries a brand-new `threadId` no snapshot has
+ * reported ALONGSIDE the `projectId` that does identify a host: resolving the
+ * unknown thread straight to local would create a remote project's thread on
+ * the user's laptop whenever the composer claim is missing or has been
+ * released. Falling through to the project is what makes the claim an
+ * optimization rather than the only thing standing between the user and a
+ * thread on the wrong machine.
+ *
+ * The project step also covers commands that carry no thread at all
+ * (`project.meta.update`, `project.delete`): without it, pinning, renaming, or
+ * deleting a REMOTE project would be applied to the local server's copy.
  */
 function resolveCallEnvironmentId(
   argument: unknown,
 ): ReturnType<typeof resolveThreadEnvironmentId> | null {
   const threadId = readStringField(argument, "threadId");
-  if (threadId !== null) return resolveThreadEnvironmentId(threadId as ThreadId);
+  const threadEnvironmentId =
+    threadId === null ? null : findThreadEnvironmentId(threadId as ThreadId);
+  if (threadEnvironmentId !== null) return threadEnvironmentId;
 
   const projectId = readStringField(argument, "projectId");
   if (projectId !== null) return resolveProjectEnvironmentId(projectId);
+
+  // A thread nobody has claimed and no project names runs where the app does.
+  if (threadId !== null) return resolveThreadEnvironmentId(threadId as ThreadId);
 
   // `space.projects.assign` names the projects it moves; they share an owner.
   const projectIds = (argument as { readonly projectIds?: unknown } | null)?.projectIds;

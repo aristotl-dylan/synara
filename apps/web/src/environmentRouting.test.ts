@@ -314,6 +314,46 @@ describe("project-scoped commands", () => {
     expect(localDispatch).not.toHaveBeenCalled();
   });
 
+  it("creates a new thread in a remote project on that project's host, with no claim", async () => {
+    // `thread.create` carries a brand-new threadId no snapshot has reported,
+    // ALONGSIDE the projectId that does identify a host. Resolving the unknown
+    // thread straight to local would create a remote project's thread on the
+    // laptop whenever the composer claim is missing or already released —
+    // making the claim the only thing preventing it, rather than a shortcut.
+    registeredClients.set(REMOTE_ENVIRONMENT_ID, remoteClient);
+    storeState.environmentIdByProjectId = { "project-remote": REMOTE_ENVIRONMENT_ID };
+
+    const api = createEnvironmentRoutedApi(localClient.api as never);
+    await api.orchestration.dispatchCommand({
+      type: "thread.create",
+      commandId: "command-1",
+      threadId: "thread-brand-new",
+      projectId: "project-remote",
+    } as never);
+
+    expect(remoteDispatch).toHaveBeenCalledTimes(1);
+    expect(localDispatch).not.toHaveBeenCalled();
+  });
+
+  it("lets a thread's own reported owner outrank its project's", async () => {
+    // A thread moved between hosts, or a project whose ownership is stale: the
+    // thread's own reported owner is the more specific fact and must win.
+    registeredClients.set(REMOTE_ENVIRONMENT_ID, remoteClient);
+    storeState.environmentIdByThreadId = { [LOCAL_THREAD_ID]: LOCAL_ENVIRONMENT_ID };
+    storeState.environmentIdByProjectId = { "project-remote": REMOTE_ENVIRONMENT_ID };
+
+    const api = createEnvironmentRoutedApi(localClient.api as never);
+    await api.orchestration.dispatchCommand({
+      type: "thread.meta.update",
+      commandId: "command-1",
+      threadId: LOCAL_THREAD_ID,
+      projectId: "project-remote",
+    } as never);
+
+    expect(localDispatch).toHaveBeenCalledTimes(1);
+    expect(remoteDispatch).not.toHaveBeenCalled();
+  });
+
   it("keeps a local project's mutation on the local server", async () => {
     registeredClients.set(REMOTE_ENVIRONMENT_ID, remoteClient);
     const api = createEnvironmentRoutedApi(localClient.api as never);
