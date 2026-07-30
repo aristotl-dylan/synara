@@ -682,7 +682,14 @@ describe("environment proxy — tunnel teardown and reattach", () => {
     await waitForOpen(first);
     first.send("advance");
     first.send("advance");
-    await delay(20);
+    // Read back through the same socket rather than sleeping: this only
+    // resolves once the remote has processed both preceding messages, so the
+    // teardown below cannot race ahead of them under CI contention.
+    const advanced = new Promise<string>((resolve) =>
+      first.once("message", (data) => resolve(data.toString())),
+    );
+    first.send("read");
+    expect(await advanced).toBe("2");
 
     const firstClosed = waitForClose(first);
     first.terminate();
