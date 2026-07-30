@@ -27,6 +27,7 @@ import {
   syncServerReadModel,
   syncServerThreadDetailHotPath,
 } from "./storeProjection";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
 import {
   localThreadDetailResumeCursors,
   resetThreadDetailResumeCursorsForTests,
@@ -2291,5 +2292,54 @@ describe("multi-environment shell aggregation", () => {
 
     expect(localThreadDetailResumeCursors().has(localThreadId)).toBe(false);
     expect(threadDetailResumeCursors(remoteEnvironmentId).get(remoteThreadId)).toBe(77);
+  });
+
+  it("prunes the remote's own stale cursor and spares the local one", () => {
+    // Mirror of the case above, with a REMOTE snapshot doing the pruning. The
+    // local-only version cannot distinguish the correct scope from the local
+    // one, because for a local snapshot they are the same object. Under a
+    // remote snapshot, pruning through the local scope goes wrong twice: the
+    // remote's stale cursor survives (vouching for detail this prune just
+    // discarded, so a resubscribe resumes on top of missing history) and the
+    // local environment's live cursor is destroyed.
+    threadDetailResumeCursors(remoteEnvironmentId).set(remoteThreadId, 77);
+    localThreadDetailResumeCursors().set(localThreadId, 42);
+
+    // The remote snapshot lists a different thread, so `remoteThreadId`'s
+    // detail is pruned and its cursor must fall with it.
+    syncServerShellSnapshot(
+      emptyState(),
+      {
+        ...makeShellSnapshot(shellThread(ThreadId.makeUnsafe("thread-remote-other"), "Other")),
+        snapshotSequence: 30,
+      },
+      remoteEnvironmentId,
+    );
+
+    expect(threadDetailResumeCursors(remoteEnvironmentId).has(remoteThreadId)).toBe(false);
+    // The local server's journal was not involved; its cursor is still valid.
+    expect(localThreadDetailResumeCursors().get(localThreadId)).toBe(42);
+  });
+
+  it("fences a low local sequence independently of a high remote one", () => {
+    // The reverse direction of the shared-fence case: local first at a high
+    // sequence, then remote at a low one. A single shared counter would reject
+    // the remote snapshot as stale here, while the local-low/remote-high
+    // ordering alone would not catch it.
+    const afterLocalHigh = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 500,
+    });
+
+    const afterRemoteLow = syncServerShellSnapshot(
+      afterLocalHigh,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 2 },
+      remoteEnvironmentId,
+    );
+
+    expect(afterRemoteLow.threadIds).toContain(remoteThreadId);
+    expect(afterRemoteLow.threadIds).toContain(localThreadId);
+    expect(afterRemoteLow.shellSnapshotSequenceByEnvironmentId?.[remoteEnvironmentId]).toBe(2);
+    expect(afterRemoteLow.shellSnapshotSequenceByEnvironmentId?.[LOCAL_ENVIRONMENT_ID]).toBe(500);
   });
 });
