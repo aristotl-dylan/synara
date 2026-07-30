@@ -62,6 +62,56 @@ const NON_PERSISTENT_KNOWN_HOSTS: ReadonlySet<string> = new Set([
   "null",
 ]);
 
+/**
+ * A hostname or username must never be readable as an OPTION.
+ *
+ * `ssh -oProxyCommand=touch\ /tmp/pwned host cmd` runs that command on the
+ * LOCAL machine before any connection is attempted, and OpenSSH parses a
+ * leading-dash destination exactly that way. This is verified behaviour, not a
+ * theoretical concern. Two defences, because either alone is fragile: values are
+ * restricted to the characters a hostname and a POSIX username may contain, and
+ * every invocation passes `--` before the destination.
+ *
+ * The allowlist is deliberate. `SshTarget` has no field that can carry a raw ssh
+ * flag — no config file, no ProxyCommand, no ControlPath — so the only way one
+ * could reach argv is smuggled inside one of these values.
+ */
+const SSH_HOST_PATTERN = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+const SSH_USER_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+
+export function assertSshHost(host: string): string {
+  const trimmed = host.trim();
+  if (!SSH_HOST_PATTERN.test(trimmed) || trimmed.length > 253) {
+    throw new Error(`Invalid remote host: ${JSON.stringify(host)}`);
+  }
+  return trimmed;
+}
+
+export function assertSshUser(user: string): string {
+  const trimmed = user.trim();
+  if (!SSH_USER_PATTERN.test(trimmed) || trimmed.length > 64) {
+    throw new Error(`Invalid remote user: ${JSON.stringify(user)}`);
+  }
+  return trimmed;
+}
+
+/**
+ * An identity file is passed as `-i <path>`, so a leading dash would be read as
+ * the next flag rather than as this one's value.
+ */
+export function assertSshIdentityFile(identityFile: string): string {
+  const trimmed = identityFile.trim();
+  if (trimmed.length === 0 || /\s/.test(trimmed)) {
+    throw new Error(`Invalid remote identity file: ${JSON.stringify(identityFile)}`);
+  }
+  if (!trimmed.startsWith("/") && !trimmed.startsWith("~/")) {
+    throw new Error(
+      `Remote identity file must be an absolute path: ${JSON.stringify(identityFile)}`,
+    );
+  }
+  return trimmed;
+}
+
 export function assertPersistentKnownHostsFile(knownHostsFile: string): string {
   const trimmed = knownHostsFile.trim();
   if (trimmed.length === 0) {
@@ -103,8 +153,8 @@ export function sshConnectionOptionArgv(target: SshTarget): ReadonlyArray<string
   if (target.knownHostsFile !== undefined) {
     argv.push("-o", `UserKnownHostsFile=${assertPersistentKnownHostsFile(target.knownHostsFile)}`);
   }
-  if (target.identityFile) {
-    argv.push("-o", "IdentitiesOnly=yes", "-i", target.identityFile);
+  if (target.identityFile !== undefined) {
+    argv.push("-o", "IdentitiesOnly=yes", "-i", assertSshIdentityFile(target.identityFile));
   }
   return argv;
 }
@@ -166,7 +216,9 @@ export function createSshConnection(
 ): RemoteConnection {
   const baseArgv = sshConnectionOptionArgv(target);
   const portArgv = target.port ? ["-p", String(target.port)] : [];
-  const destination = `${target.user}@${target.host}`;
+  // Validated here, at construction, so a hostile target fails before a single
+  // process is spawned rather than at the first exec.
+  const destination = `${assertSshUser(target.user)}@${assertSshHost(target.host)}`;
 
   return {
     describe: describeTarget(target),
@@ -174,9 +226,12 @@ export function createSshConnection(
       // `ssh host <words>` joins its trailing words with a space and runs the
       // result through the remote login shell. Encoding the argv here is the
       // only correct response; the caller never sees a command string.
+      // `--` before the destination: belt and braces with the host/user
+      // validation above, so a leading-dash value can never be read as an
+      // option (notably -oProxyCommand=, which executes LOCALLY).
       return run(
         "ssh",
-        [...baseArgv, ...portArgv, destination, quotePosixShellCommand(argv)],
+        [...baseArgv, ...portArgv, "--", destination, quotePosixShellCommand(argv)],
         options,
       );
     },

@@ -291,3 +291,86 @@ describe("scp remote path injection", () => {
     }
   });
 });
+
+describe("a hostile host/user cannot become an ssh option", () => {
+  // Verified against the real ssh binary: `ssh -oProxyCommand=touch\ /tmp/x
+  // host cmd` creates /tmp/x on the LOCAL machine before any connection is
+  // attempted, because OpenSSH parses a leading-dash destination as options.
+  // This is the PR #20 class of bug (-F/dev/null, -oProxyCommand=, -S, -vtt);
+  // SshTarget has no field that can carry a raw flag, so the only way one could
+  // reach argv is smuggled through host or user.
+  const hostileValues = [
+    "-oProxyCommand=touch /tmp/pwned",
+    "-oProxyCommand=id",
+    "-F/dev/null",
+    "-S/tmp/attacker.sock",
+    "-vtt",
+    "-i/tmp/attacker_key",
+    "-oUserKnownHostsFile=/dev/null",
+    "-oStrictHostKeyChecking=no",
+    "--",
+    "-",
+    "host with space",
+    "host;id",
+    "host$(id)",
+    "host\nid",
+    "",
+  ];
+
+  it.each(hostileValues)("refuses host %j", (host) => {
+    expect(() => createSshConnection({ ...target, host }, recordingRun().run)).toThrow(
+      /Invalid remote host/,
+    );
+  });
+
+  it.each(hostileValues)("refuses user %j", (user) => {
+    expect(() => createSshConnection({ ...target, user }, recordingRun().run)).toThrow(
+      /Invalid remote user/,
+    );
+  });
+
+  it.each(["-oProxyCommand=id", "relative/key", "/path/with space", "", "   "])(
+    "refuses identityFile %j",
+    (identityFile) => {
+      expect(() => sshConnectionOptionArgv({ ...target, identityFile })).toThrow(
+        /identity file|absolute path/i,
+      );
+    },
+  );
+
+  it("accepts ordinary hosts, users, and identity files", () => {
+    const connection = createSshConnection(
+      {
+        host: "build-01.example.test",
+        user: "deploy_user-1",
+        identityFile: "/home/me/.ssh/id_ed25519",
+      },
+      recordingRun().run,
+    );
+    expect(connection.describe).toBe("deploy_user-1@build-01.example.test");
+  });
+
+  // Defence in depth: even a value that somehow passed validation must sit
+  // after `--`, where ssh can no longer read it as a flag.
+  it("passes -- before the destination on every exec", async () => {
+    const { run, invocations } = recordingRun();
+    await createSshConnection(target, run).exec(["true"]);
+    const argv = invocationAt(invocations, 0).argv;
+    const separator = argv.indexOf("--");
+    const destination = argv.indexOf("deploy@build-01.example.test");
+    expect(separator).toBeGreaterThanOrEqual(0);
+    expect(destination).toBeGreaterThan(separator);
+  });
+
+  it("passes -- before the destination on upload too", async () => {
+    const { run, invocations } = recordingRun();
+    await createSshConnection(target, run).uploadFile({
+      localPath: "/tmp/a",
+      remotePath: "/remote/a",
+    });
+    const argv = invocationAt(invocations, 0).argv;
+    const separator = argv.indexOf("--");
+    expect(separator).toBeGreaterThanOrEqual(0);
+    expect(argv.slice(separator + 1).some((token) => token.includes("@"))).toBe(true);
+  });
+});
