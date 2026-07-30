@@ -101,6 +101,13 @@ export const DETACHING_LAUNCHER_FLAGS: ReadonlySet<string> = new Set([
  * of sails through. An allowlist inverts that: an unmodelled spelling is simply
  * not on the list, so it fails closed.
  *
+ * The parser refuses any token that is neither a known flag nor a known flag's
+ * value. That single rule covers three separate attacks at once: positional
+ * injection (a bare `attacker.example.com` here becomes THE destination, since
+ * these args go first, demoting the real host to the first word of the remote
+ * command), bundled short flags (`-Nf`, `-vtt`), and attached values (`-F/x`,
+ * `-S/x`) — all three are simply "a token I cannot parse".
+ *
  * The escape hatch for anything not listed here is the user's own
  * `~/.ssh/config`. `destination` accepts a Host alias, and ssh applies that
  * host's ProxyCommand, ProxyJump, identities and forwards exactly as it does in
@@ -112,7 +119,7 @@ export const DETACHING_LAUNCHER_FLAGS: ReadonlySet<string> = new Set([
 /**
  * `-o Key=value` names a user may set. Every entry either tunes the transport or
  * selects credentials. None can execute a local command (ProxyCommand,
- * LocalCommand, PermitLocalCommand, `Match exec`), relocate the config,
+ * LocalCommand, PermitLocalCommand, KnownHostsCommand), relocate the config,
  * known-hosts or control state ssh reads and writes (Include, UserKnownHostsFile,
  * ControlPath), or switch off a guarantee the rest of this module depends on
  * (StrictHostKeyChecking, BatchMode, RequestTTY, our multiplexing).
@@ -403,7 +410,12 @@ export function buildRemoteScript(input: BuildRemoteScriptInput): string {
     return lines.join("\n");
   }
 
-  lines.push(`cd -- ${cwd}`);
+  // The session `cd` is guarded exactly like the probe's. An unguarded `cd` that
+  // fails leaves the shell in the ssh login home and execs the agent there: a
+  // coding agent with write access, pointed at the wrong directory, reporting
+  // success. The probe classifying a missing cwd is not enough — the directory
+  // can disappear between the probe and the turn.
+  lines.push(`cd -- ${cwd} || exit ${PROBE_EXIT_CWD_MISSING}`);
   lines.push(`exec ${quotedBinary} ${posixShellJoin(input.target.args)}`.trimEnd());
   return lines.join("\n");
 }

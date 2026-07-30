@@ -126,11 +126,27 @@ describe("resolveSshControlDirectory", () => {
     const fake = {
       mkdirSync: () => undefined,
       chmodSync: () => undefined,
-      statSync: () => ({ mode: 0o40777 }) as FS.Stats,
+      lstatSync: () => ({ mode: 0o40777, isSymbolicLink: () => false }) as unknown as FS.Stats,
     };
     expect(() => resolveSshControlDirectory(home, fake as unknown as typeof FS)).toThrow(
       RemoteHostConfigError,
     );
+  });
+
+  it("refuses a symlinked control directory, whose target it does not own", () => {
+    // A real symlink planted before us, pointing at a directory an attacker owns
+    // and has chmod'd 0700. stat() follows the link and reports that innocent
+    // 0700, so a mode check alone passes while every live, authenticated control
+    // socket is created inside the attacker's directory.
+    const home = makeTempDirectory();
+    const attackerDirectory = makeTempDirectory();
+    FS.chmodSync(attackerDirectory, 0o700);
+    FS.symlinkSync(attackerDirectory, Path.join(home, "ssh-control"));
+
+    // The mode check the old code performed would have been satisfied.
+    expect(FS.statSync(Path.join(home, "ssh-control")).mode & 0o077).toBe(0);
+
+    expect(() => resolveSshControlDirectory(home)).toThrow(RemoteHostConfigError);
   });
 });
 

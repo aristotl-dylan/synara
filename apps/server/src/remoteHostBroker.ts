@@ -99,16 +99,28 @@ const defaultRunner: ProcessRunner = (command, args, options) => runProcess(comm
  */
 export function resolveSshControlDirectory(
   synaraHome: string,
-  fs: Pick<typeof FS, "mkdirSync" | "statSync" | "chmodSync"> = FS,
+  fs: Pick<typeof FS, "mkdirSync" | "lstatSync" | "chmodSync"> = FS,
 ): string {
   const directory = Path.join(synaraHome, "ssh-control");
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const stats = fs.statSync(directory);
+  // lstat, never stat: stat follows the link and reports the TARGET's mode, so a
+  // symlink planted here before us — pointing at a directory the attacker owns
+  // and has dutifully chmod'd 0700 — passes the check below while every live,
+  // authenticated control socket is created inside their directory. mkdirSync
+  // does not replace an existing symlink to a directory, so this is the only
+  // place that distinction can be caught.
+  const stats = fs.lstatSync(directory);
+  if (stats.isSymbolicLink()) {
+    throw new RemoteHostConfigError(
+      "controlDirectory",
+      `${directory} is a symbolic link; SSH connection sharing was refused because its target's ownership cannot be trusted.`,
+    );
+  }
   if ((stats.mode & 0o077) !== 0) {
     // Do not silently continue with a permissive directory: fix it, and fail if
     // that is not possible.
     fs.chmodSync(directory, 0o700);
-    if ((fs.statSync(directory).mode & 0o077) !== 0) {
+    if ((fs.lstatSync(directory).mode & 0o077) !== 0) {
       throw new RemoteHostConfigError(
         "controlDirectory",
         `${directory} is accessible to other users; SSH connection sharing was refused.`,

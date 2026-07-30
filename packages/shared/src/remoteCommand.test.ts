@@ -148,6 +148,42 @@ describe("buildRemoteScript", () => {
     expect(existsSync(sentinel)).toBe(false);
   });
 
+  it("refuses to run the session anywhere but the requested cwd", () => {
+    // A missing cwd must abort. An unguarded `cd` leaves the shell in the ssh
+    // login home and execs the agent there — a coding agent with write access
+    // pointed at the wrong directory. Proven by running the real script: the
+    // marker the agent would have written must not exist, and the exit is
+    // non-zero.
+    const directory = mkdtempSync(Path.join(tmpdir(), "synara-cwd-"));
+    const marker = Path.join(directory, "agent-ran");
+    const script = buildRemoteScript({
+      target: {
+        cwd: "/nonexistent/project/directory",
+        args: [marker],
+        versionArgs: [],
+      },
+      defaultBinary: "/usr/bin/touch",
+    });
+    let status = 0;
+    try {
+      execFileSync("/bin/sh", ["-c", script], { encoding: "utf8", stdio: "pipe" });
+    } catch (error) {
+      status = (error as { status: number }).status;
+    }
+    expect(status).not.toBe(0);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("runs the session in the requested cwd when it exists", () => {
+    const directory = mkdtempSync(Path.join(tmpdir(), "synara-cwd-"));
+    const script = buildRemoteScript({
+      target: { cwd: directory, args: ["agent-ran"], versionArgs: [] },
+      defaultBinary: "/usr/bin/touch",
+    });
+    execFileSync("/bin/sh", ["-c", script], { encoding: "utf8" });
+    expect(existsSync(Path.join(directory, "agent-ran"))).toBe(true);
+  });
+
   it("tolerates a missing shell-init file instead of aborting the session", () => {
     const script = buildRemoteScript({
       target: TARGET,
@@ -326,8 +362,41 @@ describe("buildSshArgv", () => {
     expect(args.indexOf("ConnectTimeout=45")).toBeLessThan(args.indexOf("ConnectTimeout=10"));
   });
 
-  it("accepts every option on the allowlist, in each spelling ssh understands", () => {
-    for (const option of ALLOWED_SSH_OPTIONS) {
+  // Written out rather than iterated from ALLOWED_SSH_OPTIONS: a test that loops
+  // over the set it is testing deletes its own assertion when an entry is
+  // removed, so dropping a name from the allowlist would look green. This list
+  // is the independent statement of what the allowlist is supposed to contain.
+  const EXPECTED_ALLOWED_OPTIONS = [
+    "addressfamily",
+    "ciphers",
+    "compression",
+    "connectionattempts",
+    "connecttimeout",
+    "hostkeyalgorithms",
+    "identitiesonly",
+    "identityfile",
+    "ipqos",
+    "kexalgorithms",
+    "macs",
+    "port",
+    "preferredauthentications",
+    "proxyjump",
+    "pubkeyacceptedalgorithms",
+    "pubkeyauthentication",
+    "sendenv",
+    "serveralivecountmax",
+    "serveraliveinterval",
+    "setenv",
+    "tcpkeepalive",
+    "user",
+  ] as const;
+
+  it("allows exactly the options on the expected list and no others", () => {
+    expect([...ALLOWED_SSH_OPTIONS].sort()).toEqual([...EXPECTED_ALLOWED_OPTIONS].sort());
+  });
+
+  it("accepts each expected option in every spelling ssh understands", () => {
+    for (const option of EXPECTED_ALLOWED_OPTIONS) {
       for (const spelling of [
         ["-o", `${option}=x`],
         [`-o${option}=x`],
@@ -336,6 +405,50 @@ describe("buildSshArgv", () => {
       ]) {
         expect(() => validateSshArgs(spelling)).not.toThrow();
       }
+    }
+  });
+
+  // Independent of the allowlist constants for the same reason: these names must
+  // stay refused however the allowlist is edited.
+  it("refuses each dangerous option by name, in four spellings each", () => {
+    for (const option of [
+      "StrictHostKeyChecking",
+      "UserKnownHostsFile",
+      "GlobalKnownHostsFile",
+      "CheckHostIP",
+      "NoHostAuthenticationForLocalhost",
+      "BatchMode",
+      "RequestTTY",
+      "ControlMaster",
+      "ControlPath",
+      "ControlPersist",
+      "PermitLocalCommand",
+      "LocalCommand",
+      "ProxyCommand",
+      "KnownHostsCommand",
+      "Include",
+    ]) {
+      for (const spelling of [
+        ["-o", `${option}=x`],
+        [`-o${option}=x`],
+        ["-o", `${option} x`],
+        ["-o", `${option.toUpperCase()}=x`],
+      ]) {
+        expect(() => validateSshArgs(spelling)).toThrow(RemoteHostConfigError);
+      }
+    }
+  });
+
+  it("refuses a bare positional, which would otherwise hijack the destination", () => {
+    // User args go first, so ssh reads a positional here as THE destination and
+    // demotes the real one to the first word of the remote command. Host-key
+    // verification does not help: it faithfully verifies the attacker's key.
+    for (const args of [
+      ["attacker.example.com"],
+      ["evil.example.com", "-p", "22"],
+      ["-p", "22", "attacker.example.com"],
+    ]) {
+      expect(() => validateSshArgs(args)).toThrow(RemoteHostConfigError);
     }
   });
 
@@ -407,6 +520,17 @@ describe("buildSshArgv", () => {
       // An allowlisted value flag with nothing to consume.
       ["-p"],
       ["-o"],
+      // Bundled short flags, each verified against a real ssh to be honoured.
+      ["-Nf"],
+      ["-fN"],
+      ["-D1080"],
+      ["-L8080:localhost:80"],
+      ["-w0:0"],
+      // -E writes ssh's log where it is told, an arbitrary file clobber.
+      ["-E/tmp/clobber"],
+      ["-E", "/tmp/clobber"],
+      // Runs a command on THIS machine to produce known-hosts material.
+      ["-o", "KnownHostsCommand=/bin/sh -c x"],
       // Repeated and long-form spellings.
       ["-o", "Compression=yes", "-o", "ProxyCommand=printf pwned"],
       ["--config=/dev/null"],
@@ -468,6 +592,45 @@ describe("buildSshArgv", () => {
     });
     expect(args.at(-1)).toBe(`'cd -- '\\''/a b'\\''\nexec x'`);
     expect(args.at(-3)).toBe("'/bin/sh'");
+  });
+
+  it("puts exactly the configured destination in the destination position", () => {
+    // Pins the hijack: whatever sshArgs contains, the argument ssh reads as the
+    // destination is the one from config and nothing else.
+    const { args } = buildSshArgv({
+      config: makeConfig({ sshArgs: ["-p", "2222", "-o", "Compression=yes"] }),
+      remoteArgv: ["/bin/sh", "-c", "true"],
+    });
+    const separator = args.indexOf("--");
+    expect(separator).toBeGreaterThan(-1);
+    expect(args[separator + 1]).toBe("build-box");
+    // Nothing before the separator is a bare positional that ssh could mistake
+    // for a destination.
+    expect(args.slice(0, separator).filter((arg) => arg === "build-box")).toEqual([]);
+  });
+
+  it("ends ssh's option parsing before the destination", () => {
+    const { args } = buildSshArgv({ config: makeConfig(), remoteArgv: [] });
+    expect(args[args.indexOf("--") + 1]).toBe("build-box");
+  });
+
+  it("proves with a real ssh that `--` stops a dashed destination being read as a flag", () => {
+    // The comment this replaces claimed ssh has no `--` marker. It does. Without
+    // it a -oProxyCommand destination executes; with it ssh refuses the name.
+    const ssh = ["/usr/bin/ssh", "/bin/ssh"].find((path) => existsSync(path));
+    if (ssh === undefined) return;
+    const sentinel = Path.join(mkdtempSync(Path.join(tmpdir(), "synara-ssh-")), "pwned");
+    let output = "";
+    try {
+      output = execFileSync(ssh, ["-G", "--", `-oProxyCommand=touch ${sentinel}`], {
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+    } catch (error) {
+      output = String((error as { stderr?: string }).stderr ?? "");
+    }
+    expect(existsSync(sentinel)).toBe(false);
+    expect(output).not.toContain(`proxycommand touch ${sentinel}`);
   });
 
   it("uses the configured ssh binary", () => {
