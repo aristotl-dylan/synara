@@ -44,6 +44,7 @@ import {
 } from "./wsTransport";
 import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
 import {
+  localThreadDetailResumeCursors,
   resetThreadDetailResumeCursorsForTests,
   threadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
@@ -1033,6 +1034,31 @@ describe("WsTransport", () => {
     expect(resolved.searchParams.get(WS_COMPATIBILITY_QUERY.serverInstanceId)).toBe(
       "server-instance",
     );
+  });
+
+  it("binds a transport constructed without an environmentId to the local cursor scope", async () => {
+    // The single-local-server regression bar, pinned directly: an env-unaware
+    // caller's cursor must be the one a default-constructed transport resumes
+    // from. Previously only multi-environment tests covered this keying, so a
+    // regression confined to the default path would not have been caught.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const thread = ThreadId.makeUnsafe("thread-default-env");
+    localThreadDetailResumeCursors().set(thread, 99);
+
+    const transport = new WsTransport({ url: "ws://localhost:3020" });
+    const internals = transport as unknown as {
+      resumeCursors: { get(threadId: ThreadId): number | undefined };
+    };
+    await waitForSockets(1);
+
+    expect(transport.environmentId).toBe(LOCAL_ENVIRONMENT_ID);
+    expect(internals.resumeCursors.get(thread)).toBe(99);
+    expect(internals.resumeCursors).toBe(threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID));
+
+    await transport.dispose();
+    resetThreadDetailResumeCursorsForTests();
   });
 
   it("scopes resume-cursor reset to the transport's own environment", async () => {

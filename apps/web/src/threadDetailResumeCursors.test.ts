@@ -23,6 +23,31 @@ describe("threadDetailResumeCursors", () => {
     resetThreadDetailResumeCursorsForTests();
   });
 
+  // The single-local-server case is the regression bar, and it was previously
+  // only pinned indirectly: a mutation collapsing every environment into one
+  // global map failed only multi-environment tests, so a regression affecting
+  // just the default path would have gone unnoticed. These pin it directly.
+  it("resolves the env-unaware default to the same scope as the local environment", () => {
+    expect(localThreadDetailResumeCursors()).toBe(threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID));
+  });
+
+  it("shares cursor state between env-unaware and explicitly-local callers", () => {
+    const thread = threadId("thread-default-path");
+
+    // An env-unaware caller writes...
+    localThreadDetailResumeCursors().set(thread, 21);
+    // ...and a caller naming the local environment explicitly must observe it.
+    expect(threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID).get(thread)).toBe(21);
+    expect(threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID).buildSubscribeInput(thread)).toEqual({
+      threadId: thread,
+      afterSequence: 21,
+    });
+
+    // And the reverse direction, so neither is a one-way alias.
+    threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID).set(thread, 34);
+    expect(localThreadDetailResumeCursors().get(thread)).toBe(34);
+  });
+
   it("subscribes without a cursor until cached detail exists, then resumes from it", () => {
     const cursors = localThreadDetailResumeCursors();
     const thread = threadId("thread-1");

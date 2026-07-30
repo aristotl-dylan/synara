@@ -1365,4 +1365,30 @@ describe("wsEnvironmentRegistry", () => {
     await removeWsEnvironmentClient(REMOTE_ENVIRONMENT_ID);
     expect(listener).toHaveBeenCalled();
   });
+
+  it("resolves the env-unaware default to the local environment entry", async () => {
+    // Pins the single-local-server path directly: an env-unaware subscription
+    // and an explicitly-local one must reach the same client and the same
+    // channel registry, not merely "both happen to work".
+    const { ensureWsEnvironmentClient, localWsEnvironmentClient, onServerWelcome } =
+      await import("./wsEnvironmentRegistry");
+
+    const viaDefault = localWsEnvironmentClient();
+    const viaExplicit = ensureWsEnvironmentClient({ environmentId: LOCAL_ENVIRONMENT_ID });
+    expect(viaExplicit).toBe(viaDefault);
+
+    const defaultListener = vi.fn();
+    const explicitListener = vi.fn();
+    onServerWelcome(defaultListener);
+    onServerWelcome(explicitListener, { environmentId: LOCAL_ENVIRONMENT_ID });
+
+    emitPush(WS_CHANNELS.serverWelcome, {
+      cwd: "/tmp",
+      homeDir: "/home/tester",
+      projectName: "synara",
+    });
+
+    expect(defaultListener).toHaveBeenCalledTimes(1);
+    expect(explicitListener).toHaveBeenCalledTimes(1);
+  });
 });
