@@ -54,12 +54,14 @@ import {
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
 
+import { classifyBuildSkew, isReadOnlySafeWsMethod } from "@synara/shared/buildSkew";
+
 import { APP_VERSION } from "./branding";
 import {
   buildThreadSubscribeInput,
   resetThreadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
-import type { WsTransportState } from "./wsTransportEvents";
+import type { WsBuildSkewState, WsTransportState } from "./wsTransportEvents";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
 
@@ -70,6 +72,18 @@ type RpcClientInstance =
 class WsTransportRpcError extends Data.TaggedError("WsTransportRpcError")<{
   readonly message: string;
   readonly cause?: unknown;
+}> {}
+
+/**
+ * Thrown instead of issuing a write on a version-skewed connection. Distinct
+ * from a transport failure so UI can present the degraded state rather than a
+ * retryable network error.
+ */
+export class WsBuildSkewReadOnlyError extends Data.TaggedError("WsBuildSkewReadOnlyError")<{
+  readonly message: string;
+  readonly method: string;
+  readonly clientBuild: string;
+  readonly serverBuild: string;
 }> {}
 
 export class WsTransportRequestInterruptedError extends Data.TaggedError(
@@ -539,6 +553,7 @@ export class WsTransport {
   private readonly listeners = new Map<string, Set<(message: WsPush) => void>>();
   private readonly stateListeners = new Set<(state: WsTransportState) => void>();
   private readonly compatibilityListeners = new Set<(issue: WsCompatibilityError | null) => void>();
+  private readonly buildSkewListeners = new Set<(skew: WsBuildSkewState | null) => void>();
   private readonly threadStreamFailureListeners = new Set<
     (failure: WsThreadStreamFailure) => void
   >();
@@ -576,6 +591,7 @@ export class WsTransport {
   // reconnects still reset replayed push state even after the negotiation
   // cache was cleared by an intervening failure.
   private lastServerInstanceId: string | null = null;
+  private buildSkew: WsBuildSkewState | null = null;
 
   constructor(url?: string) {
     this.explicitUrl = url ?? null;
@@ -588,6 +604,18 @@ export class WsTransport {
     options?: WsRequestOptions,
   ): Promise<T> {
     if (this.disposed) throw new Error("Transport disposed");
+    // A version-skewed session is degraded, not dead: reads keep working and
+    // every write is refused here, before it can reach a server on a different
+    // build. Checked on the request path so a skew adopted mid-session (after a
+    // reconnect to an upgraded server) takes effect immediately.
+    if (this.buildSkew && !isReadOnlySafeWsMethod(method)) {
+      throw new WsBuildSkewReadOnlyError({
+        message: `${method} is unavailable while this client (${this.buildSkew.clientBuild}) and server (${this.buildSkew.serverBuild}) run mismatched builds.`,
+        method,
+        clientBuild: this.buildSkew.clientBuild,
+        serverBuild: this.buildSkew.serverBuild,
+      });
+    }
     const requestOptions: WsRequestOptions =
       options?.timeoutMs === undefined ? { ...options, timeoutMs: REQUEST_TIMEOUT_MS } : options;
     const abortScope = makeRequestAbortScope(requestOptions);
@@ -830,6 +858,43 @@ export class WsTransport {
     }
   }
 
+  /**
+   * Version handshake. A build mismatch degrades the session to read-only
+   * rather than hard-failing: cached state stays readable and every write is
+   * refused client-side so a skewed client can never write cross-version.
+   */
+  private adoptBuildSkew(serverBuild: string): void {
+    const next =
+      classifyBuildSkew({ clientBuild: APP_VERSION, serverBuild }) === "compatible"
+        ? null
+        : ({ clientBuild: APP_VERSION, serverBuild } satisfies WsBuildSkewState);
+    if (this.buildSkew?.serverBuild === next?.serverBuild) return;
+    this.buildSkew = next;
+    for (const listener of this.buildSkewListeners) {
+      try {
+        listener(next);
+      } catch {
+        // Skew UI listeners must not break transport setup.
+      }
+    }
+  }
+
+  /** Current degraded read-only state, or null when builds match. */
+  getBuildSkew(): WsBuildSkewState | null {
+    return this.buildSkew;
+  }
+
+  onBuildSkew(
+    listener: (skew: WsBuildSkewState | null) => void,
+    options?: { readonly replayCurrent?: boolean },
+  ): () => void {
+    this.buildSkewListeners.add(listener);
+    if (options?.replayCurrent) listener(this.buildSkew);
+    return () => {
+      this.buildSkewListeners.delete(listener);
+    };
+  }
+
   private adoptNegotiation(compatibility: WsBootstrapNegotiateResult): void {
     if (serverIdentityChanged(this.lastServerInstanceId, compatibility.serverInstanceId)) {
       this.latestPushByChannel.clear();
@@ -847,6 +912,7 @@ export class WsTransport {
     this.lastServerInstanceId = compatibility.serverInstanceId;
     this.compatibility = compatibility;
     this.setCompatibilityIssue(null);
+    this.adoptBuildSkew(compatibility.serverBuild);
   }
 
   /**

@@ -18,9 +18,12 @@ import {
 
 export type WsSessionRole = "owner" | "client";
 
+/** Conservative default: an unresolved connection session is never an owner. */
+export const DEFAULT_WS_SESSION_ROLE: WsSessionRole = "client";
+
 export const CurrentWsSessionRole = ServiceMap.Reference<WsSessionRole>(
   "synara/ws/CurrentSessionRole",
-  { defaultValue: () => "client" },
+  { defaultValue: () => DEFAULT_WS_SESSION_ROLE },
 );
 
 export interface WsConnectionSession {

@@ -19,9 +19,7 @@ import {
 import {
   DEFAULT_PORT,
   deriveServerPaths,
-  normalizeHttpsPublicOrigin,
   preparePrivateServerPaths,
-  remoteAccessPolicyError,
   resolveCanonicalWorkspaceRoots,
   resolveStaticDir,
   ServerConfig,
@@ -29,6 +27,7 @@ import {
   type ServerConfigShape,
 } from "./config";
 import { fixPath, resolveBaseDir } from "./os-jank";
+import { normalizeHttpsPublicOrigin, remoteAccessPolicyError } from "./remoteAccessPolicy";
 import { Open } from "./open";
 import { ServerAuth } from "./auth/Services/ServerAuth";
 import * as SqlitePersistence from "./persistence/Layers/Sqlite";

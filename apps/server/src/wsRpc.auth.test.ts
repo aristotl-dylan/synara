@@ -3,53 +3,93 @@ import { Effect } from "effect";
 import { vi } from "vitest";
 
 import { AuthError } from "./auth/Services/ServerAuth";
-import { authenticateRpcWebSocketUpgrade, canManageExternalMcp } from "./wsRpc";
+import type { AuthenticatedDeployment } from "./remoteAccessPolicy";
+import { authenticateRpcWebSocketUpgrade } from "./wsRpc";
 
-it("reserves external MCP management for owner sessions", () => {
-  assert.isTrue(canManageExternalMcp("owner"));
-  assert.isFalse(canManageExternalMcp("client"));
-});
+const failingUpgrade = () =>
+  vi.fn(() =>
+    Effect.fail(
+      new AuthError({
+        message: "Authentication required.",
+        status: 401,
+      }),
+    ),
+  );
 
-it.effect("rejects an unauthorized websocket upgrade on a non-loopback bind", () =>
-  Effect.gen(function* () {
-    const authenticateWebSocketUpgrade = vi.fn(() =>
-      Effect.fail(
-        new AuthError({
-          message: "Authentication required.",
-          status: 401,
-        }),
-      ),
-    );
+const remoteDeployments: ReadonlyArray<readonly [string, AuthenticatedDeployment]> = [
+  [
+    "a wildcard bind with a token",
+    {
+      host: "0.0.0.0",
+      authToken: "remote-secret",
+      publicUrl: undefined,
+      allowInsecureRemote: false,
+    },
+  ],
+  [
+    "a wildcard bind with NO token",
+    { host: "0.0.0.0", authToken: undefined, publicUrl: undefined, allowInsecureRemote: false },
+  ],
+  [
+    "a LAN bind with NO token",
+    {
+      host: "192.168.1.50",
+      authToken: undefined,
+      publicUrl: undefined,
+      allowInsecureRemote: false,
+    },
+  ],
+  [
+    "a published loopback bind with NO token",
+    {
+      host: "127.0.0.1",
+      authToken: undefined,
+      publicUrl: new URL("https://synara.example.test/"),
+      allowInsecureRemote: false,
+    },
+  ],
+  [
+    "an insecure-remote loopback bind with NO token",
+    { host: "127.0.0.1", authToken: undefined, publicUrl: undefined, allowInsecureRemote: true },
+  ],
+];
 
-    const error = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined },
-      legacyToken: null,
-      request: {
-        headers: {},
-        cookies: {},
-        url: new URL("http://192.168.1.50:3773/ws"),
-      },
-      serverAuth: { authenticateWebSocketUpgrade },
-    }).pipe(Effect.flip);
+// Auth enforcement must follow the deployment's reachability, never the
+// presence of an auth token: dropping the token from any remote-reachable
+// config must still demand a real session credential.
+for (const [label, config] of remoteDeployments) {
+  it.effect(`requires an authenticated session on ${label}`, () =>
+    Effect.gen(function* () {
+      const authenticateWebSocketUpgrade = failingUpgrade();
 
-    assert.equal(error.status, 401);
-    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
-  }),
-);
+      const error = yield* authenticateRpcWebSocketUpgrade({
+        config,
+        legacyToken: config.authToken ?? null,
+        request: {
+          headers: {},
+          cookies: {},
+          url: new URL("http://192.168.1.50:3773/ws"),
+        },
+        serverAuth: { authenticateWebSocketUpgrade },
+      }).pipe(Effect.flip);
+
+      assert.equal(error.status, 401);
+      assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
+    }),
+  );
+}
 
 it.effect("does not accept a legacy query token on a non-loopback bind", () =>
   Effect.gen(function* () {
-    const authenticateWebSocketUpgrade = vi.fn(() =>
-      Effect.fail(
-        new AuthError({
-          message: "Authentication required.",
-          status: 401,
-        }),
-      ),
-    );
+    const authenticateWebSocketUpgrade = failingUpgrade();
 
     const error = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "192.168.1.50", authToken: "remote-secret", publicUrl: undefined },
+      config: {
+        host: "192.168.1.50",
+        authToken: "remote-secret",
+        publicUrl: undefined,
+        allowInsecureRemote: false,
+      },
       legacyToken: "remote-secret",
       request: {
         headers: {},
@@ -75,7 +115,12 @@ it.effect("accepts an authenticated session on a non-loopback bind", () =>
     const authenticateWebSocketUpgrade = vi.fn(() => Effect.succeed(authenticatedSession));
 
     const session = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined },
+      config: {
+        host: "0.0.0.0",
+        authToken: "remote-secret",
+        publicUrl: undefined,
+        allowInsecureRemote: false,
+      },
       legacyToken: "remote-secret",
       request: {
         headers: {},
@@ -97,12 +142,42 @@ it.effect("preserves the legacy query token for loopback desktop sessions", () =
     );
 
     const session = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "127.0.0.1", authToken: "desktop-secret", publicUrl: undefined },
+      config: {
+        host: "127.0.0.1",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        allowInsecureRemote: false,
+      },
       legacyToken: "desktop-secret",
       request: {
         headers: {},
         cookies: {},
         url: new URL("http://127.0.0.1:3773/ws?token=desktop-secret"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    });
+
+    assert.equal(session, null);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 0);
+  }),
+);
+
+it.effect("keeps a loopback bind with no configured token on the implicit-owner path", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = failingUpgrade();
+
+    const session = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "127.0.0.1",
+        authToken: undefined,
+        publicUrl: undefined,
+        allowInsecureRemote: false,
+      },
+      legacyToken: null,
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://127.0.0.1:3773/ws"),
       },
       serverAuth: { authenticateWebSocketUpgrade },
     });
@@ -129,6 +204,7 @@ it.effect(
           host: "127.0.0.1",
           authToken: "proxy-secret",
           publicUrl: new URL("https://synara.example.test/"),
+          allowInsecureRemote: false,
         },
         legacyToken: "proxy-secret",
         request: {

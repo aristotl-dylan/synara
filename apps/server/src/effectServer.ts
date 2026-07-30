@@ -15,7 +15,8 @@ import {
   makePersistedServerRuntimeState,
   persistServerRuntimeState,
 } from "./serverRuntimeState";
-import { remoteAccessPolicyError, ServerConfig } from "./config";
+import { ServerConfig } from "./config";
+import { remoteAccessPolicyError } from "./remoteAccessPolicy";
 import { resolveListeningPort } from "./startupAccess";
 import { patchBunWebSocketCloseEventCompatibility } from "./bunWebSocketCompatibility";
 import { makeEffectHttpRouteLayer } from "./http";
