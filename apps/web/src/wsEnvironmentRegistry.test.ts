@@ -1391,4 +1391,26 @@ describe("wsEnvironmentRegistry", () => {
     expect(defaultListener).toHaveBeenCalledTimes(1);
     expect(explicitListener).toHaveBeenCalledTimes(1);
   });
+
+  it("drops registry-change subscribers on reset instead of notifying them", async () => {
+    // Regression: reset notified listeners while disposing. A subscriber from
+    // the outgoing generation (a React effect whose unmount had not run yet)
+    // would re-attach against clients already being torn down, leaving stale
+    // stream wiring that made the next mount's snapshots never reach the
+    // store. The browser suite saw this as tests hanging on UI that could not
+    // render. Reset is a full teardown: subscribers go with it.
+    const { ensureWsEnvironmentClient, onWsEnvironmentRegistryChange, resetWsEnvironmentRegistry } =
+      await import("./wsEnvironmentRegistry");
+
+    ensureWsEnvironmentClient({ environmentId: REMOTE_ENVIRONMENT_ID, url: "wss://e/" });
+    const listener = vi.fn();
+    onWsEnvironmentRegistryChange(listener);
+
+    await resetWsEnvironmentRegistry();
+    expect(listener).not.toHaveBeenCalled();
+
+    // And the subscription is gone, not merely quiet during the reset.
+    ensureWsEnvironmentClient({ environmentId: REMOTE_ENVIRONMENT_ID, url: "wss://e/" });
+    expect(listener).not.toHaveBeenCalled();
+  });
 });

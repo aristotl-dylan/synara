@@ -112,7 +112,10 @@ export async function resetWsEnvironmentRegistry(): Promise<void> {
   for (const client of clients) {
     discardEnvironmentResumeCursors(client.environmentId);
   }
-  registryListeners.emit();
+  // Every registry-change subscriber is itself torn down by this reset, so
+  // notifying here would only let a listener from the outgoing generation
+  // re-attach against clients that are already being disposed.
+  registryListeners.clear();
   await Promise.all(clients.map((client) => client.dispose()));
 }
 

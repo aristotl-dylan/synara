@@ -445,6 +445,13 @@ describe("EventRouter scoped orchestration sync", () => {
       projectDraftThreadIdByProjectId: {},
     });
     useStore.setState({
+      // The snapshot fence must fall with the state it guards. Left behind, it
+      // carries a high-water mark from an earlier file into this one and every
+      // fixture snapshot here is rejected as stale, so the store never
+      // hydrates and the assertions below wait on UI that cannot appear.
+      shellSnapshotSequence: 0,
+      shellSnapshotSequenceByEnvironmentId: {},
+      environmentIdByThreadId: {},
       projects: [],
       threadIds: [],
       threadShellById: {},
