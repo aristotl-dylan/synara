@@ -264,6 +264,10 @@
       "types": "./src/remoteCommand.ts",
       "import": "./src/remoteCommand.ts"
     },
+    "./tailscaleServe": {
+      "types": "./src/tailscaleServe.ts",
+      "import": "./src/tailscaleServe.ts"
+    },
     "./remoteHostProbe": {
       "types": "./src/remoteHostProbe.ts",
       "import": "./src/remoteHostProbe.ts"

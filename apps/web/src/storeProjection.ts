@@ -1083,6 +1083,43 @@ function nextEnvironmentIdByThreadId(
   return recordsShallowEqual(previous, next) ? previous : next;
 }
 
+/**
+ * Ownership map after a snapshot, for projects. Same rule as threads: this
+ * environment claims what it reported, drops what it no longer reports, and
+ * never touches another environment's claims.
+ */
+function nextEnvironmentIdByProjectId(
+  state: AppState,
+  environmentId: EnvironmentId,
+  ownedProjectIds: ReadonlySet<string>,
+  survivingProjectIds: ReadonlySet<string>,
+): Record<string, string> {
+  const previous = state.environmentIdByProjectId ?? {};
+  const next: Record<string, string> = {};
+  for (const [projectId, owner] of Object.entries(previous)) {
+    if (survivingProjectIds.has(projectId) && owner !== environmentId) {
+      next[projectId] = owner;
+    }
+  }
+  if (environmentId !== LOCAL_ENVIRONMENT_ID) {
+    for (const projectId of ownedProjectIds) {
+      next[projectId] = environmentId;
+    }
+  }
+  return recordsShallowEqual(previous, next) ? previous : next;
+}
+
+/** Projects the store holds for environments other than `environmentId`. */
+function projectsOutsideEnvironment(
+  state: AppState,
+  environmentId: EnvironmentId,
+): readonly Project[] {
+  const ownerByProjectId = state.environmentIdByProjectId ?? {};
+  return state.projects.filter(
+    (project) => (ownerByProjectId[project.id] ?? LOCAL_ENVIRONMENT_ID) !== environmentId,
+  );
+}
+
 /** Threads the store holds for environments other than `environmentId`. */
 function threadIdsOutsideEnvironment(
   state: AppState,
@@ -1349,7 +1386,23 @@ export function syncServerShellSnapshot(
     (project) => deletedProjectIdsById[project.id] === undefined,
   );
   const spaces = mapSpaces(snapshot.spaces ?? [], state.spaces ?? []);
-  const projects = mapProjects(snapshotProjects, state.projects);
+  // Projects are widened the same way threads are. Without this, a remote
+  // snapshot would delete the local server's projects from the picker — and the
+  // "Start in" picker would then offer a remote host's directories under the
+  // local environment, which is the same wrong-machine class as the dispatch gap.
+  const foreignProjects = projectsOutsideEnvironment(state, environmentId);
+  const ownedProjectIds = new Set(snapshotProjects.map((project) => project.id));
+  const mappedOwnProjects = mapProjects(snapshotProjects, state.projects);
+  // Already-normalized rows are appended rather than re-mapped: `mapProjects`
+  // takes the server's wire shape, and a foreign project's server is not the one
+  // that sent this snapshot.
+  const survivingForeignProjects = foreignProjects.filter(
+    (project) => !ownedProjectIds.has(project.id),
+  );
+  const projects =
+    survivingForeignProjects.length === 0
+      ? mappedOwnProjects
+      : [...mappedOwnProjects, ...survivingForeignProjects];
   const ownedThreadIds = new Set(snapshotThreads.map((thread) => thread.id));
   const nextThreadIds = new Set([...ownedThreadIds, ...foreignThreadIds]);
   // The retains below prune detail slices down to the surviving threads; any
@@ -1367,6 +1420,12 @@ export function syncServerShellSnapshot(
       environmentId,
       ownedThreadIds,
       nextThreadIds,
+    ),
+    environmentIdByProjectId: nextEnvironmentIdByProjectId(
+      state,
+      environmentId,
+      ownedProjectIds,
+      new Set(projects.map((project) => project.id)),
     ),
     messageIdsByThreadId: retainThreadScopedRecord(state.messageIdsByThreadId, nextThreadIds),
     messageByThreadId: retainThreadScopedRecord(state.messageByThreadId, nextThreadIds),

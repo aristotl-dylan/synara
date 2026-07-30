@@ -48,6 +48,14 @@ export interface AppState {
    * belonging to the environment that sent it.
    */
   environmentIdByThreadId?: Record<ThreadId, string>;
+  /**
+   * Owning environment per project, on the same "absent means local" rule.
+   *
+   * The composer's "Start in" picker reads this: a project only appears under
+   * the environment that actually reported it, so picking one cannot start a
+   * thread in a directory the chosen host does not have.
+   */
+  environmentIdByProjectId?: Record<string, string>;
   spaces: Space[];
   projects: Project[];
   sidebarThreadSummaryById: Record<string, SidebarThreadSummary>;
@@ -105,6 +113,7 @@ export const initialState: AppState = {
   shellSnapshotSequence: 0,
   shellSnapshotSequenceByEnvironmentId: {},
   environmentIdByThreadId: {},
+  environmentIdByProjectId: {},
   spaces: [],
   projects: [],
   sidebarThreadSummaryById: {},

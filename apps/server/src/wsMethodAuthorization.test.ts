@@ -31,6 +31,7 @@ describe("owner-only enforcement", () => {
         WS_METHODS.serverUpsertKeybinding,
         WS_METHODS.serverStopLocalServer,
         WS_METHODS.serverProbeRemoteHost,
+        WS_METHODS.serverGetPhoneReachability,
       ].toSorted(),
     );
   });
@@ -44,6 +45,24 @@ describe("owner-only enforcement", () => {
       ).not.toBeNull();
       expect(
         authorizeWsMethod({ method: WS_METHODS.serverProbeRemoteHost, role: "owner", config }),
+      ).toBeNull();
+    }
+  });
+
+  it("keeps phone-reachability discovery owner-only on every deployment shape", () => {
+    // It reports this machine's tailnet name and how it is exposed — network
+    // topology of the operator's host — and exists only to build a pairing QR,
+    // which only an owner may issue a credential for anyway.
+    for (const config of [loopback, remote, published]) {
+      expect(
+        authorizeWsMethod({
+          method: WS_METHODS.serverGetPhoneReachability,
+          role: "client",
+          config,
+        }),
+      ).not.toBeNull();
+      expect(
+        authorizeWsMethod({ method: WS_METHODS.serverGetPhoneReachability, role: "owner", config }),
       ).toBeNull();
     }
   });
