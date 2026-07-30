@@ -2,6 +2,7 @@
 // Purpose: Exercises snapshot normalization and normalized projection ownership.
 
 import {
+  EnvironmentId,
   EventId,
   MessageId,
   ProjectId,
@@ -29,6 +30,7 @@ import {
 import {
   localThreadDetailResumeCursors,
   resetThreadDetailResumeCursorsForTests,
+  threadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
 import type { AppState } from "./storeState";
 import { getThreadFromState } from "./threadDerivation";
@@ -2155,5 +2157,139 @@ describe("resume cursor lifecycle in projection transitions", () => {
     // may vouch for detail that was never stored.
     expect(next.threadDetailSyncById?.[threadId]).toBeUndefined();
     expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
+  });
+});
+
+describe("multi-environment shell aggregation", () => {
+  const localThreadId = ThreadId.makeUnsafe("thread-local");
+  const remoteThreadId = ThreadId.makeUnsafe("thread-remote");
+  const remoteEnvironmentId = EnvironmentId.makeUnsafe("11111111-1111-4111-8111-111111111111");
+
+  const shellThread = (id: ThreadId, title: string) => ({
+    id,
+    projectId: ProjectId.makeUnsafe("project-1"),
+    title,
+    modelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    interactionMode: DEFAULT_INTERACTION_MODE,
+    envMode: "local" as const,
+    branch: null,
+    worktreePath: null,
+    forkSourceThreadId: null,
+    sidechatSourceThreadId: null,
+    latestTurn: null,
+    createdAt: "2026-02-27T00:00:00.000Z",
+    updatedAt: "2026-02-27T00:00:30.000Z",
+    handoff: null,
+    session: null,
+  });
+
+  // A store with no threads yet; these cases build their own state from snapshots.
+  const emptyState = (): AppState => ({
+    spaces: [],
+    projects: [],
+    sidebarThreadSummaryById: {},
+    threadsHydrated: false,
+    threadIds: [],
+    shellSnapshotSequence: 0,
+    shellSnapshotSequenceByEnvironmentId: {},
+    environmentIdByThreadId: {},
+  });
+
+  beforeEach(() => {
+    resetThreadDetailResumeCursorsForTests();
+  });
+
+  it("keeps both environments' threads when each emits the same snapshot sequence", () => {
+    // Two servers both starting at sequence 1 is the normal case: their
+    // sequences are unrelated autoincrement counters. A shared fence would make
+    // the second look stale, and a shared prune would delete the first's rows.
+    const localSnapshot = {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local thread")),
+      snapshotSequence: 1,
+    };
+    const remoteSnapshot = {
+      ...makeShellSnapshot(shellThread(remoteThreadId, "Remote thread")),
+      snapshotSequence: 1,
+    };
+
+    const afterLocal = syncServerShellSnapshot(emptyState(), localSnapshot);
+    const afterRemote = syncServerShellSnapshot(afterLocal, remoteSnapshot, remoteEnvironmentId);
+
+    expect(afterRemote.threadIds).toContain(localThreadId);
+    expect(afterRemote.threadIds).toContain(remoteThreadId);
+    expect(afterRemote.environmentIdByThreadId?.[remoteThreadId]).toBe(remoteEnvironmentId);
+    // Local threads stay unmapped so the single-server store keeps an empty record.
+    expect(afterRemote.environmentIdByThreadId?.[localThreadId]).toBeUndefined();
+  });
+
+  it("does not let one environment's snapshot prune another's threads", () => {
+    const afterLocal = syncServerShellSnapshot(
+      emptyState(),
+      makeShellSnapshot(shellThread(localThreadId, "Local thread")),
+    );
+    const afterRemote = syncServerShellSnapshot(
+      afterLocal,
+      makeShellSnapshot(shellThread(remoteThreadId, "Remote thread")),
+      remoteEnvironmentId,
+    );
+
+    // A later local snapshot that no longer lists the remote thread must not
+    // remove it: the local server has no authority over the remote's rows.
+    const afterLocalResync = syncServerShellSnapshot(afterRemote, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local thread renamed")),
+      snapshotSequence: 9,
+    });
+
+    expect(afterLocalResync.threadIds).toContain(remoteThreadId);
+    expect(afterLocalResync.threadShellById?.[remoteThreadId]?.title).toBe("Remote thread");
+  });
+
+  it("fences each environment against its own sequence space only", () => {
+    const afterRemoteHigh = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+
+    // Sequence 3 is far below the remote's 500 but is the local server's first
+    // snapshot, so it must be applied rather than rejected as stale.
+    const afterLocalLow = syncServerShellSnapshot(afterRemoteHigh, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 3,
+    });
+
+    expect(afterLocalLow.threadIds).toContain(localThreadId);
+    expect(afterLocalLow.shellSnapshotSequenceByEnvironmentId?.[remoteEnvironmentId]).toBe(500);
+  });
+
+  it("still rejects a genuinely stale snapshot within one environment", () => {
+    const hydrated = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Fresh")), snapshotSequence: 20 },
+      remoteEnvironmentId,
+    );
+    const stale = syncServerShellSnapshot(
+      hydrated,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Stale")), snapshotSequence: 5 },
+      remoteEnvironmentId,
+    );
+
+    expect(stale).toBe(hydrated);
+  });
+
+  it("prunes only its own environment's resume cursors", () => {
+    threadDetailResumeCursors(remoteEnvironmentId).set(remoteThreadId, 77);
+    localThreadDetailResumeCursors().set(localThreadId, 42);
+
+    // A local snapshot that does not list either thread prunes the local cursor
+    // but must leave the remote environment's cursor space untouched.
+    syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(ThreadId.makeUnsafe("thread-other"), "Other")),
+      snapshotSequence: 30,
+    });
+
+    expect(localThreadDetailResumeCursors().has(localThreadId)).toBe(false);
+    expect(threadDetailResumeCursors(remoteEnvironmentId).get(remoteThreadId)).toBe(77);
   });
 });

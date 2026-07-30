@@ -50,6 +50,9 @@ interface MockTransportState {
 }
 
 const mockTransportsByEnvironmentId = new Map<string, MockTransportState>();
+// Lets a test drive one environment's transport into "disposed" to exercise the
+// registry's replacement path.
+const mockTransportStateByEnvironmentId = new Map<string, "open" | "disposed">();
 
 function mockTransportFor(environmentId = "local"): MockTransportState {
   const state = mockTransportsByEnvironmentId.get(environmentId);
@@ -123,7 +126,7 @@ vi.mock("./wsTransport", () => {
         return this.state.latestPushByChannel.get(channel) ?? null;
       }
       getState() {
-        return "open" as const;
+        return mockTransportStateByEnvironmentId.get(this.state.environmentId) ?? "open";
       }
     },
   };
@@ -180,6 +183,7 @@ beforeEach(() => {
   showContextMenuFallbackMock.mockReset();
   subscribeMock.mockClear();
   mockTransportsByEnvironmentId.clear();
+  mockTransportStateByEnvironmentId.clear();
   nextPushSequence = 1;
   Reflect.deleteProperty(getWindowForTest(), "desktopBridge");
 });
@@ -1244,5 +1248,121 @@ describe("wsEnvironmentRegistry", () => {
     const second = localWsEnvironmentClient();
 
     expect(second).not.toBe(first);
+  });
+
+  it("sends every HTTP-backed server method to the environment's own host", async () => {
+    // A remote client resolving HTTP through the page's ambient WS URL would
+    // post its payload — session credentials, recorded audio — to the LOCAL
+    // server. Every HTTP-backed route must address its own environment.
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ authenticated: false, revoked: true, text: "hi" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { ensureWsEnvironmentClient } = await import("./wsEnvironmentRegistry");
+
+    const remote = ensureWsEnvironmentClient({
+      environmentId: REMOTE_ENVIRONMENT_ID,
+      url: "wss://b.example/",
+    });
+
+    await remote.api.server.getAuthSession();
+    await remote.api.server.bootstrapAuth({ credential: "TOKEN" });
+    await remote.api.server.logoutAuthSession().catch(() => undefined);
+    await remote.api.server
+      .transcribeVoice({
+        provider: "codex",
+        cwd: "/tmp",
+        mimeType: "audio/webm",
+        sampleRateHz: 48_000,
+        durationMs: 1_000,
+        audioBase64: "",
+      })
+      .catch(() => undefined);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(4);
+    for (const [url] of fetchMock.mock.calls) {
+      expect(String(url)).toMatch(/^https:\/\/b\.example\//);
+    }
+  });
+
+  it("leaves the local environment's HTTP requests on their existing relative paths", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ authenticated: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { localWsEnvironmentClient } = await import("./wsEnvironmentRegistry");
+
+    await localWsEnvironmentClient().api.server.getAuthSession();
+
+    // Regression bar: the single-local-server case is byte-identical.
+    expect(fetchMock).toHaveBeenCalledWith("/api/auth/session", expect.anything());
+  });
+
+  it("discards an environment's resume cursors when it is removed", async () => {
+    const { ensureWsEnvironmentClient, removeWsEnvironmentClient } =
+      await import("./wsEnvironmentRegistry");
+    const { threadDetailResumeCursors, resetThreadDetailResumeCursorsForTests } =
+      await import("./threadDetailResumeCursors");
+    resetThreadDetailResumeCursorsForTests();
+
+    const threadId = ThreadId.makeUnsafe("thread-1");
+    ensureWsEnvironmentClient({ environmentId: REMOTE_ENVIRONMENT_ID, url: "wss://e/" });
+    threadDetailResumeCursors(REMOTE_ENVIRONMENT_ID).set(threadId, 100);
+
+    await removeWsEnvironmentClient(REMOTE_ENVIRONMENT_ID);
+    // Re-registered as a different server instance whose journal is unrelated:
+    // the fresh transport has never seen the old instance id, so it cannot
+    // detect the change. The cursor must already be gone.
+    ensureWsEnvironmentClient({ environmentId: REMOTE_ENVIRONMENT_ID, url: "wss://e/" });
+
+    expect(threadDetailResumeCursors(REMOTE_ENVIRONMENT_ID).buildSubscribeInput(threadId)).toEqual({
+      threadId,
+    });
+  });
+
+  it("discards resume cursors when a disposed entry is replaced automatically", async () => {
+    const { ensureWsEnvironmentClient } = await import("./wsEnvironmentRegistry");
+    const { threadDetailResumeCursors, resetThreadDetailResumeCursorsForTests } =
+      await import("./threadDetailResumeCursors");
+    resetThreadDetailResumeCursorsForTests();
+
+    const threadId = ThreadId.makeUnsafe("thread-2");
+    const client = ensureWsEnvironmentClient({
+      environmentId: REMOTE_ENVIRONMENT_ID,
+      url: "wss://e/",
+    });
+    threadDetailResumeCursors(REMOTE_ENVIRONMENT_ID).set(threadId, 100);
+    mockTransportStateByEnvironmentId.set(REMOTE_ENVIRONMENT_ID, "disposed");
+
+    const replacement = ensureWsEnvironmentClient({
+      environmentId: REMOTE_ENVIRONMENT_ID,
+      url: "wss://e/",
+    });
+
+    expect(replacement).not.toBe(client);
+    expect(threadDetailResumeCursors(REMOTE_ENVIRONMENT_ID).buildSubscribeInput(threadId)).toEqual({
+      threadId,
+    });
+  });
+
+  it("notifies registry listeners so aggregation can re-derive", async () => {
+    const { ensureWsEnvironmentClient, onWsEnvironmentRegistryChange, removeWsEnvironmentClient } =
+      await import("./wsEnvironmentRegistry");
+
+    const listener = vi.fn();
+    onWsEnvironmentRegistryChange(listener);
+
+    ensureWsEnvironmentClient({ environmentId: REMOTE_ENVIRONMENT_ID, url: "wss://e/" });
+    expect(listener).toHaveBeenCalled();
+
+    listener.mockClear();
+    await removeWsEnvironmentClient(REMOTE_ENVIRONMENT_ID);
+    expect(listener).toHaveBeenCalled();
   });
 });

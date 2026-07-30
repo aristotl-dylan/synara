@@ -22,8 +22,29 @@ import type {
 export type ThreadDetailSyncState = "synced" | "failed";
 
 export interface AppState {
-  /** Highest authoritative snapshot integrated by this store instance. */
+  /**
+   * Highest authoritative snapshot integrated for the local server.
+   *
+   * Retained as the local environment's value because optimistic project/space
+   * deletes derive their tombstone sequence from it and those are local-only
+   * concepts. Cross-environment staleness is decided by
+   * `shellSnapshotSequenceByEnvironmentId`.
+   */
   shellSnapshotSequence?: number;
+  /**
+   * Highest snapshot integrated per environment. Snapshot sequences are
+   * per-server SQLite autoincrement values, so comparing one environment's
+   * sequence against another's is meaningless: two servers both emitting
+   * snapshot 1 are unrelated events, and a single shared counter would make the
+   * second look stale and drop it.
+   */
+  shellSnapshotSequenceByEnvironmentId?: Record<string, number>;
+  /**
+   * Owning environment per thread. Absent means the local server, so existing
+   * single-server state needs no migration. A snapshot may only prune threads
+   * belonging to the environment that sent it.
+   */
+  environmentIdByThreadId?: Record<ThreadId, string>;
   spaces: Space[];
   projects: Project[];
   sidebarThreadSummaryById: Record<string, SidebarThreadSummary>;
@@ -79,6 +100,8 @@ export const EMPTY_TURN_DIFF_BY_THREAD: Record<
 
 export const initialState: AppState = {
   shellSnapshotSequence: 0,
+  shellSnapshotSequenceByEnvironmentId: {},
+  environmentIdByThreadId: {},
   spaces: [],
   projects: [],
   sidebarThreadSummaryById: {},

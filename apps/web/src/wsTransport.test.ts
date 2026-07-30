@@ -1080,6 +1080,8 @@ describe("WsTransport", () => {
       url: "ws://localhost:3020",
       heartbeatIntervalMs: 5,
       heartbeatTimeoutMs: 5,
+      // One miss is enough here; the tolerance threshold has its own cases.
+      heartbeatMaxMissedProbes: 1,
     });
     const internals = transport as unknown as {
       runLivenessProbe: (...args: unknown[]) => Promise<void>;
@@ -1129,6 +1131,70 @@ describe("WsTransport", () => {
     const callsAfterDispose = probe.mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(probe.mock.calls.length).toBe(callsAfterDispose);
+  }, 10_000);
+
+  it("tolerates isolated missed probes and only reconnects after consecutive misses", async () => {
+    // A GC pause or a server compacting a large thread can blow one deadline on
+    // a perfectly healthy link. Reconnecting on that single miss would restart
+    // every stream under exactly the load that caused the delay.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+      heartbeatMaxMissedProbes: 3,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+
+    // Two misses then a success: the counter resets, so no reconnect.
+    let call = 0;
+    const probe = vi.fn(() => {
+      call += 1;
+      return call <= 2 ? Promise.reject(new Error("slow")) : Promise.resolve();
+    });
+    internals.runLivenessProbe = probe;
+
+    await vi.waitFor(() => expect(probe.mock.calls.length).toBeGreaterThanOrEqual(4));
+    expect(reconnect).not.toHaveBeenCalled();
+
+    await transport.dispose();
+  }, 10_000);
+
+  it("reconnects once the missed probes reach the configured threshold", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+      heartbeatMaxMissedProbes: 3,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+    const probe = vi.fn(() => Promise.reject(new Error("socket is a zombie")));
+    internals.runLivenessProbe = probe;
+
+    await vi.waitFor(() => expect(reconnect).toHaveBeenCalled());
+    // A dead socket must not trigger a reconnect before the threshold.
+    expect(probe.mock.calls.length).toBeGreaterThanOrEqual(3);
+
+    await transport.dispose();
   }, 10_000);
 
   it("notifies state listeners and replays the current state on demand", async () => {

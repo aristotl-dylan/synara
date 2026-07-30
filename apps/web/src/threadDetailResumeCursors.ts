@@ -138,6 +138,23 @@ export function localThreadDetailResumeCursors(): ThreadDetailResumeCursorScope 
   return threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID);
 }
 
+/**
+ * Drops one environment's cursors when its transport goes away for good
+ * (deregistered, or replaced after disposal).
+ *
+ * `adoptNegotiation` can only detect a journal change by comparing against the
+ * instance id its own transport last observed, and a replacement transport has
+ * observed none. A cursor that outlived its transport is therefore
+ * unverifiable: if the environment returns as a different instance, that
+ * instance is the new transport's first, no reset fires, and the stale cursor
+ * silently resumes against an unrelated sequence space — skipping every event
+ * below it. Discarding on removal costs one full snapshot and removes the
+ * possibility.
+ */
+export function discardEnvironmentResumeCursors(environmentId: EnvironmentId): void {
+  cursorsByEnvironmentId.delete(environmentId);
+}
+
 export function resetThreadDetailResumeCursorsForTests(): void {
   cursorsByEnvironmentId.clear();
 }

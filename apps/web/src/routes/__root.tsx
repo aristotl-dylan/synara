@@ -59,12 +59,15 @@ import { useStore } from "../store";
 import { createAllThreadsSelector } from "../storeSelectors";
 import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
 import { terminalActivityFromEvent } from "../terminalActivity";
+import { createShellAggregator } from "../shellAggregation";
 import {
+  listWsEnvironmentClients,
   onServerConfigUpdated,
   onServerProviderStatusesUpdated,
   onServerSettingsUpdated,
   onServerWelcome,
   onThreadStreamFailure,
+  onWsEnvironmentRegistryChange,
 } from "../wsEnvironmentRegistry";
 import {
   addWsBuildSkewListener,
@@ -1920,6 +1923,24 @@ function EventRouter() {
     syncServerShellSnapshot,
     syncServerThreadDetailHotPath,
   ]);
+
+  // Remote environments' shells merge into the same store, keyed by environment.
+  // The local environment is streamed by the effect above; this covers the rest,
+  // which is what makes the sidebar aggregate across servers.
+  useEffect(() => {
+    const aggregator = createShellAggregator({
+      syncServerShellSnapshot: (snapshot, environmentId) =>
+        useStore.getState().syncServerShellSnapshot(snapshot, environmentId),
+    });
+    aggregator.sync(listWsEnvironmentClients());
+    const unsubscribe = onWsEnvironmentRegistryChange(() => {
+      aggregator.sync(listWsEnvironmentClients());
+    });
+    return () => {
+      unsubscribe();
+      aggregator.detachAll();
+    };
+  }, []);
 
   useLayoutEffect(() => {
     const reconcile = reconcileThreadSubscriptionsRef.current;

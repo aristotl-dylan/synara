@@ -14,7 +14,8 @@ import {
 } from "@synara/contracts";
 
 import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
-import { subscribeWithReplay } from "./listenerRegistry";
+import { createListenerRegistry, subscribeWithReplay } from "./listenerRegistry";
+import { discardEnvironmentResumeCursors } from "./threadDetailResumeCursors";
 import {
   createWsEnvironmentClient,
   type WsEnvironmentClient,
@@ -30,6 +31,18 @@ export type { WsEnvironmentClient } from "./wsNativeApi";
  * SQLite autoincrement values with no cross-server ordering.
  */
 const clientsByEnvironmentId = new Map<EnvironmentId, WsEnvironmentClient>();
+
+/**
+ * Notifies when the set of registered environments changes. Consumers that
+ * aggregate across environments (the sidebar's shell merge) re-derive from
+ * `listWsEnvironmentClients` rather than tracking registrations themselves.
+ * This is the hook issue #7's settings UI drives by adding/removing servers.
+ */
+const registryListeners = createListenerRegistry<void>();
+
+export function onWsEnvironmentRegistryChange(listener: () => void): () => void {
+  return registryListeners.subscribe(listener);
+}
 
 export interface RegisterEnvironmentInput {
   readonly environmentId: EnvironmentId;
@@ -49,12 +62,18 @@ export function ensureWsEnvironmentClient(
   if (existing) {
     if (existing.transport.getState() !== "disposed") return existing;
     clientsByEnvironmentId.delete(input.environmentId);
+    // The replacement transport starts with no observed server instance, so its
+    // first negotiation cannot tell that a surviving cursor came from an earlier
+    // one. Dropping the scope here keeps the "a cursor is only valid against the
+    // journal that issued it" invariant across a dispose/recreate cycle.
+    discardEnvironmentResumeCursors(input.environmentId);
   }
   const created = createWsEnvironmentClient({
     environmentId: input.environmentId,
     ...(input.url === undefined ? {} : { url: input.url }),
   });
   clientsByEnvironmentId.set(input.environmentId, created);
+  registryListeners.emit();
   return created;
 }
 
@@ -74,6 +93,12 @@ export async function removeWsEnvironmentClient(environmentId: EnvironmentId): P
   const client = clientsByEnvironmentId.get(environmentId);
   if (!client) return;
   clientsByEnvironmentId.delete(environmentId);
+  // Cursors outlive the transport that collected them, so they must be dropped
+  // with it: a re-registered environment may be served by a different instance
+  // whose journal has an unrelated sequence space, and the fresh transport has
+  // no memory of the old instance id with which to detect that.
+  discardEnvironmentResumeCursors(environmentId);
+  registryListeners.emit();
   await client.dispose();
 }
 
@@ -84,6 +109,10 @@ export async function removeWsEnvironmentClient(environmentId: EnvironmentId): P
 export async function resetWsEnvironmentRegistry(): Promise<void> {
   const clients = [...clientsByEnvironmentId.values()];
   clientsByEnvironmentId.clear();
+  for (const client of clients) {
+    discardEnvironmentResumeCursors(client.environmentId);
+  }
+  registryListeners.emit();
   await Promise.all(clients.map((client) => client.dispose()));
 }
 

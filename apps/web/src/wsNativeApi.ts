@@ -63,7 +63,7 @@ import {
   emitWsCompatibilityIssue,
   emitWsTransportState,
 } from "./wsTransportEvents";
-import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
+import { relativePathFallback, resolveEnvironmentHttpUrl } from "./lib/wsHttpUrl";
 
 export type { WsThreadStreamFailure } from "./wsTransport";
 
@@ -110,6 +110,7 @@ function omitNullUserInputAnswers(
   };
 }
 async function requestAuthJson<T>(
+  explicitUrl: string | null,
   path: string,
   options: {
     readonly method?: "GET" | "POST";
@@ -117,7 +118,9 @@ async function requestAuthJson<T>(
   } = {},
 ): Promise<T> {
   const hasBody = options.body !== undefined;
-  const response = await fetch(path, {
+  // Local keeps the bare relative path (same-origin cookie auth); a remote
+  // environment is addressed absolutely on its own host.
+  const response = await fetch(resolveEnvironmentHttpUrl(explicitUrl, path, relativePathFallback), {
     method: options.method ?? "GET",
     credentials: "same-origin",
     ...(hasBody
@@ -142,6 +145,7 @@ async function requestAuthJson<T>(
 }
 
 async function requestVoiceTranscriptionUpload(
+  explicitUrl: string | null,
   input: Parameters<NativeApi["server"]["transcribeVoice"]>[0],
 ) {
   const params = new URLSearchParams({
@@ -158,7 +162,10 @@ async function requestVoiceTranscriptionUpload(
     bytes[index] = decoded.charCodeAt(index);
   }
   const response = await fetch(
-    resolveWsHttpUrl(`${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`),
+    resolveEnvironmentHttpUrl(
+      explicitUrl,
+      `${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`,
+    ),
     { method: "POST", credentials: "include", body: bytes },
   );
   const payload = (await response.json().catch(() => null)) as
@@ -185,6 +192,11 @@ export function createWsEnvironmentClient(
   options: WsEnvironmentClientOptions = {},
 ): WsEnvironmentClient {
   const environmentId = options.environmentId ?? LOCAL_ENVIRONMENT_ID;
+  // HTTP-backed routes (auth, voice upload) must target this environment's own
+  // server. Without this a remote client would resolve through the page's
+  // ambient WS URL and post its payload — credentials, recorded audio — to the
+  // local server instead.
+  const explicitHttpUrl = options.url ?? null;
   const transport = new WsTransport({
     environmentId,
     ...(options.url === undefined ? {} : { url: options.url }),
@@ -212,7 +224,7 @@ export function createWsEnvironmentClient(
   transport.onCompatibilityIssue((issue) => emitWsCompatibilityIssue(issue, { environmentId }), {
     replayCurrent: true,
   });
-  transport.onBuildSkew((skew) => emitWsBuildSkew(skew), { replayCurrent: true });
+  transport.onBuildSkew((skew) => emitWsBuildSkew(environmentId, skew), { replayCurrent: true });
 
   transport.subscribe(WS_CHANNELS.serverWelcome, (message) => {
     channels.welcome.emit(message.data);
@@ -393,45 +405,56 @@ export function createWsEnvironmentClient(
       getEnvironment: () => transport.request(WS_METHODS.serverGetEnvironment),
       getSettings: () => transport.request(WS_METHODS.serverGetSettings),
       updateSettings: (input) => transport.request(WS_METHODS.serverUpdateSettings, input),
-      getAuthSession: () => requestAuthJson<AuthSessionState>("/api/auth/session"),
+      getAuthSession: () => requestAuthJson<AuthSessionState>(explicitHttpUrl, "/api/auth/session"),
       bootstrapAuth: (input: AuthBootstrapInput) =>
-        requestAuthJson<AuthBootstrapResult>("/api/auth/bootstrap", {
+        requestAuthJson<AuthBootstrapResult>(explicitHttpUrl, "/api/auth/bootstrap", {
           method: "POST",
           body: input,
         }),
       bootstrapBearerAuth: (input: AuthBootstrapInput) =>
-        requestAuthJson<AuthBearerBootstrapResult>("/api/auth/bootstrap/bearer", {
+        requestAuthJson<AuthBearerBootstrapResult>(explicitHttpUrl, "/api/auth/bootstrap/bearer", {
           method: "POST",
           body: input,
         }),
       issueAuthWebSocketToken: () =>
-        requestAuthJson<AuthWebSocketTokenResult>("/api/auth/ws-token", { method: "POST" }),
+        requestAuthJson<AuthWebSocketTokenResult>(explicitHttpUrl, "/api/auth/ws-token", {
+          method: "POST",
+        }),
       createAuthPairingToken: (input?: AuthCreatePairingCredentialInput) =>
-        requestAuthJson<AuthPairingCredentialResult>("/api/auth/pairing-token", {
+        requestAuthJson<AuthPairingCredentialResult>(explicitHttpUrl, "/api/auth/pairing-token", {
           method: "POST",
           ...(input ? { body: input } : {}),
         }),
       listAuthPairingLinks: () =>
-        requestAuthJson<ReadonlyArray<AuthPairingLink>>("/api/auth/pairing-links"),
+        requestAuthJson<ReadonlyArray<AuthPairingLink>>(explicitHttpUrl, "/api/auth/pairing-links"),
       revokeAuthPairingLink: (input: AuthRevokePairingLinkInput) =>
-        requestAuthJson<{ revoked: boolean }>("/api/auth/pairing-links/revoke", {
+        requestAuthJson<{ revoked: boolean }>(explicitHttpUrl, "/api/auth/pairing-links/revoke", {
           method: "POST",
           body: input,
         }),
-      listAuthClients: () => requestAuthJson<ReadonlyArray<AuthClientSession>>("/api/auth/clients"),
+      listAuthClients: () =>
+        requestAuthJson<ReadonlyArray<AuthClientSession>>(explicitHttpUrl, "/api/auth/clients"),
       revokeAuthClient: (input: AuthRevokeClientSessionInput) =>
-        requestAuthJson<{ revoked: boolean }>("/api/auth/clients/revoke", {
+        requestAuthJson<{ revoked: boolean }>(explicitHttpUrl, "/api/auth/clients/revoke", {
           method: "POST",
           body: input,
         }),
       revokeOtherAuthClients: () =>
-        requestAuthJson<{ revokedCount: number }>("/api/auth/clients/revoke-others", {
-          method: "POST",
-        }),
+        requestAuthJson<{ revokedCount: number }>(
+          explicitHttpUrl,
+          "/api/auth/clients/revoke-others",
+          {
+            method: "POST",
+          },
+        ),
       logoutAuthSession: async () => {
-        const result = await requestAuthJson<AuthLogoutResult>("/api/auth/logout", {
-          method: "POST",
-        });
+        const result = await requestAuthJson<AuthLogoutResult>(
+          explicitHttpUrl,
+          "/api/auth/logout",
+          {
+            method: "POST",
+          },
+        );
         await transport.dispose();
         return result;
       },
@@ -467,7 +490,7 @@ export function createWsEnvironmentClient(
         if (window.desktopBridge?.server?.transcribeVoice) {
           return window.desktopBridge.server.transcribeVoice(input);
         }
-        return requestVoiceTranscriptionUpload(input);
+        return requestVoiceTranscriptionUpload(explicitHttpUrl, input);
       },
       upsertKeybinding: (input) => transport.request(WS_METHODS.serverUpsertKeybinding, input),
     },

@@ -561,12 +561,25 @@ export function shouldKeepServerLifecycleStream(activeChannels: ReadonlySet<stri
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const HEARTBEAT_TIMEOUT_MS = 10_000;
 
+/**
+ * Tearing down every stream is far more expensive than waiting one more
+ * interval, and a single missed deadline does not distinguish a dead socket
+ * from a busy one: a server compacting a large thread, a GC pause, or a
+ * throttled background tab can all blow a 10s deadline while the connection is
+ * perfectly healthy. Reconnecting on one timeout would restart every stream
+ * under exactly the sustained load that caused the delay, so a reconnect
+ * requires this many consecutive misses. A dead socket misses all of them and
+ * is still detected within roughly one NAT idle window.
+ */
+export const HEARTBEAT_MAX_MISSED_PROBES = 3;
+
 export interface WsTransportOptions {
   readonly url?: string | null;
   /** Identity of the server this transport talks to; defaults to the local server. */
   readonly environmentId?: EnvironmentId;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
+  readonly heartbeatMaxMissedProbes?: number;
 }
 
 export class WsTransport {
@@ -576,8 +589,12 @@ export class WsTransport {
   private readonly resumeCursors: ThreadDetailResumeCursorScope;
   private readonly heartbeatIntervalMs: number;
   private readonly heartbeatTimeoutMs: number;
+  private readonly heartbeatMaxMissedProbes: number;
   private heartbeatTimer: number | null = null;
   private heartbeatInFlight = false;
+  private missedHeartbeats = 0;
+  /** Timestamp of the last message received on the feature socket. */
+  private lastInboundAt = 0;
   private readonly listeners = new Map<string, Set<(message: WsPush) => void>>();
   private readonly stateListeners = new Set<(state: WsTransportState) => void>();
   private readonly compatibilityListeners = new Set<(issue: WsCompatibilityError | null) => void>();
@@ -629,6 +646,8 @@ export class WsTransport {
     this.resumeCursors = threadDetailResumeCursors(this.environmentId);
     this.heartbeatIntervalMs = resolved.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
     this.heartbeatTimeoutMs = resolved.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS;
+    this.heartbeatMaxMissedProbes =
+      resolved.heartbeatMaxMissedProbes ?? HEARTBEAT_MAX_MISSED_PROBES;
     this.clientPromise = this.createSession().clientPromise;
   }
 
@@ -1027,18 +1046,38 @@ export class WsTransport {
       this.heartbeatTimer = null;
       if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
       if (this.heartbeatInFlight) return;
+
+      // Traffic within the last interval already proves the socket is alive, so
+      // skip the probe entirely. This keeps a heavily-streaming connection from
+      // paying for probes it does not need, and stops a probe queued behind that
+      // traffic from being mistaken for a death.
+      if (Date.now() - this.lastInboundAt < this.heartbeatIntervalMs) {
+        this.missedHeartbeats = 0;
+        this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
+        return;
+      }
+
       this.heartbeatInFlight = true;
       void this.runLivenessProbe(client, runtime, this.heartbeatTimeoutMs)
         .then(() => {
           this.heartbeatInFlight = false;
+          this.missedHeartbeats = 0;
           this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
         })
         .catch(() => {
           this.heartbeatInFlight = false;
           if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+          this.missedHeartbeats += 1;
+          if (this.missedHeartbeats < this.heartbeatMaxMissedProbes) {
+            // Probably a slow server rather than a dead one. Keep probing: a
+            // live server answers the next round and resets the counter.
+            this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
+            return;
+          }
           // A dead socket cannot be revived by retrying on it. Reconnecting
           // re-establishes every registered stream and lets the server replay
           // the persisted tail from this environment's cursors.
+          this.missedHeartbeats = 0;
           void this.reconnect().catch(() => undefined);
         });
     }, this.heartbeatIntervalMs);
@@ -1070,6 +1109,12 @@ export class WsTransport {
       if (!this.disposed && this.sessionVersion === sessionVersion) {
         this.adoptNegotiation(compatibility);
         this.setState("open");
+        // A new socket starts with a clean liveness record; misses counted
+        // against the previous one say nothing about this one. Inbound time
+        // stays unset so the first probe always runs — a new socket has not yet
+        // proven it carries traffic.
+        this.missedHeartbeats = 0;
+        this.lastInboundAt = 0;
         this.scheduleHeartbeat(client, featureRuntime, sessionVersion);
       }
       return client;
@@ -1287,6 +1332,10 @@ export class WsTransport {
   }
 
   private emit<C extends WsPushChannel>(channel: C, data: WsPushMessage<C>["data"]): void {
+    // Every server-originated message funnels through here, so this is the one
+    // place that proves the socket is carrying traffic. A busy stream is
+    // stronger evidence of liveness than a probe reply.
+    this.lastInboundAt = Date.now();
     const message = {
       type: "push" as const,
       sequence: ++this.sequence,
