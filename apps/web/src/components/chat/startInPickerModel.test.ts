@@ -13,6 +13,7 @@ import {
   filterStartInOptions,
   projectEnvironmentId,
   resolveStartInSelection,
+  startInEnvironmentNote,
   type StartInProject,
 } from "./startInPickerModel";
 
@@ -156,6 +157,36 @@ describe("resolving a selection", () => {
     expect(resolveStartInSelection({ option: local, projectId: LOCAL_PROJECT_ID })).toEqual({
       target: { environmentId: LOCAL_ENVIRONMENT_ID, projectId: LOCAL_PROJECT_ID },
     });
+  });
+});
+
+describe("the remote-host note", () => {
+  const options = buildStartInEnvironmentOptions({
+    environments: ENVIRONMENTS,
+    projects: PROJECTS,
+    projectOwnership: OWNERSHIP,
+  });
+  const remote = options.find((option) => !option.isLocal) as ReturnType<
+    typeof buildStartInEnvironmentOptions
+  >[number];
+  const local = options.find((option) => option.isLocal) as typeof remote;
+
+  it("tells the user which actions do NOT follow the chat to a remote host", () => {
+    // cwd-keyed calls (git, file writes) still run locally — see issue #25. The
+    // note is the only thing standing between the user and a file edited on the
+    // wrong machine, so it must name the host and both halves of the split.
+    const note = startInEnvironmentNote(remote);
+    expect(note).toContain(remote.label);
+    expect(note).toContain("Chats and terminals run there");
+    expect(note).toContain("file and Git actions still run on this computer");
+  });
+
+  it("says nothing for This computer", () => {
+    // The absence is the load-bearing half: on the local host everything really
+    // does run in one place, and a note that is always on is a note nobody
+    // reads. If this ever starts returning a string, the note becomes noise and
+    // stops being read on the remote host where it matters.
+    expect(startInEnvironmentNote(local)).toBeNull();
   });
 });
 

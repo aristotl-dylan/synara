@@ -128,6 +128,31 @@ export function resolveStartInSelection(input: {
   return { target: { environmentId: input.option.environmentId, projectId: input.projectId } };
 }
 
+/**
+ * The standing note shown while a REMOTE host is selected, or `null` for the
+ * local one.
+ *
+ * TEMPORARY — remove this function, its call site, and its tests in one step
+ * when cwd-keyed routing lands (issue #25). Nothing else depends on it.
+ *
+ * Why it exists: the picker invites a user to run a chat on another machine,
+ * but calls keyed by a bare filesystem path still execute locally, because a
+ * path carries no host identity. Since the same path usually exists on both
+ * machines, that misroute is a silent success against the wrong checkout
+ * rather than an error. A limitation the user can see beats one they discover
+ * from a file edited on the wrong machine.
+ *
+ * Deliberately absent for "This computer": there everything really does run in
+ * one place, and a note that is always on is a note nobody reads.
+ */
+export function startInEnvironmentNote(option: {
+  readonly isLocal: boolean;
+  readonly label: string;
+}): string | null {
+  if (option.isLocal) return null;
+  return `Runs on ${option.label}. Chats and terminals run there; file and Git actions still run on this computer.`;
+}
+
 /** Case-insensitive filter over environment labels and their project names. */
 export function filterStartInOptions(
   options: readonly StartInEnvironmentOption[],
