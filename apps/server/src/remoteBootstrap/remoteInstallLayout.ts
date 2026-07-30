@@ -15,8 +15,10 @@ import { containsControlCharacter, normalizeReleaseId } from "./remoteInputs";
  * The brand is not decoration: uninstall recursively deletes `layout.root`, and
  * the only thing standing between that and data loss is the root having been
  * validated. Because the brand cannot be produced outside this module, a
- * hand-assembled or spread layout is a compile error at the call site rather
- * than an `rm -rf /` at runtime.
+ * hand-assembled layout is a compile error at the call site. A SPREAD is not:
+ * `{ ...valid, root: "/" }` copies the brand along with the attacker-chosen
+ * root and compiles cleanly, which is why every destructive path re-runs
+ * `assertSafeInstallRoot` at runtime rather than trusting the type.
  */
 declare const validatedInstallRoot: unique symbol;
 

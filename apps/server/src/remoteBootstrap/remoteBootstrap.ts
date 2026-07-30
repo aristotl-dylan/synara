@@ -298,9 +298,11 @@ async function extractRelease(
   // — the one release on the box that is definitely in use.
   const activeReleaseDirectory = await readRemoteCurrentTarget(connection, input.layout);
   if (activeReleaseDirectory === releaseDirectory) {
-    // Already extracted and live: the scratch tree is redundant, and the bytes
-    // are identical because the tarball's digest was verified before it was
-    // unpacked. Leaving `current` untouched is the safe resolution.
+    // Already live at this release: never delete the tree a running server is
+    // executing from. The digest proves the ARCHIVE is intact, not the
+    // extracted tree, so this path deliberately does not repair a release
+    // corrupted on disk — reinstalling the same version is a no-op. Uninstall
+    // first to force a clean extraction.
     await expectRemoteSuccess(connection, ["rm", "-rf", "--", scratch]);
     return;
   }
