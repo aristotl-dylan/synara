@@ -44,7 +44,10 @@ export function redactCredential(_credential: RemoteCredential | string | undefi
 export interface ProvisioningClaim {
   readonly environmentId: string | undefined;
   readonly serverVersion: string | undefined;
-  /** Echo of the credential the remote accepted, if the probe returned one. */
+  /**
+   * Echo of the credential the remote accepted. Optional on the wire, but a
+   * claim that omits it is rejected: see verifyProvisioningHandshake.
+   */
   readonly acceptedToken: string | undefined;
   readonly authenticated: boolean;
 }
@@ -104,10 +107,15 @@ export function verifyProvisioningHandshake(input: {
       reason: `Remote server reported version ${claim.serverVersion}, expected ${expected.serverVersion}. The activated release is not the one running.`,
     };
   }
-  if (claim.acceptedToken !== undefined) {
-    if (!constantTimeEquals(claim.acceptedToken, expected.credential.token)) {
-      return { ok: false, reason: "Remote server echoed a credential we did not provision." };
-    }
+  // Required, not optional. Making the comparison conditional on the field
+  // being present would let the party being authenticated decide whether it
+  // gets checked, simply by omitting it — and `authenticated` is self-reported
+  // by that same party, so it is no backstop.
+  if (claim.acceptedToken === undefined) {
+    return { ok: false, reason: "Remote server did not echo the credential it accepted." };
+  }
+  if (!constantTimeEquals(claim.acceptedToken, expected.credential.token)) {
+    return { ok: false, reason: "Remote server echoed a credential we did not provision." };
   }
   return { ok: true };
 }

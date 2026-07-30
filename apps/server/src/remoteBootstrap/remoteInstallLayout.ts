@@ -7,7 +7,18 @@
 // Exports: RemoteInstallLayout, remoteInstallLayout, remoteReleaseDirectory,
 //          isPathInsideInstallRoot, assertSafeInstallRoot
 
-import { containsControlCharacter, normalizeReleaseId } from "./releaseId";
+import { containsControlCharacter, normalizeReleaseId } from "./remoteInputs";
+
+/**
+ * Marks a layout as having passed `assertSafeInstallRoot`.
+ *
+ * The brand is not decoration: uninstall recursively deletes `layout.root`, and
+ * the only thing standing between that and data loss is the root having been
+ * validated. Because the brand cannot be produced outside this module, a
+ * hand-assembled or spread layout is a compile error at the call site rather
+ * than an `rm -rf /` at runtime.
+ */
+declare const validatedInstallRoot: unique symbol;
 
 /**
  * The absolute paths of one remote install, rooted at `root`.
@@ -34,6 +45,11 @@ export interface RemoteInstallLayout {
   readonly environmentIdFile: string;
   readonly logFile: string;
   readonly lockFile: string;
+  /**
+   * Type-level only, never present at runtime: it exists so that a layout
+   * assembled by hand or by spreading is a compile error.
+   */
+  readonly [validatedInstallRoot]: true;
 }
 
 /**
@@ -93,6 +109,8 @@ export function assertSafeInstallRoot(root: string): string {
 
 export function remoteInstallLayout(root: string): RemoteInstallLayout {
   const normalizedRoot = assertSafeInstallRoot(root);
+  // The brand is erased at runtime; this factory is the only place allowed to
+  // assert it, and it does so directly after validating the root.
   return {
     root: normalizedRoot,
     releasesDirectory: `${normalizedRoot}/releases`,
@@ -105,11 +123,37 @@ export function remoteInstallLayout(root: string): RemoteInstallLayout {
     environmentIdFile: `${normalizedRoot}/state/environment-id`,
     logFile: `${normalizedRoot}/state/synara.log`,
     lockFile: `${normalizedRoot}/state/bootstrap.lock`,
-  };
+  } as RemoteInstallLayout;
 }
 
 export function remoteReleaseDirectory(layout: RemoteInstallLayout, releaseId: string): string {
   return `${layout.releasesDirectory}/${normalizeReleaseId(releaseId)}`;
+}
+
+/**
+ * The pinned Node binary's name inside a release tree.
+ *
+ * The supervisor launches `<root>/current/<this>`, and the bootstrapper moves
+ * the staged runtime to exactly that path, so the two are derived from one
+ * constant. When they were computed independently the unit's ExecStart named a
+ * binary that bootstrap never placed, and the service could not start at all.
+ */
+const RELEASE_NODE_BINARY_NAME = "node";
+
+/** Absolute path of the pinned Node binary inside a specific release. */
+export function remoteReleaseNodePath(layout: RemoteInstallLayout, releaseId: string): string {
+  return `${remoteReleaseDirectory(layout, releaseId)}/${RELEASE_NODE_BINARY_NAME}`;
+}
+
+/**
+ * Absolute path of the pinned Node binary as the supervisor must name it.
+ *
+ * Goes through `current`, not a release id: the unit outlives any one release,
+ * and an ExecStart pinned to a release directory would keep launching the old
+ * binary after an upgrade swapped the symlink.
+ */
+export function remoteCurrentNodePath(layout: RemoteInstallLayout): string {
+  return `${layout.currentLink}/${RELEASE_NODE_BINARY_NAME}`;
 }
 
 /**

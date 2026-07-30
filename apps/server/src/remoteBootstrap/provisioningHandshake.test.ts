@@ -68,10 +68,19 @@ describe("verifyProvisioningHandshake", () => {
     expect(verifyProvisioningHandshake({ claim: claim(), expected })).toEqual({ ok: true });
   });
 
-  it("accepts a claim that omits the token echo but authenticated", () => {
-    expect(
-      verifyProvisioningHandshake({ claim: claim({ acceptedToken: undefined }), expected }),
-    ).toEqual({ ok: true });
+  // Mutation guard (F5): this check must not be conditional on the field being
+  // present. `authenticated` is self-reported by the same untrusted side, so a
+  // remote that simply omits acceptedToken would otherwise opt itself out of
+  // the only comparison that proves it holds the credential we minted.
+  it("refuses a claim that omits the token echo, even when it claims authenticated", () => {
+    const verdict = verifyProvisioningHandshake({
+      claim: claim({ acceptedToken: undefined }),
+      expected,
+    });
+    expect(verdict).toEqual({
+      ok: false,
+      reason: "Remote server did not echo the credential it accepted.",
+    });
   });
 
   // Each of these is a separate predicate. Removing any one of them must fail.
@@ -86,10 +95,25 @@ describe("verifyProvisioningHandshake", () => {
     });
   });
 
-  it("refuses a missing environmentId rather than assuming it matches", () => {
+  // Mutation guard (M35): pinned to the exact reason, so a mutation that
+  // reaches the wrong branch cannot pass by failing for a different cause.
+  it.each([undefined, ""])(
+    "refuses environmentId %j rather than assuming it matches",
+    (environmentId) => {
+      const verdict = verifyProvisioningHandshake({ claim: claim({ environmentId }), expected });
+      expect(verdict).toEqual({
+        ok: false,
+        reason: "Remote server reported no environmentId.",
+      });
+    },
+  );
+
+  // An empty expected id would make the comparison vacuous; the bootstrapper
+  // validates it as a UUID up front, and this pins the second half of that.
+  it("refuses an empty claimed environmentId even against an empty expectation", () => {
     const verdict = verifyProvisioningHandshake({
-      claim: claim({ environmentId: undefined }),
-      expected,
+      claim: claim({ environmentId: "" }),
+      expected: { ...expected, environmentId: "" },
     });
     expect(verdict.ok).toBe(false);
   });
@@ -103,10 +127,12 @@ describe("verifyProvisioningHandshake", () => {
     expect(verdict.ok === false && verdict.reason).toMatch(/did not provision/);
   });
 
-  it("refuses a missing version", () => {
-    expect(
-      verifyProvisioningHandshake({ claim: claim({ serverVersion: undefined }), expected }).ok,
-    ).toBe(false);
+  // Mutation guard (M36): likewise pinned to its own reason.
+  it.each([undefined, ""])("refuses serverVersion %j", (serverVersion) => {
+    expect(verifyProvisioningHandshake({ claim: claim({ serverVersion }), expected })).toEqual({
+      ok: false,
+      reason: "Remote server reported no version.",
+    });
   });
 
   it("refuses a version that is not the release we activated", () => {

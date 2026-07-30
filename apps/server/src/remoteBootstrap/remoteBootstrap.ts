@@ -40,12 +40,18 @@ import {
   type RemoteExecResult,
 } from "./remoteConnection";
 import {
+  assertSafeInstallRoot,
   isPathInsideInstallRoot,
   type RemoteInstallLayout,
   remoteReleaseDirectory,
+  remoteReleaseNodePath,
 } from "./remoteInstallLayout";
 import type { SupervisorPlan } from "./remoteSupervisor";
-import { normalizeReleaseId } from "./releaseId";
+import {
+  normalizeEnvironmentId,
+  normalizeReleaseId,
+  normalizeRemoteFileName,
+} from "./remoteInputs";
 
 export type BootstrapProgress =
   | { readonly step: "preparing" }
@@ -78,9 +84,22 @@ export interface BootstrapInput {
 
 const REMOTE_DIRECTORY_MODE = "700";
 const REMOTE_SECRET_MODE = "600";
+const REMOTE_EXECUTABLE_MODE = "700";
 
+/**
+ * Where an artifact is uploaded to.
+ *
+ * `remoteFileName` is caller-influenced, so it is validated rather than
+ * concatenated, and the result is gated on the install root the same way every
+ * other computed remote path is. Without both, a name of `../../../../tmp/x`
+ * would upload outside the tree that uninstall is scoped to delete.
+ */
 function stagedPath(layout: RemoteInstallLayout, artifact: BootstrapArtifact): string {
-  return `${layout.stagingDirectory}/${artifact.remoteFileName}`;
+  const remotePath = `${layout.stagingDirectory}/${normalizeRemoteFileName(artifact.remoteFileName)}`;
+  if (!isPathInsideInstallRoot(layout, remotePath)) {
+    throw new Error(`Refusing to stage an artifact outside the install root: ${remotePath}`);
+  }
+  return remotePath;
 }
 
 /**
@@ -193,9 +212,36 @@ async function extractRelease(
   }
   await expectRemoteSuccess(connection, ["rm", "-rf", "--", scratch]);
   await expectRemoteSuccess(connection, ["mkdir", "-p", "--", scratch]);
-  await expectRemoteSuccess(connection, ["tar", "-xzf", tarballRemotePath, "-C", scratch]);
+  await expectRemoteSuccess(connection, ["tar", "-xzf", tarballRemotePath, "-C", scratch, "--"]);
   await expectRemoteSuccess(connection, ["rm", "-rf", "--", releaseDirectory]);
   await expectRemoteSuccess(connection, ["mv", "--", scratch, releaseDirectory]);
+}
+
+/**
+ * Copy the staged Node binary into the release tree.
+ *
+ * This has to happen after extraction (which replaces the release directory
+ * wholesale) and before activation (after which `current/node` is the path the
+ * supervisor executes). Staging is wiped on success, so a runtime left only in
+ * staging is a runtime that no longer exists by the time systemd launches it.
+ *
+ * A copy rather than a move: staging is the content-addressed resume cache, and
+ * emptying it here would make any interruption past this point re-upload the
+ * whole runtime over the WAN. A duplicate on remote disk until success is the
+ * cheaper side of that trade.
+ */
+async function installReleaseRuntime(
+  input: BootstrapInput,
+  stagedRuntimePath: string,
+  releaseId: string,
+): Promise<void> {
+  const { connection, layout } = input;
+  const runtimePath = remoteReleaseNodePath(layout, releaseId);
+  if (!isPathInsideInstallRoot(layout, runtimePath)) {
+    throw new Error(`Refusing to install a runtime outside the install root: ${runtimePath}`);
+  }
+  await expectRemoteSuccess(connection, ["cp", "-f", "--", stagedRuntimePath, runtimePath]);
+  await expectRemoteSuccess(connection, ["chmod", REMOTE_EXECUTABLE_MODE, "--", runtimePath]);
 }
 
 async function writeRemoteSecret(
@@ -269,35 +315,43 @@ export async function rollbackRemoteServer(input: {
 export async function bootstrapRemoteServer(input: BootstrapInput): Promise<BootstrapOutcome> {
   const { connection, layout, artifacts, supervisor } = input;
   const releaseId = normalizeReleaseId(artifacts.releaseId);
+  const environmentId = normalizeEnvironmentId(input.environmentId);
   input.onProgress?.({ step: "preparing" });
   await ensureDirectories(input);
 
   const previousReleaseId = await readRemoteReleaseId(connection, layout);
 
   const tarballRemotePath = await stageArtifact(input, artifacts.serverTarball);
-  await stageArtifact(input, artifacts.nodeRuntime);
+  const stagedRuntimePath = await stageArtifact(input, artifacts.nodeRuntime);
 
   const releaseDirectory = remoteReleaseDirectory(layout, releaseId);
   await extractRelease(input, tarballRemotePath, releaseDirectory);
+  await installReleaseRuntime(input, stagedRuntimePath, releaseId);
 
   const credential = (input.mintCredential ?? mintRemoteCredential)();
   await writeRemoteSecret(connection, layout.credentialFile, `${credential.token}\n`);
-  await writeRemoteSecret(connection, layout.environmentIdFile, `${input.environmentId}\n`);
+  await writeRemoteSecret(connection, layout.environmentIdFile, `${environmentId}\n`);
 
-  await activateRelease(input, releaseId, previousReleaseId);
-
-  input.onProgress?.({ step: "installing-supervisor" });
-  await writeRemoteSecret(connection, supervisor.unitPath, supervisor.unitContents);
-  await runPlanCommands(connection, supervisor.installArgv);
-  await runPlanCommands(connection, supervisor.startArgv);
-
-  input.onProgress?.({ step: "handshake" });
+  // Everything from the symlink swap onward is inside the rollback boundary.
+  // Activation is the first step that changes what runs, so an interruption
+  // after it — a supervisor that fails to install, a connection dropped during
+  // restart — must restore `current` rather than leave it advertising a release
+  // the box is not actually running. A later readRemoteReleaseId believes that
+  // symlink, and so does the version-skew policy that reads it.
   try {
+    await activateRelease(input, releaseId, previousReleaseId);
+
+    input.onProgress?.({ step: "installing-supervisor" });
+    await writeRemoteSecret(connection, supervisor.unitPath, supervisor.unitContents);
+    await runPlanCommands(connection, supervisor.installArgv);
+    await runPlanCommands(connection, supervisor.startArgv);
+
+    input.onProgress?.({ step: "handshake" });
     const claim = await input.probeHandshake(credential);
     const verdict = verifyProvisioningHandshake({
       claim,
       expected: {
-        environmentId: input.environmentId,
+        environmentId,
         serverVersion: artifacts.serverVersion,
         credential,
       },
@@ -316,7 +370,7 @@ export async function bootstrapRemoteServer(input: BootstrapInput): Promise<Boot
   // so a mid-bootstrap crash leaves them for the next attempt to reuse.
   await connection.exec(["rm", "-rf", "--", layout.stagingDirectory]);
 
-  return { releaseId, environmentId: input.environmentId, credential, previousReleaseId };
+  return { releaseId, environmentId, credential, previousReleaseId };
 }
 
 /**
@@ -332,6 +386,11 @@ export async function uninstallRemoteServer(input: {
   readonly supervisor: SupervisorPlan;
 }): Promise<void> {
   const { connection, layout, supervisor } = input;
+  // Re-assert the root before anything destructive runs. `isPathInsideInstallRoot`
+  // cannot serve as this check — comparing the root to itself is structurally
+  // `x === x` and can never fail — and the brand on RemoteInstallLayout only
+  // constrains the type, so the value is re-validated here too.
+  assertSafeInstallRoot(layout.root);
   for (const argv of supervisor.uninstallArgv) {
     // Uninstall is best-effort per step: a unit that was never installed must
     // not block deleting the files, or a half-bootstrapped host stays dirty
@@ -344,9 +403,6 @@ export async function uninstallRemoteServer(input: {
   const pid = Number.parseInt(pidResult.stdout.trim(), 10);
   if (pidResult.exitCode === 0 && Number.isInteger(pid) && pid > 1) {
     await connection.exec(["kill", "-TERM", String(pid)]);
-  }
-  if (!isPathInsideInstallRoot(layout, layout.root)) {
-    throw new Error(`Refusing to remove a path outside the install root: ${layout.root}`);
   }
   await expectRemoteSuccess(connection, ["rm", "-rf", "--", layout.root]);
 }

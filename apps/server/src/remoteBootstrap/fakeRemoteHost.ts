@@ -48,6 +48,15 @@ export interface FakeRemoteHost {
   /** Registers a one-shot fault keyed by the first two argv tokens. */
   failOn(match: (argv: ReadonlyArray<string>) => boolean, fault: () => never): void;
   /**
+   * Makes every matching command return a canned result instead of running.
+   *
+   * Distinct from `failOn`, which throws: a real remote command that fails
+   * exits non-zero and may still have written to stdout. That combination — a
+   * failed digest tool that nonetheless prints a plausible digest line — is the
+   * one a caller can most easily mistake for success.
+   */
+  stubExit(match: (argv: ReadonlyArray<string>) => boolean, result: RemoteExecResult): void;
+  /**
    * Makes the next upload to `remotePath` land different bytes while still
    * reporting success — a lossy link, not a dropped one. This is the only way
    * to exercise the post-upload remote checksum, because a fault that throws
@@ -74,6 +83,10 @@ export function createFakeRemoteHost(): FakeRemoteHost {
     fault: () => never;
   }> = [];
   const corruptions = new Map<string, string>();
+  const stubs: Array<{
+    match: (argv: ReadonlyArray<string>) => boolean;
+    result: RemoteExecResult;
+  }> = [];
 
   const mkdirp = (path: string): void => {
     const segments = path.split("/").filter(Boolean);
@@ -126,6 +139,9 @@ export function createFakeRemoteHost(): FakeRemoteHost {
         fault();
       }
     }
+    for (const { match, result } of stubs) {
+      if (match(argv)) return result;
+    }
     // Strip a `--` end-of-options separator the way GNU utilities do.
     const [command, ...rest] = argv;
     const args = rest.filter((token) => token !== "--");
@@ -158,6 +174,16 @@ export function createFakeRemoteHost(): FakeRemoteHost {
           if (!nodes.has(operand) && !force) return fail(`rm: no such file: ${operand}`);
           removeRecursive(operand);
         }
+        return ok();
+      }
+      case "cp": {
+        const from = resolvePath(operand(0));
+        const to = operand(1);
+        const source = nodes.get(from);
+        if (!source) return fail(`cp: no such file: ${operand(0)}`);
+        if (source.kind !== "file") return fail(`cp: not a regular file: ${operand(0)}`);
+        mkdirp(parent(to));
+        nodes.set(to, { kind: "file", contents: source.contents, mode: source.mode });
         return ok();
       }
       case "mv": {
@@ -276,6 +302,9 @@ export function createFakeRemoteHost(): FakeRemoteHost {
     listUnder: (prefix) => [...nodes.keys()].filter((key) => key.startsWith(prefix)).sort(),
     failOn(match, fault) {
       faults.push({ match, fault });
+    },
+    stubExit(match, result) {
+      stubs.push({ match, result });
     },
     corruptNextUpload(remotePath, contents) {
       corruptions.set(remotePath, contents);

@@ -211,6 +211,20 @@ describe("launchd plan", () => {
     expect(plist).toContain("<string>45123</string>");
   });
 
+  // Mutation guard (M47): KeepAlive must be the SuccessfulExit/false dict, not
+  // a bare <true/>. A bare true restarts the server even after a deliberate
+  // stop, which would turn drain-then-upgrade into a race with launchd — the
+  // same distinction systemd's Restart=on-failure makes.
+  it("restarts only on failure, never after a clean stop", () => {
+    const plist = renderLaunchdPlist(input({ os: "darwin" }));
+    expect(plist).toContain(
+      ["  <key>KeepAlive</key>", "  <dict>", "    <key>SuccessfulExit</key>", "    <false/>"].join(
+        "\n",
+      ),
+    );
+    expect(plist).not.toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+  });
+
   // Mutation guard: dropping escapeXml lets a path close the <string> element
   // and inject arbitrary plist keys.
   it("escapes XML metacharacters in a path", () => {

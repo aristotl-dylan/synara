@@ -17,7 +17,7 @@
 import { quotePosixShellArgument } from "@synara/shared/posixShell";
 
 import type { RemoteInstallLayout } from "./remoteInstallLayout";
-import { containsControlCharacter, normalizeReleaseId } from "./releaseId";
+import { containsControlCharacter, normalizeReleaseId } from "./remoteInputs";
 
 export type SupervisorKind = "systemd-user" | "launchd-user";
 

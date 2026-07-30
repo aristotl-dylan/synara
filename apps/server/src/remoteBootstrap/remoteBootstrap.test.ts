@@ -15,7 +15,12 @@ import {
   readRemoteReleaseId,
   uninstallRemoteServer,
 } from "./remoteBootstrap";
-import { remoteInstallLayout } from "./remoteInstallLayout";
+import {
+  isPathInsideInstallRoot,
+  remoteCurrentNodePath,
+  type RemoteInstallLayout,
+  remoteInstallLayout,
+} from "./remoteInstallLayout";
 import { remoteSupervisorPlan } from "./remoteSupervisor";
 
 const ENVIRONMENT_ID = "6f9d0c6e-7a1f-4d2b-9a3c-0e5d1b2c3d4e";
@@ -76,7 +81,7 @@ const supervisor = remoteSupervisorPlan({
   os: "linux",
   layout,
   releaseId: "0.6.3",
-  nodePath: `${layout.root}/current/node`,
+  nodePath: remoteCurrentNodePath(layout),
   entrypointPath: `${layout.root}/current/dist/index.mjs`,
   port: 45123,
   instanceId: "env-abc123",
@@ -118,15 +123,61 @@ describe("clean-host bootstrap", () => {
     expect(await readRemoteReleaseId(host.connection, layout)).toBe("0.6.3");
   });
 
+  // The bug this locks down (F1): staging the runtime without ever moving it
+  // into the release tree left ExecStart naming a binary that did not exist, so
+  // a "successful" bootstrap produced a unit systemd could not launch at all.
+  // Asserting on the unit's own ExecStart — rather than a hardcoded path — is
+  // what makes this catch any future drift between the two.
+  it("places every binary the unit's ExecStart names inside the activated release", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    const execStart = /^ExecStart=(.*)$/m.exec(supervisor.unitContents)?.[1];
+    expect(execStart).toBeDefined();
+    const absolutePaths = execStart
+      ?.split(" ")
+      .filter((token) => token.startsWith("/"))
+      .map((token) => token.replaceAll("'", ""));
+    // The node binary and the entrypoint: if this ever drops to one, the loop
+    // below stops proving anything.
+    expect(absolutePaths).toHaveLength(2);
+    for (const path of absolutePaths ?? []) {
+      expect(path.startsWith(`${layout.currentLink}/`)).toBe(true);
+      expect(host.readFile(path), `${path} must exist under current`).not.toBeNull();
+    }
+  });
+
+  it("keeps the pinned runtime with the release, so a rollback restores its own node", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    expect(host.readFile(`${layout.releasesDirectory}/0.6.3/node`)).toBe(NODE_RUNTIME_BYTES);
+    expect(host.readFile(`${layout.currentLink}/node`)).toBe(NODE_RUNTIME_BYTES);
+  });
+
+  it("makes the installed runtime executable", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    expect(host.commands).toContainEqual([
+      "chmod",
+      "700",
+      "--",
+      `${layout.releasesDirectory}/0.6.3/node`,
+    ]);
+  });
+
   // The whole point of upload-first: an air-gapped host must never be asked to
   // reach the internet. Mutation guard against a "just curl it" regression.
+  //
+  // Scans the whole command line, not just argv[0]: this module legitimately
+  // runs `sh -c` to write the credential, and that is exactly the shape a
+  // future `sh -c "curl ... | sh"` regression would hide behind.
   it.each(["curl", "wget", "npm", "npx", "pip", "apt-get", "yum", "brew", "git"])(
     "never invokes %s on the remote host",
     async (command) => {
       const host = createFakeRemoteHost();
       await bootstrapRemoteServer(bootstrapInput(host));
       for (const argv of host.commands) {
-        expect(argv[0]).not.toBe(command);
+        expect(argv.join(" ")).not.toMatch(new RegExp(`\\b${command}\\b`));
       }
     },
   );
@@ -226,6 +277,26 @@ describe("checksum enforcement", () => {
     expect(host.exists(layout.currentLink)).toBe(false);
   });
 
+  // Mutation guard (M2/M5): a non-zero exit means "no digest", never "matches".
+  // The second case is the dangerous one — a host that prints a plausible
+  // digest line while failing must not have that output parsed as a match.
+  it.each([
+    ["silently", ""],
+    ["while printing a valid-looking digest", `${"a".repeat(64)}  node\n`],
+    ["while printing the expected digest", null],
+  ])("refuses to activate when sha256sum exits non-zero %s", async (_label, stdout) => {
+    const host = createFakeRemoteHost();
+    const expectedDigest = digestOf(NODE_RUNTIME_BYTES);
+    host.stubExit(
+      (argv) => argv[0] === "sha256sum" && argv.includes(`${layout.stagingDirectory}/node`),
+      { exitCode: 1, stdout: stdout ?? `${expectedDigest}  node\n`, stderr: "sha256sum: failed" },
+    );
+    await expect(bootstrapRemoteServer(bootstrapInput(host))).rejects.toThrow(
+      ChecksumMismatchError,
+    );
+    expect(host.exists(layout.currentLink)).toBe(false);
+  });
+
   it("refuses when the remote cannot produce a digest at all", async () => {
     const host = createFakeRemoteHost();
     // Both digest tools missing: a host that answers nothing must not pass.
@@ -237,6 +308,87 @@ describe("checksum enforcement", () => {
     );
     await expect(bootstrapRemoteServer(bootstrapInput(host))).rejects.toThrow();
     expect(host.exists(layout.currentLink)).toBe(false);
+  });
+});
+
+describe("hostile artifact file names", () => {
+  // remoteFileName is caller-influenced and lands in two dangerous positions:
+  // joined onto a path, and passed to tar as an operand. Both are covered here.
+  const hostileNames = [
+    "../../../../tmp/pwned.tar.gz",
+    "../escape",
+    "..",
+    "./x",
+    "a/b",
+    "/absolute",
+    "--checkpoint-action=exec=sh",
+    "--to-command=sh",
+    "-rf",
+    "with space.tar.gz",
+    "quote'.tar.gz",
+    'double".tar.gz',
+    "new\nline",
+    "semi;colon",
+    "$(id)",
+    "`id`",
+    "$HOME",
+    "pipe|cat",
+    "null\0byte",
+    "unicodé.tar.gz",
+    "‮gnp.exe",
+    "",
+  ];
+
+  it.each(hostileNames)("refuses to stage an artifact named %j", async (remoteFileName) => {
+    const host = createFakeRemoteHost();
+    const base = artifacts();
+    await expect(
+      bootstrapRemoteServer(
+        bootstrapInput(host, {
+          artifacts: { ...base, serverTarball: { ...base.serverTarball, remoteFileName } },
+        }),
+      ),
+    ).rejects.toThrow(/Invalid remote artifact file name/);
+
+    // Nothing was uploaded, and in particular nothing outside the install root.
+    for (const argv of host.commands) {
+      if (argv[0] === "scp") {
+        expect(isPathInsideInstallRoot(layout, argv[2] ?? "")).toBe(true);
+      }
+    }
+    expect(host.exists(layout.currentLink)).toBe(false);
+  });
+
+  // The property the individual cases above are instances of: whatever a name
+  // is, every path we ever upload to stays inside the tree uninstall can clean.
+  it("never uploads outside the install root, whatever the name", async () => {
+    for (const remoteFileName of [...hostileNames, "node", "synara-server-0.6.3.tar.gz"]) {
+      const host = createFakeRemoteHost();
+      const base = artifacts();
+      await bootstrapRemoteServer(
+        bootstrapInput(host, {
+          artifacts: { ...base, nodeRuntime: { ...base.nodeRuntime, remoteFileName } },
+        }),
+      ).catch(() => undefined);
+      for (const argv of host.commands) {
+        if (argv[0] === "scp") {
+          expect(isPathInsideInstallRoot(layout, argv[2] ?? "")).toBe(true);
+        }
+      }
+    }
+  });
+
+  // Mutation guard: tar treats a leading-dash operand as a flag, and
+  // --checkpoint-action=exec= is a documented arbitrary-execution vector. The
+  // name validator is the first defence; this `--` is the second.
+  it("passes -- to tar so a staged file can never be read as a flag", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+    const tarCommands = host.commands.filter((argv) => argv[0] === "tar");
+    expect(tarCommands).not.toHaveLength(0);
+    for (const argv of tarCommands) {
+      expect(argv).toContain("--");
+    }
   });
 });
 
@@ -311,12 +463,13 @@ describe("handshake failure rolls back", () => {
         bootstrapInput(host, {
           artifacts: upgraded,
           // The activated release reports the wrong version: something else is
-          // serving on that port.
-          probeHandshake: () =>
+          // serving on that port. Every other field is correct, so the version
+          // is the only thing that can reject it.
+          probeHandshake: (credential) =>
             Promise.resolve({
               environmentId: ENVIRONMENT_ID,
               serverVersion: "0.6.3",
-              acceptedToken: undefined,
+              acceptedToken: credential.token,
               authenticated: true,
             }),
         }),
@@ -337,11 +490,11 @@ describe("handshake failure rolls back", () => {
       bootstrapRemoteServer(
         bootstrapInput(host, {
           artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
-          probeHandshake: () =>
+          probeHandshake: (credential) =>
             Promise.resolve({
               environmentId: "00000000-0000-4000-8000-000000000000",
               serverVersion: "0.7.0",
-              acceptedToken: undefined,
+              acceptedToken: credential.token,
               authenticated: true,
             }),
         }),
@@ -357,11 +510,11 @@ describe("handshake failure rolls back", () => {
       bootstrapRemoteServer(
         bootstrapInput(host, {
           artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
-          probeHandshake: () =>
+          probeHandshake: (credential) =>
             Promise.resolve({
               environmentId: ENVIRONMENT_ID,
               serverVersion: "0.7.0",
-              acceptedToken: undefined,
+              acceptedToken: credential.token,
               authenticated: false,
             }),
         }),
@@ -387,6 +540,94 @@ describe("handshake failure rolls back", () => {
     ).rejects.toThrow();
     expect(host.exists(layout.currentLink)).toBe(false);
     expect(host.commands).toContainEqual(["systemctl", "--user", "stop", supervisor.unitName]);
+  });
+});
+
+describe("environmentId validation", () => {
+  // The handshake proves identity by comparing the reported environmentId to
+  // this one. An empty string compares equal to an empty string, which would
+  // turn the strongest check in the bootstrap into a tautology.
+  it.each(["", "   ", "not-a-uuid", "6f9d0c6e7a1f4d2b9a3c0e5d1b2c3d4e", "../../etc", "0"])(
+    "refuses to bootstrap with environmentId %j",
+    async (environmentId) => {
+      const host = createFakeRemoteHost();
+      await expect(bootstrapRemoteServer(bootstrapInput(host, { environmentId }))).rejects.toThrow(
+        /Invalid remote environment id/,
+      );
+      // Rejected at the entry point: nothing was touched on the remote host.
+      expect(host.commands).toEqual([]);
+    },
+  );
+
+  it("accepts a UUID and normalizes its case", async () => {
+    const host = createFakeRemoteHost();
+    const outcome = await bootstrapRemoteServer(
+      bootstrapInput(host, {
+        environmentId: ENVIRONMENT_ID.toUpperCase(),
+        probeHandshake: (credential) =>
+          Promise.resolve({
+            environmentId: ENVIRONMENT_ID,
+            serverVersion: "0.6.3",
+            acceptedToken: credential.token,
+            authenticated: true,
+          }),
+      }),
+    );
+    expect(outcome.environmentId).toBe(ENVIRONMENT_ID);
+  });
+});
+
+describe("interrupted activation does not leave current lying", () => {
+  // The bug this locks down (F7): the try/catch used to start after the
+  // supervisor was installed and started, so a connection dropped at
+  // `systemctl restart` left `current` pointing at the new release while the
+  // old one was still running. readRemoteReleaseId then reports the new id and
+  // the version-skew policy believes it.
+  it.each([
+    ["the supervisor install", (argv: ReadonlyArray<string>) => argv[2] === "enable"],
+    ["the supervisor restart", (argv: ReadonlyArray<string>) => argv[2] === "restart"],
+  ])("rolls current back when the connection drops at %s", async (_label, match) => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    host.failOn(
+      (argv) => argv[0] === "systemctl" && match(argv),
+      () => {
+        throw new InterruptionError("connection dropped mid-upgrade");
+      },
+    );
+
+    await expect(
+      bootstrapRemoteServer(
+        bootstrapInput(host, {
+          artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+        }),
+      ),
+    ).rejects.toThrow(InterruptionError);
+
+    expect(host.readLink(layout.currentLink)).toBe(`${layout.releasesDirectory}/0.6.3`);
+    expect(await readRemoteReleaseId(host.connection, layout)).toBe("0.6.3");
+  });
+
+  it("rolls current back when writing the unit file fails", async () => {
+    const host = createFakeRemoteHost();
+    await bootstrapRemoteServer(bootstrapInput(host));
+
+    host.failOn(
+      (argv) => argv[0] === "sh" && argv.includes(supervisor.unitPath),
+      () => {
+        throw new InterruptionError("connection dropped writing the unit");
+      },
+    );
+
+    await expect(
+      bootstrapRemoteServer(
+        bootstrapInput(host, {
+          artifacts: artifacts({ releaseId: "0.7.0", serverVersion: "0.7.0" }),
+        }),
+      ),
+    ).rejects.toThrow(InterruptionError);
+    expect(await readRemoteReleaseId(host.connection, layout)).toBe("0.6.3");
   });
 });
 
@@ -459,6 +700,34 @@ describe("uninstall", () => {
       expect(host.commands.slice(before).filter((argv) => argv[0] === "kill")).toEqual([]);
     }
   });
+
+  // The bug this locks down (F3): the old guard was
+  // isPathInsideInstallRoot(layout, layout.root) — structurally `x === x`, so it
+  // could never fire. A hand-built layout with root "/" produced a literal
+  // ["rm","-rf","--","/"]. The brand on RemoteInstallLayout makes this a compile
+  // error too, hence the cast: the runtime assertion is the backstop for any
+  // caller that reaches this through `any`, JS, or a structured-clone boundary.
+  it.each(["/", "/home", "/usr", "/Users", "/home/alice", "relative/path"])(
+    "refuses to uninstall a hand-built layout rooted at %j",
+    async (root) => {
+      const host = createFakeRemoteHost();
+      const hostile = {
+        ...layout,
+        root,
+        releasesDirectory: `${root}/releases`,
+        stateDirectory: `${root}/state`,
+        pidFile: `${root}/state/synara.pid`,
+      } as unknown as RemoteInstallLayout;
+
+      await expect(
+        uninstallRemoteServer({ connection: host.connection, layout: hostile, supervisor }),
+      ).rejects.toThrow(/Refusing to manage|absolute POSIX path|home directory root/);
+
+      for (const argv of host.commands) {
+        expect(argv[0]).not.toBe("rm");
+      }
+    },
+  );
 
   it("still removes files when the unit was never installed", async () => {
     const host = createFakeRemoteHost();
