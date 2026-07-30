@@ -15,6 +15,7 @@ import {
 const OWNER_SESSION: WsConnectionSession = {
   role: "owner",
   attachmentPrincipal: LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
+  buildSkewed: false,
 };
 
 describe("WsConnectionSessions", () => {
@@ -40,6 +41,7 @@ describe("WsConnectionSessions", () => {
         sessions.register({
           role: "client",
           attachmentPrincipal: { ownerKind: "session", ownerId: "session-1" },
+          buildSkewed: false,
         }),
         scope,
       ),
@@ -62,6 +64,7 @@ describe("WsConnectionSessions", () => {
       provideWsConnectionSession(read, {
         role: "owner",
         attachmentPrincipal: { ownerKind: "session", ownerId: "session-9" },
+        buildSkewed: false,
       }),
     );
     expect(withSession).toEqual({

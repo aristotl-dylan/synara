@@ -118,6 +118,7 @@ import {
 import {
   negotiateWsCompatibility,
   parseWsNegotiateSearchParams,
+  isWsClientBuildSkewed,
   validateWsFeatureCompatibility,
 } from "./wsCompatibility";
 import {
@@ -171,6 +172,9 @@ export function makeWsAdmissionMiddleware(deps: {
       method: options.rpc._tag,
       role: session?.role ?? DEFAULT_WS_SESSION_ROLE,
       config: deps.config,
+      // Unresolved sessions fail safe: treat the build as skewed so an
+      // unidentified connection cannot mutate either.
+      buildSkewed: session?.buildSkewed ?? true,
     });
     if (rejection) return Effect.fail(rejection);
     const scoped = provideWsConnectionSession(effect, session);
@@ -1825,6 +1829,9 @@ export function makeWebsocketRpcRouteLayer<R>(
               headers: { "Cache-Control": "no-store" },
             });
           }
+          // Server-side skew enforcement, so the middleware can refuse
+          // mutations regardless of whether the client honors its own guard.
+          const buildSkewed = isWsClientBuildSkewed(url.searchParams);
           const legacyToken = url.searchParams.get("token");
           const authenticatedSession = yield* authenticateRpcWebSocketUpgrade({
             config,
@@ -1837,6 +1844,7 @@ export function makeWebsocketRpcRouteLayer<R>(
             return yield* runWithConnectionSession(request, {
               role: "owner",
               attachmentPrincipal: LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
+              buildSkewed,
             });
           }
 
@@ -1845,6 +1853,7 @@ export function makeWebsocketRpcRouteLayer<R>(
             runWithConnectionSession(request, {
               role: authenticatedSession.role,
               attachmentPrincipal: attachmentPrincipalForSession(authenticatedSession.sessionId),
+              buildSkewed,
             }),
           );
         }).pipe(

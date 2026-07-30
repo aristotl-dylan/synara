@@ -1091,6 +1091,34 @@ describe("WsTransport version handshake", () => {
     await transport.dispose();
   });
 
+  // Regression: the pre-connect check alone cannot catch this. A write issued
+  // before negotiation completes sees no skew yet, awaits the connection, and
+  // would then dispatch unchecked against a mismatched server.
+  it("refuses a write started before the skew is known", async () => {
+    let releaseNegotiation: (() => void) | undefined;
+    const negotiationGate = new Promise<void>((resolve) => {
+      releaseNegotiation = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        await negotiationGate;
+        return jsonResponse(200, skewedBuild);
+      }),
+    );
+
+    const transport = new WsTransport("ws://localhost:3020");
+    // No skew is known at this point — the pre-connect check cannot refuse it.
+    expect(transport.getBuildSkew()).toBeNull();
+    const pending = transport.request(ORCHESTRATION_WS_METHODS.dispatchCommand, { command: {} });
+    const assertion = expect(pending).rejects.toBeInstanceOf(WsBuildSkewReadOnlyError);
+
+    releaseNegotiation?.();
+    await assertion;
+
+    await transport.dispose();
+  });
+
   it("still admits read methods while degraded", async () => {
     vi.stubGlobal(
       "fetch",

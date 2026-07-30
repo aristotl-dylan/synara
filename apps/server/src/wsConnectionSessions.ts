@@ -29,6 +29,14 @@ export const CurrentWsSessionRole = ServiceMap.Reference<WsSessionRole>(
 export interface WsConnectionSession {
   readonly role: WsSessionRole;
   readonly attachmentPrincipal: ManagedAttachmentPrincipal;
+  /**
+   * Whether this connection's client build is version-skewed from the server.
+   * Classified once at upgrade from the client build it presented, and enforced
+   * by the admission middleware. The client refuses writes too, but that is UX:
+   * an older client predating the client-side guard, or any direct client, only
+   * stops here.
+   */
+  readonly buildSkewed: boolean;
 }
 
 /**

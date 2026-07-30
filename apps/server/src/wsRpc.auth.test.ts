@@ -52,6 +52,16 @@ const remoteDeployments: ReadonlyArray<readonly [string, AuthenticatedDeployment
     "an insecure-remote loopback bind with NO token",
     { host: "127.0.0.1", authToken: undefined, publicUrl: undefined, allowInsecureRemote: true },
   ],
+  // SYNARA_HOST="" binds 0.0.0.0. This upgrade must never hand out the
+  // implicit owner session for it.
+  [
+    "a blank host (binds 0.0.0.0) with NO token",
+    { host: "", authToken: undefined, publicUrl: undefined, allowInsecureRemote: false },
+  ],
+  [
+    "a whitespace-only host with NO token",
+    { host: "   ", authToken: undefined, publicUrl: undefined, allowInsecureRemote: false },
+  ],
 ];
 
 // Auth enforcement must follow the deployment's reachability, never the

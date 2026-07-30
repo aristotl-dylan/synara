@@ -604,18 +604,10 @@ export class WsTransport {
     options?: WsRequestOptions,
   ): Promise<T> {
     if (this.disposed) throw new Error("Transport disposed");
-    // A version-skewed session is degraded, not dead: reads keep working and
-    // every write is refused here, before it can reach a server on a different
-    // build. Checked on the request path so a skew adopted mid-session (after a
-    // reconnect to an upgraded server) takes effect immediately.
-    if (this.buildSkew && !isReadOnlySafeWsMethod(method)) {
-      throw new WsBuildSkewReadOnlyError({
-        message: `${method} is unavailable while this client (${this.buildSkew.clientBuild}) and server (${this.buildSkew.serverBuild}) run mismatched builds.`,
-        method,
-        clientBuild: this.buildSkew.clientBuild,
-        serverBuild: this.buildSkew.serverBuild,
-      });
-    }
+    // Fail fast when the skew is already known. This is only the first of two
+    // checks: the authoritative one runs after the connection resolves, since
+    // the skew is adopted during negotiation.
+    this.assertNotSkewedWrite(method);
     const requestOptions: WsRequestOptions =
       options?.timeoutMs === undefined ? { ...options, timeoutMs: REQUEST_TIMEOUT_MS } : options;
     const abortScope = makeRequestAbortScope(requestOptions);
@@ -636,6 +628,11 @@ export class WsTransport {
       }
 
       const client = await awaitWithAbort(this.getClient(), abortScope.signal);
+      // Authoritative check. The skew is adopted while the connection resolves,
+      // so a write started during initial connect or a reconnect passes the
+      // pre-connect check with no skew known yet. Re-checking here is what
+      // actually keeps a skewed build from mutating.
+      this.assertNotSkewedWrite(method);
 
       if (method === WS_METHODS.gitRunStackedAction) {
         return (await this.runGitActionStream(client, params, abortScope.signal)) as T;
@@ -877,6 +874,22 @@ export class WsTransport {
         // Skew UI listeners must not break transport setup.
       }
     }
+  }
+
+  /**
+   * Refuses a mutating method while the session is version-skewed. Called both
+   * before and after the connection resolves, because the skew is only adopted
+   * during negotiation.
+   */
+  private assertNotSkewedWrite(method: string): void {
+    const skew = this.buildSkew;
+    if (!skew || isReadOnlySafeWsMethod(method)) return;
+    throw new WsBuildSkewReadOnlyError({
+      message: `${method} is unavailable while this client (${skew.clientBuild}) and server (${skew.serverBuild}) run mismatched builds.`,
+      method,
+      clientBuild: skew.clientBuild,
+      serverBuild: skew.serverBuild,
+    });
   }
 
   /** Current degraded read-only state, or null when builds match. */

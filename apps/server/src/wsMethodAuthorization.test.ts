@@ -1,8 +1,9 @@
-import { WS_METHODS } from "@synara/contracts";
+import { ORCHESTRATION_WS_METHODS, WS_METHODS } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
 import {
   authorizeWsMethod,
+  CLIENT_ALLOWED_WS_METHODS,
   LOCAL_ONLY_WS_METHODS,
   OWNER_ONLY_WS_METHODS,
 } from "./wsMethodAuthorization";
@@ -74,4 +75,61 @@ it("leaves ordinary thread work authorized for a paired client", () => {
   ]) {
     expect(authorizeWsMethod({ method, role: "client", config: remote })).toBeNull();
   }
+});
+
+describe("default deny", () => {
+  // The failure class this table exists to remove: a privileged handler added
+  // to the RPC group without a decision recorded must NOT be reachable.
+  it.each([
+    "server.someFutureUnclassifiedMethod",
+    "orchestration.someFutureUnclassifiedMethod",
+    "",
+  ])("refuses unregistered method %j for a client session", (method) => {
+    const rejection = authorizeWsMethod({ method, role: "client", config: loopback });
+    expect(rejection).not.toBeNull();
+    expect(rejection?.message).toContain("not available to this session");
+  });
+
+  it("never lists an owner-only method as client-allowed", () => {
+    for (const method of OWNER_ONLY_WS_METHODS) {
+      expect(CLIENT_ALLOWED_WS_METHODS.has(method), `${method} is client-allowed`).toBe(false);
+    }
+  });
+});
+
+describe("server-side version skew", () => {
+  it("refuses a mutation from a skewed client regardless of role", () => {
+    for (const role of ["owner", "client"] as const) {
+      const rejection = authorizeWsMethod({
+        method: ORCHESTRATION_WS_METHODS.dispatchCommand,
+        role,
+        config: loopback,
+        buildSkewed: true,
+      });
+      expect(rejection).not.toBeNull();
+      expect(rejection?.message).toContain("different Synara build");
+    }
+  });
+
+  it("refuses server.listWorktrees from a skewed client because it prunes", () => {
+    expect(
+      authorizeWsMethod({
+        method: WS_METHODS.serverListWorktrees,
+        role: "owner",
+        config: loopback,
+        buildSkewed: true,
+      }),
+    ).not.toBeNull();
+  });
+
+  it("still admits reads from a skewed client", () => {
+    expect(
+      authorizeWsMethod({
+        method: WS_METHODS.gitStatus,
+        role: "client",
+        config: loopback,
+        buildSkewed: true,
+      }),
+    ).toBeNull();
+  });
 });

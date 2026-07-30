@@ -89,25 +89,78 @@ describe("read-only method allowlist", () => {
     expect(isReadOnlySafeWsMethod("some.future.method")).toBe(false);
   });
 
-  it("never allowlists a method whose name marks it as a mutation", () => {
-    const mutationPrefixes = [
-      "create",
-      "update",
-      "delete",
-      "write",
-      "run",
-      "dispatch",
-      "stop",
-      "revoke",
-      "upsert",
-      "import",
-      "repair",
-    ];
-    for (const method of READ_ONLY_SAFE_WS_METHODS) {
-      const operation = method.slice(method.indexOf(".") + 1).toLowerCase();
-      for (const prefix of mutationPrefixes) {
-        expect(operation.startsWith(prefix), `${method} looks like a mutation`).toBe(false);
-      }
-    }
+  // A name heuristic cannot classify safety: server.listWorktrees reads as a
+  // "list" but its handler prunes and force-removes archived worktrees. The
+  // allowlist is therefore pinned to an exact, reviewed roster — any addition
+  // or removal has to be made here deliberately, with the handler inspected.
+  it("matches the exact reviewed roster of skew-safe methods", () => {
+    expect([...READ_ONLY_SAFE_WS_METHODS].toSorted()).toEqual(
+      [
+        ORCHESTRATION_WS_METHODS.getSnapshot,
+        ORCHESTRATION_WS_METHODS.getShellSnapshot,
+        ORCHESTRATION_WS_METHODS.getThreadDetailSnapshot,
+        ORCHESTRATION_WS_METHODS.getTurnDiff,
+        ORCHESTRATION_WS_METHODS.getFullThreadDiff,
+        ORCHESTRATION_WS_METHODS.replayEvents,
+        ORCHESTRATION_WS_METHODS.listProviderDeliveryBlockers,
+        ORCHESTRATION_WS_METHODS.subscribeShell,
+        ORCHESTRATION_WS_METHODS.unsubscribeShell,
+        ORCHESTRATION_WS_METHODS.subscribeThread,
+        ORCHESTRATION_WS_METHODS.unsubscribeThread,
+        WS_METHODS.subscribeOrchestrationDomainEvents,
+        WS_METHODS.projectsDiscoverScripts,
+        WS_METHODS.projectsListDirectories,
+        WS_METHODS.projectsSearchEntries,
+        WS_METHODS.projectsSearchLocalEntries,
+        WS_METHODS.projectsReadFile,
+        WS_METHODS.projectsListDevServers,
+        WS_METHODS.subscribeProjectDevServerEvents,
+        WS_METHODS.studioListThreadOutputs,
+        WS_METHODS.filesystemBrowse,
+        WS_METHODS.gitGithubRepository,
+        WS_METHODS.gitStatus,
+        WS_METHODS.gitReadWorkingTreeDiff,
+        WS_METHODS.gitWorkingTreeDiffStats,
+        WS_METHODS.gitSummarizeDiff,
+        WS_METHODS.gitListBranches,
+        WS_METHODS.gitStashInfo,
+        WS_METHODS.gitResolvePullRequest,
+        WS_METHODS.gitPullRequestSnapshot,
+        WS_METHODS.pullRequestsList,
+        WS_METHODS.pullRequestsReviewRequestCount,
+        WS_METHODS.pullRequestsDetail,
+        WS_METHODS.pullRequestsDiff,
+        WS_METHODS.serverGetConfig,
+        WS_METHODS.serverGetEnvironment,
+        WS_METHODS.serverGetSettings,
+        WS_METHODS.serverListExternalMcpIntegrations,
+        WS_METHODS.serverListLocalServers,
+        WS_METHODS.serverGetProviderUsageSnapshot,
+        WS_METHODS.serverListProviderUsage,
+        WS_METHODS.serverGetDiagnostics,
+        WS_METHODS.subscribeServerLifecycle,
+        WS_METHODS.subscribeServerConfig,
+        WS_METHODS.subscribeServerProviderStatuses,
+        WS_METHODS.subscribeServerSettings,
+        WS_METHODS.statsGetProfileStats,
+        WS_METHODS.statsGetProfileTokenStats,
+        WS_METHODS.providerGetComposerCapabilities,
+        WS_METHODS.providerListCommands,
+        WS_METHODS.providerListSkills,
+        WS_METHODS.providerListSkillsCatalog,
+        WS_METHODS.providerListPlugins,
+        WS_METHODS.providerReadPlugin,
+        WS_METHODS.providerListModels,
+        WS_METHODS.providerListAgents,
+        WS_METHODS.automationList,
+        WS_METHODS.automationGetMemory,
+        WS_METHODS.subscribeAutomationEvents,
+        WS_METHODS.subscribeTerminalEvents,
+      ].toSorted(),
+    );
+  });
+
+  it("refuses server.listWorktrees, whose handler prunes and removes worktrees", () => {
+    expect(isReadOnlySafeWsMethod(WS_METHODS.serverListWorktrees)).toBe(false);
   });
 });

@@ -46,6 +46,27 @@ describe("remote reachability", () => {
   );
 });
 
+// Regression: SYNARA_HOST="" survives `??` (only null/undefined fall through)
+// and Node binds it as 0.0.0.0. If it were classified as loopback, startup
+// would succeed and a remote client would receive the implicit owner session.
+describe("blank host closes the unauthenticated public bind", () => {
+  it.each(["", " ", "\t"])("treats host %j as remote-reachable", (host) => {
+    const config = { ...loopbackBase, host };
+    expect(isRemoteReachableDeployment(config)).toBe(true);
+    expect(isLocalOnlyDeployment(config)).toBe(false);
+  });
+
+  it.each(["", " ", "\t"])("requires session auth for host %j with no token", (host) => {
+    expect(requiresSessionAuthentication({ ...loopbackBase, host })).toBe(true);
+  });
+
+  it.each(["", " ", "\t"])("refuses to start on host %j without a credential", (host) => {
+    expect(remoteAccessPolicyError({ ...remoteBase, host, authToken: undefined })).toContain(
+      "Refusing",
+    );
+  });
+});
+
 describe("session authentication policy", () => {
   // The security property this module exists for: enforcement follows the
   // deployment's reachability, never the presence of an auth token. Removing
