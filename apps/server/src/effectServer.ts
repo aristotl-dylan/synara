@@ -42,6 +42,8 @@ import { ServerSettingsService } from "./serverSettings";
 import { makeServerReadiness } from "./server/readiness";
 import { makeServerShutdownController, type ServerShutdownController } from "./serverShutdown";
 import { makeBoundedNodeHttpServer } from "./nodeHttpServer";
+import { makeEnvironmentProxyDispatch } from "./environmentProxy";
+import { sharedEnvironmentProxyRegistry } from "./environmentProxyRegistry";
 import { websocketRpcRouteLayer } from "./wsRpc";
 import { recoverGitHandoffOperations } from "./gitHandoffOperations";
 import { externalMcpRouteLayer } from "./externalMcp/httpRoute";
@@ -154,10 +156,23 @@ export const createEffectServer = Effect.fn(function* (
   // Keep embedded/test callers safe if they construct ServerConfig without
   // passing through the CLI's loopback-default resolution.
   const listenOptions = { host: resolveBindHost(config.host), port: config.port };
-  const httpServer = yield* makeBoundedNodeHttpServer(() => {
-    nodeServer = http.createServer();
-    return nodeServer;
-  }, listenOptions).pipe(
+  // Single-origin environment proxy. Installed unconditionally so a remote host
+  // registered at runtime is reachable without restarting the server; with an
+  // empty registry every `/env/*` target 404s, so this adds no surface until an
+  // environment is actually published.
+  const environmentProxy = makeEnvironmentProxyDispatch({
+    registry: sharedEnvironmentProxyRegistry(),
+    onError: (message, cause) =>
+      Effect.runFork(Effect.logWarning(message, { cause: String(cause) })),
+  });
+  const httpServer = yield* makeBoundedNodeHttpServer(
+    () => {
+      nodeServer = http.createServer();
+      return nodeServer;
+    },
+    listenOptions,
+    environmentProxy,
+  ).pipe(
     Effect.mapError((cause) => new ServerLifecycleError({ operation: "httpServerListen", cause })),
   );
 
