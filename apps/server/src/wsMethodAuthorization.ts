@@ -148,6 +148,10 @@ export const OWNER_ONLY_WS_METHODS: ReadonlySet<string> = new Set<string>([
   // the caller. That is an outbound capability of the operator's machine, not
   // work inside a thread, so a paired non-owner client may not trigger it.
   WS_METHODS.serverProbeRemoteHost,
+  // Reports this machine's tailnet name and how it is exposed — network topology
+  // of the operator's host, not work inside a thread. It also exists solely to
+  // build a pairing QR code, and only an owner may issue pairing credentials.
+  WS_METHODS.serverGetPhoneReachability,
 ]);
 
 /**

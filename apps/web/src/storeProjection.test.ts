@@ -2246,6 +2246,55 @@ describe("multi-environment shell aggregation", () => {
     expect(afterLocalResync.threadShellById?.[remoteThreadId]?.title).toBe("Remote thread");
   });
 
+  it("keeps each environment's PROJECTS and records their owner", () => {
+    // The composer's "Start in" picker groups projects by owning environment.
+    // Without per-environment project ownership, the last snapshot to arrive
+    // would wipe the other host's folders — and the picker would then offer one
+    // host's directories under the other, starting a chat at a path that host
+    // does not have.
+    const remoteProjectId = ProjectId.makeUnsafe("project-remote");
+    const remoteSnapshot = {
+      ...makeShellSnapshot(shellThread(remoteThreadId, "Remote thread")),
+      projects: [
+        {
+          id: remoteProjectId,
+          title: "Remote project",
+          workspaceRoot: "/srv/remote",
+          defaultModelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+          createdAt: "2026-02-27T00:00:00.000Z",
+          updatedAt: "2026-02-27T00:00:00.000Z",
+          scripts: [],
+          spaceId: null,
+        },
+      ],
+      threads: [{ ...shellThread(remoteThreadId, "Remote thread"), projectId: remoteProjectId }],
+    };
+
+    const afterLocal = syncServerShellSnapshot(
+      emptyState(),
+      makeShellSnapshot(shellThread(localThreadId, "Local thread")),
+    );
+    const afterRemote = syncServerShellSnapshot(
+      afterLocal,
+      remoteSnapshot as never,
+      remoteEnvironmentId,
+    );
+
+    const projectIds = afterRemote.projects.map((project) => project.id);
+    expect(projectIds).toContain(ProjectId.makeUnsafe("project-1"));
+    expect(projectIds).toContain(remoteProjectId);
+    expect(afterRemote.environmentIdByProjectId?.[remoteProjectId]).toBe(remoteEnvironmentId);
+    // Local-owned projects stay unmapped, matching the "absent means local" rule.
+    expect(afterRemote.environmentIdByProjectId?.["project-1"]).toBeUndefined();
+
+    // And a later local resync must not delete the remote's project either.
+    const afterLocalResync = syncServerShellSnapshot(afterRemote, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local thread")),
+      snapshotSequence: 9,
+    });
+    expect(afterLocalResync.projects.map((project) => project.id)).toContain(remoteProjectId);
+  });
+
   it("fences each environment against its own sequence space only", () => {
     const afterRemoteHigh = syncServerShellSnapshot(
       emptyState(),

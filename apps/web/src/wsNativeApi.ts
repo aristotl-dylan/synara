@@ -85,6 +85,15 @@ export interface WsEnvironmentChannels {
 /** One connected server: its transport, its NativeApi, and its channel registries. */
 export interface WsEnvironmentClient {
   readonly environmentId: EnvironmentId;
+  /**
+   * Absolute WS URL for a remote environment, `null` for the page's own server.
+   *
+   * Every HTTP-backed route (attachment upload/cancel, thread export, local
+   * images, editor icons, favicons) must resolve through this rather than the
+   * ambient `resolveWsHttpUrl`: an ambient resolution posts a remote thread's
+   * bytes to the local server.
+   */
+  readonly wsUrl: string | null;
   readonly api: NativeApi;
   readonly transport: WsTransport;
   readonly channels: WsEnvironmentChannels;
@@ -473,6 +482,7 @@ export function createWsEnvironmentClient(
         transport.request(WS_METHODS.serverUpdateProvider, input, { timeoutMs: null }),
       listWorktrees: () => transport.request(WS_METHODS.serverListWorktrees),
       listLocalServers: () => transport.request(WS_METHODS.serverListLocalServers),
+      getPhoneReachability: () => transport.request(WS_METHODS.serverGetPhoneReachability),
       stopLocalServer: (input) => transport.request(WS_METHODS.serverStopLocalServer, input),
       getProviderUsageSnapshot: (input) =>
         transport.request(WS_METHODS.serverGetProviderUsageSnapshot, input),
@@ -779,6 +789,7 @@ export function createWsEnvironmentClient(
 
   return {
     environmentId,
+    wsUrl: explicitHttpUrl,
     api,
     transport,
     channels,
