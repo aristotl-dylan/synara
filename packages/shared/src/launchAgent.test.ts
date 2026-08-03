@@ -13,7 +13,7 @@ import {
 
 function spec(overrides: Partial<LaunchAgentSpec> = {}): LaunchAgentSpec {
   return {
-    label: "com.synara.host",
+    label: "com.emanueledipietro.synara.host",
     argv: ["/usr/local/bin/node", "/opt/synara/server.mjs", "--port", "21987"],
     workingDirectory: "/opt/synara",
     logPath: "/opt/synara/logs/host.log",
@@ -36,7 +36,7 @@ describe("renderLaunchAgentPlist", () => {
   it("renders a loadable agent", () => {
     const plist = renderLaunchAgentPlist(spec());
     expect(plist).toContain("<key>Label</key>");
-    expect(plist).toContain("<string>com.synara.host</string>");
+    expect(plist).toContain("<string>com.emanueledipietro.synara.host</string>");
     expect(plist).toContain("<string>/usr/local/bin/node</string>");
     expect(plist).toContain("<string>--port</string>");
     expect(plist).toContain("<string>21987</string>");
@@ -93,10 +93,10 @@ describe("renderLaunchAgentPlist", () => {
 
   it.each([
     ["empty", ""],
-    ["leading dot", ".com.synara"],
-    ["a space", "com synara"],
-    ["a slash", "com/synara"],
-    ["a newline", "com.synara\nevil"],
+    ["leading dot", ".example.invalid"],
+    ["a space", "example invalid"],
+    ["a slash", "example/invalid"],
+    ["a newline", "example.invalid\nevil"],
   ])("refuses a label with %s", (_label, value) => {
     expect(() => renderLaunchAgentPlist(spec({ label: value }))).toThrow(/Invalid launchd label/);
   });
@@ -117,13 +117,15 @@ describe("renderLaunchAgentPlist", () => {
 
 describe("launchAgentPath", () => {
   it("places the agent in the user's LaunchAgents directory", () => {
-    expect(launchAgentPath("/Users/dylan", "com.synara.host")).toBe(
-      "/Users/dylan/Library/LaunchAgents/com.synara.host.plist",
+    expect(launchAgentPath("/Users/dylan", "com.emanueledipietro.synara.host")).toBe(
+      "/Users/dylan/Library/LaunchAgents/com.emanueledipietro.synara.host.plist",
     );
   });
 
   it("refuses a relative home directory", () => {
-    expect(() => launchAgentPath("Users/dylan", "com.synara.host")).toThrow(/absolute path/);
+    expect(() => launchAgentPath("Users/dylan", "com.emanueledipietro.synara.host")).toThrow(
+      /absolute path/,
+    );
   });
 });
 
@@ -135,40 +137,42 @@ describe("launchctl argv", () => {
   });
 
   it("bootstraps with the plist path", () => {
-    expect(bootstrapArgv(501, "/Users/d/Library/LaunchAgents/com.synara.host.plist")).toEqual([
+    expect(
+      bootstrapArgv(501, "/Users/d/Library/LaunchAgents/com.emanueledipietro.synara.host.plist"),
+    ).toEqual([
       "launchctl",
       "bootstrap",
       "gui/501",
-      "/Users/d/Library/LaunchAgents/com.synara.host.plist",
+      "/Users/d/Library/LaunchAgents/com.emanueledipietro.synara.host.plist",
     ]);
   });
 
   it("boots out by service target rather than by path", () => {
     // The path form fails once the file is gone, which is the state uninstall
     // is trying to reach — it would make uninstall order-dependent.
-    expect(bootoutArgv(501, "com.synara.host")).toEqual([
+    expect(bootoutArgv(501, "com.emanueledipietro.synara.host")).toEqual([
       "launchctl",
       "bootout",
-      "gui/501/com.synara.host",
+      "gui/501/com.emanueledipietro.synara.host",
     ]);
   });
 
   it("kickstarts with -k so a running instance is replaced", () => {
     // Without -k this is a no-op on a running job, and an update that swapped
     // the binary would leave the old one serving.
-    expect(kickstartArgv(501, "com.synara.host")).toEqual([
+    expect(kickstartArgv(501, "com.emanueledipietro.synara.host")).toEqual([
       "launchctl",
       "kickstart",
       "-k",
-      "gui/501/com.synara.host",
+      "gui/501/com.emanueledipietro.synara.host",
     ]);
   });
 
   it("never builds a shell string", () => {
     for (const argv of [
-      bootstrapArgv(501, "/Users/d/Library/LaunchAgents/com.synara.host.plist"),
-      bootoutArgv(501, "com.synara.host"),
-      kickstartArgv(501, "com.synara.host"),
+      bootstrapArgv(501, "/Users/d/Library/LaunchAgents/com.emanueledipietro.synara.host.plist"),
+      bootoutArgv(501, "com.emanueledipietro.synara.host"),
+      kickstartArgv(501, "com.emanueledipietro.synara.host"),
     ]) {
       expect(argv[0]).toBe("launchctl");
       expect(argv.some((token) => token.includes(" ") || token.includes(";"))).toBe(false);
