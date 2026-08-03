@@ -68,7 +68,8 @@ import {
   openHostLogDescriptors,
 } from "./detachedHostSpawn";
 import { resolveHostEndpoint } from "./hostAttach";
-import { gatherHostAdoptionFacts } from "./hostRuntimeRecord";
+import { gatherHostAdoptionFacts, hostRuntimeRecordPathFor } from "./hostRuntimeRecord";
+import { mayInstallAfterStop, stopDetachedHost } from "./hostStop";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import {
   retainLiveBackendAfterShutdownFailure,
@@ -2735,6 +2736,11 @@ async function runDownloadedUpdateInstall(
     isQuitting = true;
     clearUpdatePollTimer();
     await stopBackendAndWaitForExit();
+    // stopBackendAndWaitForExit stops the child this UI spawned. A detached
+    // host is not that child — backendProcess is null — so it returns having
+    // stopped nothing, and the install would replace the server binary
+    // underneath a host that is still running and still writing.
+    await stopDetachedHostForInstall();
     updateInstallPreparation.requireActive(preparationAttempt);
     await logMacUpdateDiagnostics("before install handoff");
     updateInstallPreparation.requireActive(preparationAttempt);
@@ -3267,6 +3273,40 @@ type BackendStartTrigger = "lifecycle" | "crash-restart";
  * the host — before it can be the default. The flag lets the lifecycle land and
  * be exercised on real machines while the surface is still being designed.
  */
+/**
+ * Stops the detached host before an update replaces the server binary.
+ *
+ * The one path allowed to stop a host this UI does not own. Quitting a window
+ * must leave it serving; an update genuinely cannot proceed while it runs.
+ *
+ * Clears the attach flag on success so recovery may start a replacement. The
+ * flag exists to stop a UI racing a LIVE host, and after a confirmed stop there
+ * is no host to race.
+ */
+async function stopDetachedHostForInstall(): Promise<void> {
+  if (!hostModeEnabled()) return;
+
+  const outcome = await stopDetachedHost({
+    recordPath: hostRuntimeRecordPathFor(STATE_DIR),
+  });
+
+  if (!mayInstallAfterStop(outcome)) {
+    // Refusing the install is the safe direction: a new server started over a
+    // host we could not stop puts two writers on one SYNARA_HOME, and that
+    // corrupts state rather than merely failing to update.
+    const reason = outcome.kind === "failed" ? outcome.reason : "the host could not be stopped";
+    writeDesktopLogHeader(`update install refused: ${reason}`);
+    throw new Error(`Synara could not stop the running server: ${reason}`);
+  }
+
+  attachedToExistingHost = false;
+  writeDesktopLogHeader(
+    outcome.kind === "stopped"
+      ? `update stopped host pid=${outcome.pid} forced=${outcome.forced}`
+      : "update found no running host to stop",
+  );
+}
+
 /**
  * Whether this UI attached to a host it did not start.
  *
