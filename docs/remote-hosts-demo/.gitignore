@@ -1,0 +1,7 @@
+# up.sh generates a dedicated keypair so a reviewer never has to authorize
+# their own. These are private key material and must never be committed —
+# this repository is a public contribution, and one `git add -A` is all it
+# takes.
+demo_key
+demo_key.pub
+authorized_keys

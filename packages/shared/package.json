@@ -8,6 +8,10 @@
       "types": "./src/hostAdoption.ts",
       "import": "./src/hostAdoption.ts"
     },
+    "./launchAgent": {
+      "types": "./src/launchAgent.ts",
+      "import": "./src/launchAgent.ts"
+    },
     "./buildSkew": {
       "types": "./src/buildSkew.ts",
       "import": "./src/buildSkew.ts"
