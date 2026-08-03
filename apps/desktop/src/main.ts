@@ -67,6 +67,8 @@ import {
   type HostLogDescriptors,
   openHostLogDescriptors,
 } from "./detachedHostSpawn";
+import { resolveHostEndpoint } from "./hostAttach";
+import { gatherHostAdoptionFacts } from "./hostRuntimeRecord";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import {
   retainLiveBackendAfterShutdownFailure,
@@ -3265,6 +3267,29 @@ type BackendStartTrigger = "lifecycle" | "crash-restart";
  * the host — before it can be the default. The flag lets the lifecycle land and
  * be exercised on real machines while the surface is still being designed.
  */
+/**
+ * Whether this UI attached to a host it did not start.
+ *
+ * Load-bearing beyond bookkeeping: every path that would start or restart a
+ * server has to refuse while this is true. The host belongs to no window, and
+ * a UI that starts one anyway becomes a second writer against the same
+ * SYNARA_HOME — which is the failure this whole feature exists to prevent.
+ */
+let attachedToExistingHost = false;
+
+export function isAttachedToExistingHost(): boolean {
+  return attachedToExistingHost;
+}
+
+/** Points this UI at a host that is already running. */
+function adoptHostEndpoint(endpoint: { readonly origin: string; readonly port: number }): void {
+  attachedToExistingHost = true;
+  backendPort = endpoint.port;
+  backendHttpUrl = endpoint.origin;
+  backendWsUrl = `${endpoint.origin.replace(/^http/, "ws")}/?token=${encodeURIComponent(backendAuthToken)}`;
+  process.env.SYNARA_DESKTOP_WS_URL = backendWsUrl;
+}
+
 function hostModeEnabled(): boolean {
   const raw = process.env.SYNARA_HOST_MODE?.trim().toLowerCase();
   return raw === "1" || raw === "true";
@@ -3332,6 +3357,13 @@ function startDetachedHost(backendEntry: string, backendEnvironment: NodeJS.Proc
 
 function startBackend(trigger: BackendStartTrigger = "lifecycle"): void {
   if (isQuitting || backendProcess) return;
+  // This UI attached to a host it does not own. Starting one here would put a
+  // second writer on the same SYNARA_HOME; if the host has genuinely died, the
+  // next launch re-decides from the record rather than racing it now.
+  if (attachedToExistingHost) {
+    writeDesktopLogHeader("backend start suppressed: attached to an existing host");
+    return;
+  }
   // Recovery owns the database until it clears the marker. Callers that restart
   // the backend after an unrelated failure — a given-up update install, say —
   // must not hand it a database the user is being asked how to repair.
@@ -3469,6 +3501,9 @@ function startBackend(trigger: BackendStartTrigger = "lifecycle"): void {
 
 function takeBackendProcessForShutdown(): ChildProcess.ChildProcess | null {
   cancelBackendReadinessWait();
+  // Nothing to take when we attached: the host is not ours to stop, and quitting
+  // this window must leave it serving every other client. Deliberate stops for
+  // an update go through a separate path that targets the host explicitly.
   backendListeningDetector = null;
   if (restartTimer) {
     clearTimeout(restartTimer);
@@ -4341,7 +4376,27 @@ async function bootstrap(): Promise<void> {
   }
 
   backendAuthToken = Crypto.randomBytes(24).toString("hex");
-  await reserveBackendEndpoint("bootstrap");
+
+  // Reserving a port is right when this UI is about to start the server and
+  // wrong when it is about to attach: a running host is already bound to the
+  // port in its record, and a port reserved here would point every request at
+  // something nothing is listening on. So the decision comes first.
+  const attachOutcome = hostModeEnabled()
+    ? await resolveHostEndpoint({ facts: gatherHostAdoptionFacts({ stateDir: STATE_DIR }) })
+    : ({ kind: "start-host", reason: "host mode is disabled" } as const);
+
+  if (attachOutcome.kind === "attached") {
+    adoptHostEndpoint(attachOutcome.endpoint);
+    writeDesktopLogHeader(
+      `bootstrap attached to host pid=${attachOutcome.pid} origin=${attachOutcome.endpoint.origin}`,
+    );
+  } else {
+    // The reason is logged rather than swallowed: "Synara started a second
+    // server" is otherwise indistinguishable from "Synara ignored my host", and
+    // the refusals name which one happened.
+    writeDesktopLogHeader(`bootstrap starting a host: ${attachOutcome.reason}`);
+    await reserveBackendEndpoint("bootstrap");
+  }
 
   registerIpcHandlers();
   writeDesktopLogHeader("bootstrap ipc handlers registered");
