@@ -61,6 +61,12 @@ import { applyShellEnvironmentHydrationMarker } from "@synara/shared/shell";
 import { RotatingFileSink } from "@synara/shared/logging";
 import { ensureStaticSnapshot, findAsarArchivePath } from "@synara/shared/staticSnapshot";
 import { isBackendReadinessAborted, waitForHttpReady } from "./backendReadiness";
+import {
+  closeHostLogDescriptors,
+  detachedHostSpawnOptions,
+  type HostLogDescriptors,
+  openHostLogDescriptors,
+} from "./detachedHostSpawn";
 import { resolveBackendNodeArgs } from "./backendNodeOptions";
 import {
   retainLiveBackendAfterShutdownFailure,
@@ -260,6 +266,8 @@ const COMMIT_HASH_DISPLAY_LENGTH = 12;
 const LOG_DIR = Path.join(STATE_DIR, "logs");
 const DESKTOP_LOG_FILE_NAME = "desktop-main.log";
 const BACKEND_LOG_FILE_NAME = "server-child.log";
+// The detached host writes here instead of into pipes owned by the UI.
+const HOST_LOG_FILE_NAME = "server-host.log";
 const LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
 const LOG_FILE_MAX_FILES = 10;
 const APP_RUN_ID = Crypto.randomBytes(6).toString("hex");
@@ -3249,6 +3257,79 @@ async function restartBackendAfterCrash(
  */
 type BackendStartTrigger = "lifecycle" | "crash-restart";
 
+/**
+ * Whether this launch runs the server as a host that outlives the window.
+ *
+ * Opt-in for now, and deliberately so: making the server survive quit changes
+ * what "Quit Synara" means, and that needs UI — a tray indicator, a way to stop
+ * the host — before it can be the default. The flag lets the lifecycle land and
+ * be exercised on real machines while the surface is still being designed.
+ */
+function hostModeEnabled(): boolean {
+  const raw = process.env.SYNARA_HOST_MODE?.trim().toLowerCase();
+  return raw === "1" || raw === "true";
+}
+
+/**
+ * Starts the server as a detached host.
+ *
+ * The differences from the child path are all consequences of one thing: this
+ * process must keep running after we exit.
+ *
+ * - Output goes to file descriptors, not pipes. A pipe's read end closes with
+ *   the UI, and the host's next log line would then raise EPIPE and kill it.
+ * - Nothing is tracked in `backendProcess`. That field means "a child this UI
+ *   supervises", and the crash watchdog restarts whatever is in it — which for a
+ *   host that is merely unreachable would start a SECOND writer over a live one.
+ * - Readiness comes from polling /health rather than reading stdout, which
+ *   waitForBackendStartupReady already supports when no listening promise exists.
+ * - The browser-host capability travels by environment. fd 3 cannot be inherited
+ *   by a process that outlives us, and the server already prefers the env value
+ *   (browserHostRpcClient.resolveBrowserHostCapability).
+ */
+function startDetachedHost(backendEntry: string, backendEnvironment: NodeJS.ProcessEnv): void {
+  let descriptors: HostLogDescriptors;
+  try {
+    descriptors = openHostLogDescriptors(LOG_DIR, HOST_LOG_FILE_NAME);
+  } catch (error) {
+    scheduleBackendRestart(`failed to open host log: ${formatErrorMessage(error)}`);
+    return;
+  }
+
+  try {
+    const child = ChildProcess.spawn(
+      process.execPath,
+      [...backendNodeArgs(), backendEntry],
+      detachedHostSpawnOptions({
+        cwd: resolveBackendCwd(),
+        env: {
+          ...backendEnvironment,
+          // Replaces the fd-3 handoff. Read before the fd path by the server, and
+          // subject to the same 32-byte minimum.
+          SYNARA_BROWSER_HOST_CAPABILITY: DESKTOP_BROWSER_HOST_CAPABILITY,
+        },
+        stdoutFd: descriptors.stdoutFd,
+        stderrFd: descriptors.stderrFd,
+      }),
+    );
+
+    // detached governs signals; unref governs whether our event loop waits. Both
+    // are required — detached alone would keep the UI alive at quit, waiting on a
+    // server built never to exit.
+    child.unref();
+
+    writeDesktopLogHeader(
+      `host started detached pid=${child.pid ?? "unknown"} port=${backendPort} log=${descriptors.path}`,
+    );
+  } catch (error) {
+    scheduleBackendRestart(`failed to start detached host: ${formatErrorMessage(error)}`);
+  } finally {
+    // The child holds its own duplicates. Holding ours would keep the log file
+    // open for this UI's whole life and block rotation on Windows.
+    closeHostLogDescriptors(descriptors);
+  }
+}
+
 function startBackend(trigger: BackendStartTrigger = "lifecycle"): void {
   if (isQuitting || backendProcess) return;
   // Recovery owns the database until it clears the marker. Callers that restart
@@ -3269,15 +3350,22 @@ function startBackend(trigger: BackendStartTrigger = "lifecycle"): void {
     return;
   }
 
+  const backendEnvironment: NodeJS.ProcessEnv = {
+    ...backendEnv(),
+    ELECTRON_RUN_AS_NODE: "1",
+    SYNARA_SERVER_ENTRY: backendEntry,
+  };
+
+  if (hostModeEnabled()) {
+    startDetachedHost(backendEntry, backendEnvironment);
+    return;
+  }
+
   const child = ChildProcess.spawn(process.execPath, [...backendNodeArgs(), backendEntry], {
     cwd: resolveBackendCwd(),
     // In Electron main, process.execPath points to the Electron binary.
     // Run the child in Node mode so this backend process does not become a GUI app instance.
-    env: {
-      ...backendEnv(),
-      ELECTRON_RUN_AS_NODE: "1",
-      SYNARA_SERVER_ENTRY: backendEntry,
-    },
+    env: backendEnvironment,
     // Keep output piped in every environment so startup blockers and readiness
     // are observable even when packaged log setup is unavailable. The fourth
     // pipe carries the browser-host capability and must never be inherited.
