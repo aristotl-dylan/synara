@@ -5,8 +5,11 @@
 
 import type { ThreadId } from "@synara/contracts";
 import { useEffect, useRef } from "react";
-import { hasThreadDetailResumeCursor } from "./threadDetailResumeCursors";
-import { retainThreadDetailSubscription } from "./threadDetailSubscriptionRetention";
+import { localThreadDetailResumeCursors } from "./threadDetailResumeCursors";
+import {
+  retainSpeculativeThreadDetail,
+  type SpeculativeThreadDetailRetainOptions,
+} from "./threadDetailSpeculativeRetain";
 
 export const THREAD_DETAIL_PREWARM_RELEASE_MS = 10_000;
 export const THREAD_DETAIL_PREWARM_LIMIT = 5;
@@ -33,6 +36,7 @@ export interface ThreadDetailPrewarmController {
 export interface ThreadDetailPrewarmControllerOptions {
   retainThreadDetailSubscription?: RetainThreadDetailSubscription | undefined;
   canPrewarmThreadDetail?: ((threadId: ThreadId) => boolean) | undefined;
+  subscribeResumeCursorReset?: ((listener: () => void) => () => void) | undefined;
   releaseMs?: number | undefined;
   maxRetainedThreads?: number | undefined;
   clock?: ThreadDetailPrewarmClock | undefined;
@@ -73,12 +77,15 @@ function uniqueEligibleThreadIds(
 export function createThreadDetailPrewarmController(
   options: ThreadDetailPrewarmControllerOptions = {},
 ): ThreadDetailPrewarmController {
-  const retainThreadDetail =
-    options.retainThreadDetailSubscription ?? retainThreadDetailSubscription;
   // A speculative prewarm subscription is only cheap when it resumes from a
   // cursor: without cached detail it would open a full-history snapshot stream
   // and compete with real navigation for the per-client thread-stream budget.
-  const canPrewarmThreadDetail = options.canPrewarmThreadDetail ?? hasThreadDetailResumeCursor;
+  // Local-only cursor read: this must be keyed by (EnvironmentId, ThreadId)
+  // before a remote environment can be registered — see the KNOWN GAP note at
+  // the top of threadDetailSubscriptionRetention.ts.
+  const canRetainThreadDetail =
+    options.canPrewarmThreadDetail ??
+    ((threadId) => localThreadDetailResumeCursors().has(threadId));
   const releaseMs = options.releaseMs ?? THREAD_DETAIL_PREWARM_RELEASE_MS;
   const maxRetainedThreads = options.maxRetainedThreads ?? THREAD_DETAIL_PREWARM_LIMIT;
   const clock = options.clock ?? DEFAULT_CLOCK;
@@ -94,16 +101,38 @@ export function createThreadDetailPrewarmController(
     retainedThreadById.delete(threadId);
   };
 
+  const retainOptions: SpeculativeThreadDetailRetainOptions = {
+    ...(options.retainThreadDetailSubscription === undefined
+      ? {}
+      : { retainThreadDetailSubscription: options.retainThreadDetailSubscription }),
+    ...(options.canPrewarmThreadDetail === undefined
+      ? {}
+      : { canRetainThreadDetail: options.canPrewarmThreadDetail }),
+    ...(options.subscribeResumeCursorReset === undefined
+      ? {}
+      : { subscribeResumeCursorReset: options.subscribeResumeCursorReset }),
+    // The retain released itself because its cursor is gone; forget the entry
+    // in the same step so this map never claims a lease it no longer holds.
+    onAutoRelease: (threadId) => {
+      const entry = retainedThreadById.get(threadId);
+      if (!entry) return;
+      clock.clearTimeout(entry.timeoutId);
+      retainedThreadById.delete(threadId);
+    },
+  };
+
   const prewarmThreadDetail = (threadId: ThreadId) => {
     const existing = retainedThreadById.get(threadId);
-    if (!existing && !canPrewarmThreadDetail(threadId)) {
-      return;
-    }
     if (existing) {
       clock.clearTimeout(existing.timeoutId);
     }
 
-    const release = existing?.release ?? retainThreadDetail(threadId);
+    // Eligibility lives in the shared speculative retain: it gates admission on
+    // a resume cursor and gives the retain back if that cursor is later reset.
+    const release = existing?.release ?? retainSpeculativeThreadDetail(threadId, retainOptions);
+    if (release === null) {
+      return;
+    }
     const timeoutId = clock.setTimeout(() => {
       const current = retainedThreadById.get(threadId);
       if (!current || current.release !== release) {
@@ -124,7 +153,9 @@ export function createThreadDetailPrewarmController(
         maxRetainedThreads,
         // Already-retained threads stay eligible: their prewarm retain is live
         // even if the cursor moved underneath, matching prewarmThreadDetail.
-        (threadId) => retainedThreadById.has(threadId) || canPrewarmThreadDetail(threadId),
+        // A retain the cursor reset took back has already left this map, so it
+        // is re-checked here like any cold thread — one source of truth.
+        (threadId) => retainedThreadById.has(threadId) || canRetainThreadDetail(threadId),
       );
       const nextThreadIdSet = new Set(nextThreadIds);
 

@@ -119,6 +119,12 @@ import type {
   ProjectWriteFileResult,
 } from "./project";
 import type { FilesystemBrowseInput, FilesystemBrowseResult } from "./filesystem";
+import type {
+  RemoteHostFingerprintInput,
+  RemoteHostFingerprintResult,
+  RemoteHostProbeInput,
+  RemoteHostProbeRpcResult,
+} from "./remoteHost";
 import type { StudioListThreadOutputsInput, StudioListThreadOutputsResult } from "./studio";
 import type {
   ServerConfig,
@@ -134,6 +140,7 @@ import type {
   ServerListProviderUsageResult,
   ServerGetSettingsResult,
   ServerListLocalServersResult,
+  ServerPhoneReachabilityResult,
   ServerListWorktreesResult,
   ServerProviderUpdateInput,
   ServerProviderUpdateResult,
@@ -268,6 +275,12 @@ export interface BrowserTabState {
   id: string;
   url: string;
   title: string;
+  /**
+   * Agent-owned tabs use a main-process WebContentsView so the exact page can
+   * stay alive while its chat route is not mounted. Older snapshots omit this
+   * field and are treated as renderer-owned by the web app.
+   */
+  runtimeSurface?: "native" | "renderer";
   status: "live" | "suspended";
   isLoading: boolean;
   canGoBack: boolean;
@@ -677,7 +690,12 @@ export interface NativeApi {
     updateProvider: (input: ServerProviderUpdateInput) => Promise<ServerProviderUpdateResult>;
     listWorktrees: () => Promise<ServerListWorktreesResult>;
     listLocalServers: () => Promise<ServerListLocalServersResult>;
+    getPhoneReachability: () => Promise<ServerPhoneReachabilityResult>;
     stopLocalServer: (input: ServerStopLocalServerInput) => Promise<ServerStopLocalServerResult>;
+    probeRemoteHost: (input: RemoteHostProbeInput) => Promise<RemoteHostProbeRpcResult>;
+    getRemoteHostFingerprint: (
+      input: RemoteHostFingerprintInput,
+    ) => Promise<RemoteHostFingerprintResult>;
     getProviderUsageSnapshot: (
       input: ServerGetProviderUsageSnapshotInput,
     ) => Promise<ServerGetProviderUsageSnapshotResult>;

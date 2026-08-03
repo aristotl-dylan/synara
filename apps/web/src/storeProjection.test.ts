@@ -2,6 +2,7 @@
 // Purpose: Exercises snapshot normalization and normalized projection ownership.
 
 import {
+  EnvironmentId,
   EventId,
   MessageId,
   ProjectId,
@@ -17,7 +18,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   applyShellEvent,
+  applyThreadUpdate,
+  clearEnvironmentShellFence,
   clearThreadDetailSyncFailureInClientState,
+  discardEnvironmentProjection,
   evictThreadDetailFromClientState,
   markThreadDetailSyncFailedInClientState,
   removeDeletedProjectFromClientState,
@@ -26,10 +30,12 @@ import {
   syncServerReadModel,
   syncServerThreadDetailHotPath,
 } from "./storeProjection";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
+import { selectEnvironment, selectLocalEnvironment } from "./storeAggregation";
 import {
-  hasThreadDetailResumeCursor,
+  localThreadDetailResumeCursors,
   resetThreadDetailResumeCursorsForTests,
-  setThreadDetailResumeCursor,
+  threadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
 import type { AppState } from "./storeState";
 import { getThreadFromState } from "./threadDerivation";
@@ -37,6 +43,8 @@ import {
   makeThread,
   makeActivity,
   makeState,
+  makeEnvironmentState,
+  makeStoreState,
   makeProject,
   makeReadModelThread,
   makeReadModel,
@@ -228,7 +236,7 @@ describe("store projection", () => {
   });
 
   it("reuses the existing project slot for shell upserts that keep the same workspace root", () => {
-    const initialState: AppState = {
+    const initialState: AppState = makeStoreState({
       spaces: [],
       projects: [
         makeProject({
@@ -241,7 +249,7 @@ describe("store projection", () => {
       ],
       sidebarThreadSummaryById: {},
       threadsHydrated: true,
-    };
+    });
 
     const next = applyShellEvent(initialState, {
       kind: "project-upserted",
@@ -269,7 +277,7 @@ describe("store projection", () => {
 
   it("moves shell projects to Void with the deletion timestamp", () => {
     const spaceId = SpaceId.makeUnsafe("space-shell-delete");
-    const initialState: AppState = {
+    const initialState: AppState = makeStoreState({
       spaces: [
         {
           id: spaceId,
@@ -289,7 +297,7 @@ describe("store projection", () => {
       ],
       sidebarThreadSummaryById: {},
       threadsHydrated: true,
-    };
+    });
 
     const next = applyShellEvent(initialState, {
       kind: "space-removed",
@@ -307,8 +315,7 @@ describe("store projection", () => {
 
   it("drops descendant thread state when a shell project removal arrives", () => {
     const initialState = syncServerReadModel(
-      {
-        spaces: [],
+      makeStoreState({
         projects: [
           makeProject({
             id: ProjectId.makeUnsafe("project-shell"),
@@ -319,9 +326,8 @@ describe("store projection", () => {
             cwd: "/tmp/project-other",
           }),
         ],
-        sidebarThreadSummaryById: {},
         threadsHydrated: true,
-      },
+      }),
       {
         snapshotSequence: 1,
         updatedAt: "2026-02-27T00:00:00.000Z",
@@ -1261,11 +1267,11 @@ describe("store projection", () => {
 
   it("creates an initial sidebar summary when hot-path detail sync sees a new thread first", () => {
     const threadId = ThreadId.makeUnsafe("thread-detail-before-shell");
-    const initialState: AppState = {
-      ...makeState(makeThread()),
+    const initialState: AppState = makeStoreState({
+      ...makeEnvironmentState(makeThread()),
       threadIds: [],
       sidebarThreadSummaryById: {},
-    };
+    });
 
     const next = syncServerThreadDetailHotPath(
       initialState,
@@ -2075,32 +2081,32 @@ describe("resume cursor lifecycle in projection transitions", () => {
 
   function makeStateWithCursor() {
     const state = makeState(makeThread({ id: threadId, projectId }));
-    setThreadDetailResumeCursor(threadId, 42);
+    localThreadDetailResumeCursors().set(threadId, 42);
     return state;
   }
 
   it("clears the cursor when the thread's detail is evicted", () => {
     const state = makeStateWithCursor();
     evictThreadDetailFromClientState(state, threadId);
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when the thread is deleted", () => {
     const state = makeStateWithCursor();
     removeDeletedThreadFromClientState(state, threadId);
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when the thread's project is deleted", () => {
     const state = makeStateWithCursor();
     removeDeletedProjectFromClientState(state, projectId);
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a shell thread-removed event drops the thread", () => {
     const state = makeStateWithCursor();
     applyShellEvent(state, { kind: "thread-removed", sequence: 50, threadId });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a shell snapshot prunes the thread", () => {
@@ -2112,7 +2118,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       projects: [],
       threads: [],
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a read-model repair prunes the thread", () => {
@@ -2124,7 +2130,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       snapshotSequence: 60,
       threads: [],
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a full read-model sync replaces retained detail", () => {
@@ -2137,7 +2143,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       ...makeReadModel(makeReadModelThread({ id: threadId, projectId })),
       snapshotSequence: 60,
     });
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
   });
 
   it("clears the cursor when a tombstone rejects the thread's detail snapshot", () => {
@@ -2145,7 +2151,7 @@ describe("resume cursor lifecycle in projection transitions", () => {
       makeState(makeThread({ id: threadId, projectId })),
       threadId,
     );
-    setThreadDetailResumeCursor(threadId, 42);
+    localThreadDetailResumeCursors().set(threadId, 42);
 
     const next = syncServerThreadDetailHotPath(
       state,
@@ -2155,6 +2161,855 @@ describe("resume cursor lifecycle in projection transitions", () => {
     // The tombstone discarded the snapshot instead of applying it, so nothing
     // may vouch for detail that was never stored.
     expect(next.threadDetailSyncById?.[threadId]).toBeUndefined();
-    expect(hasThreadDetailResumeCursor(threadId)).toBe(false);
+    expect(localThreadDetailResumeCursors().has(threadId)).toBe(false);
+  });
+});
+
+describe("multi-environment shell aggregation", () => {
+  const localThreadId = ThreadId.makeUnsafe("thread-local");
+  const remoteThreadId = ThreadId.makeUnsafe("thread-remote");
+  const remoteEnvironmentId = EnvironmentId.makeUnsafe("11111111-1111-4111-8111-111111111111");
+
+  const shellThread = (id: ThreadId, title: string) => ({
+    id,
+    projectId: ProjectId.makeUnsafe("project-1"),
+    title,
+    modelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    interactionMode: DEFAULT_INTERACTION_MODE,
+    envMode: "local" as const,
+    branch: null,
+    worktreePath: null,
+    forkSourceThreadId: null,
+    sidechatSourceThreadId: null,
+    latestTurn: null,
+    createdAt: "2026-02-27T00:00:00.000Z",
+    updatedAt: "2026-02-27T00:00:30.000Z",
+    handoff: null,
+    session: null,
+  });
+
+  // A store with no threads yet; these cases build their own state from snapshots.
+  const emptyState = (): AppState => makeStoreState();
+
+  beforeEach(() => {
+    resetThreadDetailResumeCursorsForTests();
+  });
+
+  it("keeps both environments' threads when each emits the same snapshot sequence", () => {
+    // Two servers both starting at sequence 1 is the normal case: their
+    // sequences are unrelated autoincrement counters. A shared fence would make
+    // the second look stale, and a shared prune would delete the first's rows.
+    const localSnapshot = {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local thread")),
+      snapshotSequence: 1,
+    };
+    const remoteSnapshot = {
+      ...makeShellSnapshot(shellThread(remoteThreadId, "Remote thread")),
+      snapshotSequence: 1,
+    };
+
+    const afterLocal = syncServerShellSnapshot(emptyState(), localSnapshot);
+    const afterRemote = syncServerShellSnapshot(afterLocal, remoteSnapshot, remoteEnvironmentId);
+
+    expect(afterRemote.threadIds).toContain(localThreadId);
+    expect(afterRemote.threadIds).toContain(remoteThreadId);
+    // Ownership is positional: each thread lives in exactly one environment's
+    // record, so there is no side table that can disagree with where the rows are.
+    expect(selectEnvironment(afterRemote, remoteEnvironmentId).threadIds).toContain(remoteThreadId);
+    expect(selectEnvironment(afterRemote, remoteEnvironmentId).threadIds).not.toContain(
+      localThreadId,
+    );
+    expect(selectLocalEnvironment(afterRemote).threadIds).toContain(localThreadId);
+  });
+
+  it("does not let one environment's snapshot prune another's threads", () => {
+    const afterLocal = syncServerShellSnapshot(
+      emptyState(),
+      makeShellSnapshot(shellThread(localThreadId, "Local thread")),
+    );
+    const afterRemote = syncServerShellSnapshot(
+      afterLocal,
+      makeShellSnapshot(shellThread(remoteThreadId, "Remote thread")),
+      remoteEnvironmentId,
+    );
+
+    // A later local snapshot that no longer lists the remote thread must not
+    // remove it: the local server has no authority over the remote's rows.
+    const afterLocalResync = syncServerShellSnapshot(afterRemote, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local thread renamed")),
+      snapshotSequence: 9,
+    });
+
+    expect(afterLocalResync.threadIds).toContain(remoteThreadId);
+    expect(afterLocalResync.threadShellById?.[remoteThreadId]?.title).toBe("Remote thread");
+  });
+
+  it("fences each environment against its own sequence space only", () => {
+    const afterRemoteHigh = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+
+    // Sequence 3 is far below the remote's 500 but is the local server's first
+    // snapshot, so it must be applied rather than rejected as stale.
+    const afterLocalLow = syncServerShellSnapshot(afterRemoteHigh, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 3,
+    });
+
+    expect(afterLocalLow.threadIds).toContain(localThreadId);
+    expect(selectEnvironment(afterLocalLow, remoteEnvironmentId).shellSnapshotSequence).toBe(500);
+  });
+
+  it("still rejects a genuinely stale snapshot within one environment", () => {
+    const hydrated = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Fresh")), snapshotSequence: 20 },
+      remoteEnvironmentId,
+    );
+    const stale = syncServerShellSnapshot(
+      hydrated,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Stale")), snapshotSequence: 5 },
+      remoteEnvironmentId,
+    );
+
+    expect(stale).toBe(hydrated);
+  });
+
+  it("prunes only its own environment's resume cursors", () => {
+    threadDetailResumeCursors(remoteEnvironmentId).set(remoteThreadId, 77);
+    localThreadDetailResumeCursors().set(localThreadId, 42);
+
+    // A local snapshot that does not list either thread prunes the local cursor
+    // but must leave the remote environment's cursor space untouched.
+    syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(ThreadId.makeUnsafe("thread-other"), "Other")),
+      snapshotSequence: 30,
+    });
+
+    expect(localThreadDetailResumeCursors().has(localThreadId)).toBe(false);
+    expect(threadDetailResumeCursors(remoteEnvironmentId).get(remoteThreadId)).toBe(77);
+  });
+
+  it("prunes the remote's own stale cursor and spares the local one", () => {
+    // Mirror of the case above, with a REMOTE snapshot doing the pruning. The
+    // local-only version cannot distinguish the correct scope from the local
+    // one, because for a local snapshot they are the same object. Under a
+    // remote snapshot, pruning through the local scope goes wrong twice: the
+    // remote's stale cursor survives (vouching for detail this prune just
+    // discarded, so a resubscribe resumes on top of missing history) and the
+    // local environment's live cursor is destroyed.
+    threadDetailResumeCursors(remoteEnvironmentId).set(remoteThreadId, 77);
+    localThreadDetailResumeCursors().set(localThreadId, 42);
+
+    // The remote snapshot lists a different thread, so `remoteThreadId`'s
+    // detail is pruned and its cursor must fall with it.
+    syncServerShellSnapshot(
+      emptyState(),
+      {
+        ...makeShellSnapshot(shellThread(ThreadId.makeUnsafe("thread-remote-other"), "Other")),
+        snapshotSequence: 30,
+      },
+      remoteEnvironmentId,
+    );
+
+    expect(threadDetailResumeCursors(remoteEnvironmentId).has(remoteThreadId)).toBe(false);
+    // The local server's journal was not involved; its cursor is still valid.
+    expect(localThreadDetailResumeCursors().get(localThreadId)).toBe(42);
+  });
+
+  it("fences a low local sequence independently of a high remote one", () => {
+    // The reverse direction of the shared-fence case: local first at a high
+    // sequence, then remote at a low one. A single shared counter would reject
+    // the remote snapshot as stale here, while the local-low/remote-high
+    // ordering alone would not catch it.
+    const afterLocalHigh = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 500,
+    });
+
+    const afterRemoteLow = syncServerShellSnapshot(
+      afterLocalHigh,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 2 },
+      remoteEnvironmentId,
+    );
+
+    expect(afterRemoteLow.threadIds).toContain(remoteThreadId);
+    expect(afterRemoteLow.threadIds).toContain(localThreadId);
+    expect(selectEnvironment(afterRemoteLow, remoteEnvironmentId).shellSnapshotSequence).toBe(2);
+    // The local fence lives in the local environment's record and nowhere else,
+    // so there is no second copy that a partial reset could leave behind.
+    expect(selectLocalEnvironment(afterRemoteLow).shellSnapshotSequence).toBe(500);
+    expect(afterRemoteLow.shellSnapshotSequence).toBe(500);
+  });
+
+  it("keeps the local fence in shellSnapshotSequence so a partial reset fully clears it", () => {
+    // Regression: the local fence was duplicated into the per-environment map.
+    // Every store reset written before that map existed zeroes
+    // shellSnapshotSequence alone, so the duplicate survived and silently
+    // rejected the next snapshot as stale — the browser suite stopped
+    // hydrating and 60 tests timed out waiting for UI that never rendered.
+    const hydrated = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 500,
+    });
+
+    // The local fence must live in exactly one place.
+    expect(selectLocalEnvironment(hydrated).shellSnapshotSequence).toBe(500);
+
+    // Resetting that one place must be enough; there is no duplicate to miss.
+    const afterReset = clearEnvironmentShellFence(hydrated, LOCAL_ENVIRONMENT_ID);
+    const rehydrated = syncServerShellSnapshot(afterReset, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local again")),
+      snapshotSequence: 2,
+    });
+
+    expect(rehydrated.threadsHydrated).toBe(true);
+    expect(rehydrated.threadIds).toContain(localThreadId);
+  });
+
+  /**
+   * Replaces a test that was named for teardown but never performed any: it
+   * hydrated a remote fence at 500 and then asserted the fence WAS 500, so it
+   * pinned the bug rather than the fix.
+   */
+  /**
+   * NOTE for anyone writing a similar probe: `makeShellSnapshot` defaults BOTH
+   * environments to `project-1`, so a two-environment test that does not give
+   * each its own project shows no damage at all and reads as "already fixed".
+   * Each snapshot below carries a distinct project id on purpose.
+   */
+  it("keeps every environment's projects and spaces across cross-environment snapshots", () => {
+    const remoteProject = {
+      id: ProjectId.makeUnsafe("project-remote"),
+      title: "Remote Project",
+      workspaceRoot: "/tmp/remote",
+      defaultModelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+      scripts: [],
+      spaceId: null,
+    };
+    const localSpace = {
+      id: SpaceId.makeUnsafe("space-local"),
+      name: "Local Space",
+      icon: "bag" as const,
+      sortOrder: 0,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+    };
+    const remoteSpace = {
+      id: SpaceId.makeUnsafe("space-remote"),
+      name: "Remote Space",
+      icon: "rocket" as const,
+      sortOrder: 0,
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+    };
+    const localSnapshot = {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      spaces: [localSpace],
+      snapshotSequence: 1,
+    };
+    const remoteSnapshot = {
+      ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+      projects: [remoteProject],
+      spaces: [remoteSpace],
+      snapshotSequence: 1,
+    };
+
+    const afterLocal = syncServerShellSnapshot(emptyState(), localSnapshot);
+    const afterRemote = syncServerShellSnapshot(afterLocal, remoteSnapshot, remoteEnvironmentId);
+
+    // The damage landed HERE before the fix, not on a later resync: the remote's
+    // snapshot rebuilt `projects` from itself and the local project vanished.
+    expect(afterRemote.projects.map((project) => project.id).toSorted()).toEqual([
+      "project-1",
+      "project-remote",
+    ]);
+    // Positional ownership, as for threads.
+    expect(
+      selectEnvironment(afterRemote, remoteEnvironmentId).projects.map((project) => project.id),
+    ).toEqual(["project-remote"]);
+    expect(selectLocalEnvironment(afterRemote).projects.map((project) => project.id)).toEqual([
+      "project-1",
+    ]);
+    // SPACES, which this test is named for and never exercised: the remote
+    // snapshot rebuilt `spaces` from itself exactly as it did `projects`, so
+    // the local space vanished on the first cross-environment snapshot.
+    expect(afterRemote.spaces.map((space) => space.id).toSorted()).toEqual([
+      "space-local",
+      "space-remote",
+    ]);
+    expect(selectEnvironment(afterRemote, remoteEnvironmentId).spaces.map((s) => s.id)).toEqual([
+      "space-remote",
+    ]);
+    expect(selectLocalEnvironment(afterRemote).spaces.map((s) => s.id)).toEqual(["space-local"]);
+
+    // ...and the local server resyncing must not delete the remote's project.
+    const afterLocalResync = syncServerShellSnapshot(afterRemote, {
+      ...localSnapshot,
+      snapshotSequence: 2,
+    });
+    expect(afterLocalResync.projects.map((project) => project.id).toSorted()).toEqual([
+      "project-1",
+      "project-remote",
+    ]);
+    // ...and the remote's space survives a local resync too.
+    expect(afterLocalResync.spaces.map((space) => space.id).toSorted()).toEqual([
+      "space-local",
+      "space-remote",
+    ]);
+    // Threads survived throughout; the point is that their projects now do too.
+    expect(afterLocalResync.threadIds).toContain(localThreadId);
+    expect(afterLocalResync.threadIds).toContain(remoteThreadId);
+  });
+
+  it("drops a project the owning environment stopped reporting", () => {
+    const remoteProject = {
+      id: ProjectId.makeUnsafe("project-remote"),
+      title: "Remote Project",
+      workspaceRoot: "/tmp/remote",
+      defaultModelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+      scripts: [],
+      spaceId: null,
+    };
+    const withRemote = syncServerShellSnapshot(
+      emptyState(),
+      {
+        ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+        projects: [remoteProject],
+        snapshotSequence: 1,
+      },
+      remoteEnvironmentId,
+    );
+    expect(withRemote.projects.map((project) => project.id)).toContain("project-remote");
+
+    // The remote deletes the project server-side and resyncs without it. Its own
+    // snapshot IS authoritative for its own projects, so it must disappear —
+    // otherwise a remote deletion could never propagate.
+    const afterRemoteDrop = syncServerShellSnapshot(
+      withRemote,
+      {
+        ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+        projects: [],
+        snapshotSequence: 2,
+      },
+      remoteEnvironmentId,
+    );
+    expect(afterRemoteDrop.projects.map((project) => project.id)).not.toContain("project-remote");
+    expect(
+      selectEnvironment(afterRemoteDrop, remoteEnvironmentId).projects.map((project) => project.id),
+    ).not.toContain("project-remote");
+  });
+
+  /**
+   * A deleted thread must not come back because ANOTHER server's snapshot
+   * happened to carry a higher sequence. Tombstones live in the sequence space
+   * of the server that recorded the deletion; a remote idling at 5000 would
+   * otherwise satisfy `5000 >= 101` and retire a local tombstone written at 101,
+   * and since a remote snapshot never lists local threads the "still present"
+   * check passes too. The next local snapshot then resurrects the row.
+   */
+  /**
+   * The read-model path's twin of the shell path's foreign-thread carryover.
+   * This one was unpinned: replacing `threadIdsOutsideEnvironment` with an empty
+   * set here left the whole suite green, while the same mutation in
+   * `syncServerShellSnapshot` fails three tests. This path is what "Repair local
+   * state" and desktop bootstrap recovery run, so a regression here wipes every
+   * remote environment's threads with nothing noticing.
+   */
+  /**
+   * `threadsHydrated` gates destructive work, not just a spinner:
+   * `prunePinnedProjects`, `prunePinnedThreads` and the recent-view pruner all
+   * run on it. A remote snapshot arriving first must NOT flip it, or those
+   * pruners run against a store whose local rows have not loaded and silently
+   * drop pins whose targets are merely absent — and the pruned set is what gets
+   * persisted, so nothing restores them.
+   */
+  it("stays unhydrated when only a remote environment has reported", () => {
+    const afterRemote = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 1 },
+      remoteEnvironmentId,
+    );
+
+    expect(afterRemote.threadsHydrated).toBe(false);
+    // The remote's own rows still landed; only the local-hydration claim waits.
+    expect(afterRemote.threadIds).toContain(remoteThreadId);
+  });
+
+  it("hydrates once the local environment reports", () => {
+    const afterRemote = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 1 },
+      remoteEnvironmentId,
+    );
+    const afterLocal = syncServerShellSnapshot(afterRemote, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 1,
+    });
+
+    expect(afterLocal.threadsHydrated).toBe(true);
+  });
+
+  it("keeps hydration once set when a later remote snapshot arrives", () => {
+    const afterLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 1,
+    });
+    expect(afterLocal.threadsHydrated).toBe(true);
+
+    const afterRemote = syncServerShellSnapshot(
+      afterLocal,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 1 },
+      remoteEnvironmentId,
+    );
+
+    // A remote snapshot must not UN-hydrate either; it has no authority here.
+    expect(afterRemote.threadsHydrated).toBe(true);
+  });
+
+  it("keeps remote environments' threads through a local read-model resync", () => {
+    const withRemote = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 1 },
+      remoteEnvironmentId,
+    );
+    expect(withRemote.threadIds).toContain(remoteThreadId);
+
+    // A local read-model resync is authoritative for the LOCAL server only.
+    const afterReadModel = syncServerReadModel(
+      withRemote,
+      makeReadModel(makeReadModelThread({ id: localThreadId })),
+    );
+
+    expect(afterReadModel.threadIds).toContain(remoteThreadId);
+    expect(afterReadModel.threadIds).toContain(localThreadId);
+    expect(selectEnvironment(afterReadModel, remoteEnvironmentId).threadIds).toContain(
+      remoteThreadId,
+    );
+  });
+
+  it("keeps remote environments' projects through a local read-model resync", () => {
+    const remoteProject = {
+      id: ProjectId.makeUnsafe("project-remote"),
+      title: "Remote Project",
+      workspaceRoot: "/tmp/remote",
+      defaultModelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+      scripts: [],
+      spaceId: null,
+    };
+    const withRemote = syncServerShellSnapshot(
+      emptyState(),
+      {
+        ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+        projects: [remoteProject],
+        snapshotSequence: 1,
+      },
+      remoteEnvironmentId,
+    );
+    expect(withRemote.projects.map((project) => project.id)).toContain("project-remote");
+
+    // The read-model path is the other place projects are rebuilt wholesale.
+    // It is authoritative for the local server only.
+    const afterReadModel = syncServerReadModel(
+      withRemote,
+      makeReadModel(makeReadModelThread({ id: localThreadId })),
+    );
+
+    expect(afterReadModel.projects.map((project) => project.id).toSorted()).toEqual([
+      "project-1",
+      "project-remote",
+    ]);
+  });
+
+  it("does not retire a local deletion tombstone using a remote environment's sequence", () => {
+    const hydrated = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    const afterDelete = removeDeletedThreadFromClientState(hydrated, localThreadId, 101);
+    expect(afterDelete.deletedThreadIdsById?.[localThreadId]).toBe(101);
+
+    // The remote environment's routine snapshot at ITS sequence 5000.
+    const afterRemote = syncServerShellSnapshot(
+      afterDelete,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 5000 },
+      remoteEnvironmentId,
+    );
+    expect(afterRemote.deletedThreadIdsById?.[localThreadId]).toBe(101);
+
+    // A later local snapshot still carrying the deleted thread must not
+    // reinstate it — which is only true while the tombstone survived above.
+    const afterLocalResync = syncServerShellSnapshot(afterRemote, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    expect(afterLocalResync.threadIds).not.toContain(localThreadId);
+  });
+
+  /**
+   * With no explicit `deletedAtSequence` the tombstone is stamped from the fence
+   * of the environment that OWNS the row. Reading the local fence for a remote
+   * row would stamp it in the wrong sequence space entirely — here the local
+   * fence is 100 and the remote's is 5000, so a local-derived stamp (101) would
+   * be retired by the remote's very next snapshot.
+   */
+  /**
+   * The project twin of the thread case below. It was the untested half:
+   * mutating `environmentIdForProject` to always return local survived the full
+   * suite in five independent reviews, because the existing project-tombstone
+   * test passes an explicit `deletedAtSequence` for a project no record owns,
+   * which makes routing invisible. A regression here tombstones a REMOTE
+   * project against the LOCAL fence — original bug #3's exact mechanism — and
+   * the remote's next snapshot resurrects it.
+   */
+  it("stamps a remote project's tombstone from its own environment's fence", () => {
+    const remoteProjectId = ProjectId.makeUnsafe("project-remote");
+    const remoteProject = {
+      id: remoteProjectId,
+      title: "Remote Project",
+      workspaceRoot: "/tmp/remote",
+      defaultModelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+      scripts: [],
+      spaceId: null,
+    };
+    const withLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    const withBoth = syncServerShellSnapshot(
+      withLocal,
+      {
+        ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+        projects: [remoteProject],
+        snapshotSequence: 5000,
+      },
+      remoteEnvironmentId,
+    );
+
+    // No explicit sequence: the stamp has to come from the OWNING
+    // environment's fence, which is the whole point.
+    const afterDelete = removeDeletedProjectFromClientState(withBoth, remoteProjectId);
+
+    expect(
+      selectEnvironment(afterDelete, remoteEnvironmentId).deletedProjectIdsById?.[remoteProjectId],
+    ).toBe(5001);
+    // ...and it must NOT have been written into the local record, where it
+    // would be retired by an unrelated local sequence.
+    expect(selectLocalEnvironment(afterDelete).deletedProjectIdsById?.[remoteProjectId]).toBe(
+      undefined,
+    );
+  });
+
+  it("removes a deleted remote project from its own environment's rows", () => {
+    const remoteProjectId = ProjectId.makeUnsafe("project-remote");
+    const remoteProject = {
+      id: remoteProjectId,
+      title: "Remote Project",
+      workspaceRoot: "/tmp/remote",
+      defaultModelSelection: { provider: "codex" as const, model: "gpt-5.3-codex" },
+      createdAt: "2026-02-27T00:00:00.000Z",
+      updatedAt: "2026-02-27T00:00:00.000Z",
+      scripts: [],
+      spaceId: null,
+    };
+    const withRemote = syncServerShellSnapshot(
+      emptyState(),
+      {
+        ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+        projects: [remoteProject],
+        snapshotSequence: 1,
+      },
+      remoteEnvironmentId,
+    );
+
+    const afterDelete = removeDeletedProjectFromClientState(withRemote, remoteProjectId);
+
+    expect(afterDelete.projects.map((project) => project.id)).not.toContain(remoteProjectId);
+    expect(
+      selectEnvironment(afterDelete, remoteEnvironmentId).projects.map((project) => project.id),
+    ).not.toContain(remoteProjectId);
+  });
+
+  /**
+   * The event reducer funnels nearly every `thread.*` domain event through
+   * `applyThreadUpdate` — markThreadVisited, markThreadUnread, setError,
+   * setThreadWorkspace, thread.meta-updated. Its routing CALL SITE was
+   * unpinned even though the lookup it calls was covered: mutating the call
+   * site to LOCAL left the store suites green.
+   */
+  it("applies a thread update inside the environment that owns the thread", () => {
+    const withLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 1,
+    });
+    const withBoth = syncServerShellSnapshot(
+      withLocal,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 1 },
+      remoteEnvironmentId,
+    );
+
+    const updated = applyThreadUpdate(withBoth, remoteThreadId, (thread) => ({
+      ...thread,
+      title: "Remote renamed",
+    }));
+
+    expect(
+      selectEnvironment(updated, remoteEnvironmentId).threadShellById?.[remoteThreadId]?.title,
+    ).toBe("Remote renamed");
+    // Routed to the wrong record the update would both corrupt the local slice
+    // and be lost: the remote's row would still read "Remote".
+    expect(selectLocalEnvironment(updated).threadShellById?.[remoteThreadId]).toBeUndefined();
+    expect(updated.threadShellById?.[remoteThreadId]?.title).toBe("Remote renamed");
+  });
+
+  it("stamps a remote row's tombstone from its own environment's fence", () => {
+    const withLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    const withBoth = syncServerShellSnapshot(
+      withLocal,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 5000 },
+      remoteEnvironmentId,
+    );
+
+    const afterDelete = removeDeletedThreadFromClientState(withBoth, remoteThreadId);
+
+    expect(afterDelete.deletedThreadIdsById?.[remoteThreadId]).toBe(5001);
+  });
+
+  it("does not retire a local project tombstone using a remote environment's sequence", () => {
+    const hydrated = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    const projectId = ProjectId.makeUnsafe("project-1");
+    const afterDelete = removeDeletedProjectFromClientState(hydrated, projectId, 101);
+    expect(afterDelete.deletedProjectIdsById?.[projectId]).toBe(101);
+
+    // The remote snapshot must NOT list the tombstoned project id. Sharing
+    // `project-1` between both snapshots made this test pass for the wrong
+    // reason: retirement was blocked by the "still present" check rather than
+    // by the sequence-space scoping it claims to pin, so a mutation that
+    // retired local tombstones on a remote sequence survived it.
+    const afterRemote = syncServerShellSnapshot(
+      afterDelete,
+      {
+        ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")),
+        projects: [],
+        snapshotSequence: 5000,
+      },
+      remoteEnvironmentId,
+    );
+    // The project half of the same defect, which the thread-only report missed.
+    expect(afterRemote.deletedProjectIdsById?.[projectId]).toBe(101);
+
+    // And the tombstone still does its job: a later local snapshot carrying the
+    // project must not resurrect it.
+    const afterLocalResync = syncServerShellSnapshot(afterRemote, {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    expect(afterLocalResync.projects.map((project) => project.id)).not.toContain(projectId);
+  });
+
+  it("clears a remote fence with the environment's own registry teardown", () => {
+    const hydrated = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+    expect(selectEnvironment(hydrated, remoteEnvironmentId).shellSnapshotSequence).toBe(500);
+
+    const afterTeardown = discardEnvironmentProjection(hydrated, remoteEnvironmentId);
+
+    // The fence is gone, so a re-registered server starting low is believed.
+    expect(selectEnvironment(afterTeardown, remoteEnvironmentId).shellSnapshotSequence ?? 0).toBe(
+      0,
+    );
+    // ...and so are the rows it owned: no snapshot is coming to prune them.
+    expect(afterTeardown.threadIds).not.toContain(remoteThreadId);
+    expect(afterTeardown.sidebarThreadSummaryById?.[remoteThreadId]).toBeUndefined();
+    expect(afterTeardown.environmentById[remoteEnvironmentId]).toBeUndefined();
+  });
+
+  /**
+   * The teardown lifecycle, distinct from a server-generation change on a live
+   * transport: an environment is REMOVED and later re-registered against a
+   * fresh journal. The resume cursors were already discarded on this path; the
+   * fence one line away was not, so the re-registered server's first snapshot
+   * was rejected as stale forever.
+   */
+  it("accepts a re-registered environment's fresh journal after teardown", () => {
+    const hydrated = syncServerShellSnapshot(
+      emptyState(),
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+    expect(selectEnvironment(hydrated, remoteEnvironmentId).shellSnapshotSequence).toBe(500);
+
+    // removeWsEnvironmentClient -> discardEnvironmentProjection.
+    const afterTeardown = discardEnvironmentProjection(hydrated, remoteEnvironmentId);
+
+    // Re-registered against a fresh install whose journal restarts at 1. This
+    // snapshot must be BELIEVED, not dropped as older than the retired fence.
+    const afterReregister = syncServerShellSnapshot(
+      afterTeardown,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote again")), snapshotSequence: 1 },
+      remoteEnvironmentId,
+    );
+
+    expect(afterReregister.threadIds).toContain(remoteThreadId);
+    expect(afterReregister.sidebarThreadSummaryById?.[remoteThreadId]?.title).toBe("Remote again");
+    expect(selectEnvironment(afterReregister, remoteEnvironmentId).shellSnapshotSequence).toBe(1);
+  });
+
+  it("keeps the local environment's rows and fence when a remote is torn down", () => {
+    const withLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 42,
+    });
+    const withBoth = syncServerShellSnapshot(
+      withLocal,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+
+    const afterTeardown = discardEnvironmentProjection(withBoth, remoteEnvironmentId);
+
+    // Teardown is scoped: the surviving environment's journal did not change.
+    expect(afterTeardown.threadIds).toContain(localThreadId);
+    expect(afterTeardown.shellSnapshotSequence).toBe(42);
+  });
+
+  /**
+   * The critical this pair exists for: a server restored from backup restarts
+   * its journal low. Without clearing the fence the store silently rejects
+   * every snapshot from the replacement and keeps rendering content that server
+   * no longer holds — stale, not merely frozen, and with no error surfaced.
+   */
+  it("believes a restored server's low snapshot once the generation change clears the fence", () => {
+    const before = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Before restore")),
+      snapshotSequence: 500,
+    });
+    expect(before.shellSnapshotSequence).toBe(500);
+
+    // adoptNegotiation observes a new serverInstanceId and clears the fence.
+    const reset = clearEnvironmentShellFence(before, LOCAL_ENVIRONMENT_ID);
+
+    const after = syncServerShellSnapshot(reset, {
+      ...makeShellSnapshot(shellThread(localThreadId, "After restore")),
+      snapshotSequence: 2,
+    });
+
+    expect(after.shellSnapshotSequence).toBe(2);
+    expect(after.sidebarThreadSummaryById?.[localThreadId]?.title).toBe("After restore");
+  });
+
+  /**
+   * Reachable on a plain single-server install, with no remote environment
+   * registered at all: tombstones carry sequences from the journal the
+   * generation change just retired, and they filter rows before any pruning
+   * runs, so the fence reset alone leaves them comparing old numbers against
+   * the new journal.
+   */
+  it("drops tombstones with the fence so a restored server's rows come back", () => {
+    const hydrated = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Before restore")),
+      snapshotSequence: 500,
+    });
+    // Optimistic delete stamps against the CURRENT journal: 500 + 1.
+    const afterDelete = removeDeletedThreadFromClientState(hydrated, localThreadId);
+    expect(afterDelete.deletedThreadIdsById?.[localThreadId]).toBe(501);
+
+    // Server restored from backup; adoptNegotiation sees a new instance id.
+    const reset = clearEnvironmentShellFence(afterDelete, LOCAL_ENVIRONMENT_ID);
+    expect(reset.deletedThreadIdsById?.[localThreadId]).toBeUndefined();
+
+    // The replacement's journal restarts low and still lists the thread. With
+    // the tombstone left behind this row stayed invisible, with no error, until
+    // the new journal happened to pass 501.
+    const restored = syncServerShellSnapshot(reset, {
+      ...makeShellSnapshot(shellThread(localThreadId, "After restore")),
+      snapshotSequence: 3,
+    });
+
+    expect(restored.threadIds).toContain(localThreadId);
+    expect(restored.sidebarThreadSummaryById?.[localThreadId]?.title).toBe("After restore");
+  });
+
+  it("drops project tombstones with the fence too", () => {
+    const projectId = ProjectId.makeUnsafe("project-1");
+    const hydrated = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Before restore")),
+      snapshotSequence: 500,
+    });
+    const afterDelete = removeDeletedProjectFromClientState(hydrated, projectId);
+    expect(afterDelete.deletedProjectIdsById?.[projectId]).toBe(501);
+
+    const reset = clearEnvironmentShellFence(afterDelete, LOCAL_ENVIRONMENT_ID);
+    expect(reset.deletedProjectIdsById?.[projectId]).toBeUndefined();
+
+    const restored = syncServerShellSnapshot(reset, {
+      ...makeShellSnapshot(shellThread(localThreadId, "After restore")),
+      snapshotSequence: 3,
+    });
+    expect(restored.projects.map((project) => project.id)).toContain(projectId);
+  });
+
+  it("clears only the generation-changed environment's tombstones", () => {
+    // Scoping matters as much as the drop: another server's journal did not
+    // change, so its tombstones must survive or a row it deleted resurrects.
+    const withLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 100,
+    });
+    const withBoth = syncServerShellSnapshot(
+      withLocal,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 5000 },
+      remoteEnvironmentId,
+    );
+    const afterRemoteDelete = removeDeletedThreadFromClientState(withBoth, remoteThreadId);
+    expect(selectEnvironment(afterRemoteDelete, remoteEnvironmentId).deletedThreadIdsById).toEqual({
+      [remoteThreadId]: 5001,
+    });
+
+    const reset = clearEnvironmentShellFence(afterRemoteDelete, LOCAL_ENVIRONMENT_ID);
+
+    expect(selectEnvironment(reset, remoteEnvironmentId).deletedThreadIdsById).toEqual({
+      [remoteThreadId]: 5001,
+    });
+  });
+
+  it("clears a remote environment's fence without touching the local one", () => {
+    const withLocal = syncServerShellSnapshot(emptyState(), {
+      ...makeShellSnapshot(shellThread(localThreadId, "Local")),
+      snapshotSequence: 42,
+    });
+    const withBoth = syncServerShellSnapshot(
+      withLocal,
+      { ...makeShellSnapshot(shellThread(remoteThreadId, "Remote")), snapshotSequence: 500 },
+      remoteEnvironmentId,
+    );
+
+    const reset = clearEnvironmentShellFence(withBoth, remoteEnvironmentId);
+
+    expect(selectEnvironment(reset, remoteEnvironmentId).shellSnapshotSequence ?? 0).toBe(0);
+    expect(selectLocalEnvironment(reset).shellSnapshotSequence).toBe(42);
+    // A generation change leaves the rows: the replacement's snapshot is in
+    // flight and will prune them itself.
+    expect(reset.threadIds).toContain(remoteThreadId);
   });
 });

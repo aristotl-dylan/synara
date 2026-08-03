@@ -83,6 +83,11 @@ import {
   ProjectStopDevServerInput,
   ProjectWriteFileInput,
 } from "./project";
+import {
+  RemoteEnvironmentStatusesPayload,
+  RemoteHostFingerprintInput,
+  RemoteHostProbeInput,
+} from "./remoteHost";
 import { StudioListThreadOutputsInput } from "./studio";
 import { FilesystemBrowseInput } from "./filesystem";
 import { OpenInEditorInput } from "./editor";
@@ -209,6 +214,9 @@ export const WS_METHODS = {
   serverListWorktrees: "server.listWorktrees",
   serverListLocalServers: "server.listLocalServers",
   serverStopLocalServer: "server.stopLocalServer",
+  serverProbeRemoteHost: "server.probeRemoteHost",
+  serverGetRemoteHostFingerprint: "server.getRemoteHostFingerprint",
+  serverGetPhoneReachability: "server.getPhoneReachability",
   serverGetProviderUsageSnapshot: "server.getProviderUsageSnapshot",
   serverListProviderUsage: "server.listProviderUsage",
   statsGetProfileStats: "stats.getProfileStats",
@@ -222,6 +230,7 @@ export const WS_METHODS = {
   subscribeServerConfig: "server.subscribeConfig",
   subscribeServerProviderStatuses: "server.subscribeProviderStatuses",
   subscribeServerSettings: "server.subscribeSettings",
+  subscribeRemoteEnvironmentStatuses: "server.subscribeRemoteEnvironmentStatuses",
 
   // Streaming subscriptions
   subscribeTerminalEvents: "terminal.subscribeEvents",
@@ -264,6 +273,7 @@ export const WS_CHANNELS = {
   serverConfigUpdated: "server.configUpdated",
   serverProviderStatusesUpdated: "server.providerStatusesUpdated",
   serverSettingsUpdated: "server.settingsUpdated",
+  remoteEnvironmentStatusesUpdated: "server.remoteEnvironmentStatusesUpdated",
 } as const;
 
 // -- Tagged Union of all request body schemas ─────────────────────────
@@ -383,6 +393,9 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.serverListWorktrees, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverListLocalServers, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverStopLocalServer, ServerStopLocalServerInput),
+  tagRequestBody(WS_METHODS.serverProbeRemoteHost, RemoteHostProbeInput),
+  tagRequestBody(WS_METHODS.serverGetRemoteHostFingerprint, RemoteHostFingerprintInput),
+  tagRequestBody(WS_METHODS.serverGetPhoneReachability, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverGetProviderUsageSnapshot, ServerGetProviderUsageSnapshotInput),
   tagRequestBody(WS_METHODS.serverListProviderUsage, ServerListProviderUsageInput),
   tagRequestBody(WS_METHODS.statsGetProfileStats, StatsGetProfileStatsInput),
@@ -455,6 +468,7 @@ export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.serverConfigUpdated]: typeof ServerConfigUpdatedPayload.Type;
   readonly [WS_CHANNELS.serverProviderStatusesUpdated]: typeof ServerProviderStatusesUpdatedPayload.Type;
   readonly [WS_CHANNELS.serverSettingsUpdated]: typeof ServerSettingsUpdatedPayload.Type;
+  readonly [WS_CHANNELS.remoteEnvironmentStatusesUpdated]: typeof RemoteEnvironmentStatusesPayload.Type;
   readonly [WS_CHANNELS.automationEvent]: typeof AutomationStreamEvent.Type;
   readonly [WS_CHANNELS.gitActionProgress]: typeof GitActionProgressEvent.Type;
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
@@ -495,6 +509,10 @@ export const WsPushServerSettingsUpdated = makeWsPushSchema(
   WS_CHANNELS.serverSettingsUpdated,
   ServerSettingsUpdatedPayload,
 );
+export const WsPushRemoteEnvironmentStatusesUpdated = makeWsPushSchema(
+  WS_CHANNELS.remoteEnvironmentStatusesUpdated,
+  RemoteEnvironmentStatusesPayload,
+);
 export const WsPushAutomationEvent = makeWsPushSchema(
   WS_CHANNELS.automationEvent,
   AutomationStreamEvent,
@@ -528,6 +546,7 @@ export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.serverConfigUpdated,
   WS_CHANNELS.serverProviderStatusesUpdated,
   WS_CHANNELS.serverSettingsUpdated,
+  WS_CHANNELS.remoteEnvironmentStatusesUpdated,
   WS_CHANNELS.automationEvent,
   WS_CHANNELS.terminalEvent,
   WS_CHANNELS.projectDevServerEvent,
@@ -543,6 +562,7 @@ export const WsPush = Schema.Union([
   WsPushServerConfigUpdated,
   WsPushServerProviderStatusesUpdated,
   WsPushServerSettingsUpdated,
+  WsPushRemoteEnvironmentStatusesUpdated,
   WsPushAutomationEvent,
   WsPushGitActionProgress,
   WsPushTerminalEvent,

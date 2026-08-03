@@ -22,6 +22,7 @@ import {
   makeDesktopShutdownEffectRouteLayer,
   makeHealthEffectRouteLayer,
   projectFaviconEffectRouteLayer,
+  provisioningIdentityEffectRouteLayer,
   staticAndDevEffectRouteLayer,
 } from "./http";
 import {
@@ -115,7 +116,19 @@ type TestedRoute =
   | { readonly kind: "shutdown"; readonly controller: ServerShutdownController }
   | { readonly kind: "static" }
   | { readonly kind: "favicon" }
-  | { readonly kind: "editor-icon" };
+  | { readonly kind: "editor-icon" }
+  /**
+   * The provisioning route MERGED WITH the SPA fallback, in the order
+   * `makeEffectHttpRouteLayer` composes them.
+   *
+   * Registering a route proves nothing about whether it executes:
+   * `staticAndDevEffectRouteLayer` is a `GET *` fallback that answers any path,
+   * so a GET route that lost the ordering would silently serve index.html — a
+   * 200, and therefore invisible to a test that only asserts "not an error".
+   * That collision is the whole risk, so this pairs exactly those two rather
+   * than the full table, which drags in four unrelated services.
+   */
+  | { readonly kind: "provisioning" };
 
 async function withEffectServer(
   config: ServerConfigShape,
@@ -145,6 +158,14 @@ async function withEffectServer(
             yield* httpServer.serve(yield* HttpRouter.toHttpEffect(projectFaviconEffectRouteLayer));
           } else if (route.kind === "editor-icon") {
             yield* httpServer.serve(yield* HttpRouter.toHttpEffect(editorIconEffectRouteLayer));
+          } else if (route.kind === "provisioning") {
+            // Merged in the SAME order makeEffectHttpRouteLayer uses, so the
+            // precedence under test is the deployed one.
+            yield* httpServer.serve(
+              yield* HttpRouter.toHttpEffect(
+                Layer.mergeAll(provisioningIdentityEffectRouteLayer, staticAndDevEffectRouteLayer),
+              ),
+            );
           } else {
             yield* httpServer.serve(
               yield* HttpRouter.toHttpEffect(makeHealthEffectRouteLayer(route.readiness)),
@@ -578,5 +599,42 @@ describe("production Effect HTTP routes", () => {
       expect(response.status).toBe(400);
       await expect(response.text()).resolves.toBe("Missing id parameter");
     });
+  });
+
+  /**
+   * The provisioning-identity route must actually EXECUTE in the deployed table.
+   *
+   * Registering a route proves nothing on its own: `staticAndDevEffectRouteLayer`
+   * is a `GET *` SPA fallback, so a new GET route that lost the ordering would be
+   * answered with index.html — status 200, content-type text/html, and therefore
+   * invisible to any test that only checks "not an error". This serves the same
+   * composed layer production does and asserts the answer is the route's JSON,
+   * not the fallback's HTML.
+   */
+  it("answers the provisioning handshake rather than the SPA fallback", async () => {
+    const environmentIdPath = path.join(makeTempDir("synara-provisioning-"), "environment-id");
+    writeFileSync(environmentIdPath, "env-from-bootstrap\n");
+
+    await withEffectServer(
+      makeConfig({ environmentIdPath }),
+      { kind: "provisioning" },
+      async (origin) => {
+        const response = await fetch(`${origin}/api/provisioning/identity`, {
+          headers: { authorization: "Bearer tok-1" },
+        });
+        expect(response.status).toBe(200);
+        // Not the SPA fallback. This is the assertion that catches a route that
+        // was registered but never reached.
+        expect(response.headers.get("content-type")).toContain("application/json");
+
+        const body = (await response.json()) as Record<string, unknown>;
+        // The id bootstrap WROTE, not one the server generated for itself.
+        expect(body.environmentId).toBe("env-from-bootstrap");
+        expect(body.authenticated).toBe(true);
+        // The echo is of the token the caller presented and this server accepted.
+        expect(body.acceptedToken).toBe("tok-1");
+        expect(typeof body.serverVersion).toBe("string");
+      },
+    );
   });
 });

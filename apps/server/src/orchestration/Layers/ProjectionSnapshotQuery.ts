@@ -646,6 +646,7 @@ function toProjectedThreadShellFromStoredSummary(input: {
     createdAt: threadRow.createdAt,
     updatedAt: threadRow.updatedAt,
     archivedAt: threadRow.archivedAt ?? null,
+    settledAt: threadRow.settledAt ?? null,
     handoff: threadRow.handoff,
     session: input.session,
   };
@@ -695,6 +696,7 @@ function toProjectedThread(input: {
     createdAt: threadRow.createdAt,
     updatedAt: threadRow.updatedAt,
     archivedAt: threadRow.archivedAt ?? null,
+    settledAt: threadRow.settledAt ?? null,
     deletedAt: threadRow.deletedAt,
     handoff: threadRow.handoff,
     latestUserMessageAt: summary.latestUserMessageAt,
@@ -837,6 +839,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           archived_at AS "archivedAt",
+          settled_at AS "settledAt",
           deleted_at AS "deletedAt"
         FROM projection_threads
         ORDER BY created_at ASC, thread_id ASC
@@ -885,6 +888,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           archived_at AS "archivedAt",
+          settled_at AS "settledAt",
           deleted_at AS "deletedAt"
         FROM projection_threads
         ORDER BY created_at ASC, thread_id ASC
@@ -1339,6 +1343,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  // Deliberately NOT filtered by `deleted_at`. Every other thread lookup here
+  // hides soft-deleted rows, but `thread.create` is decided against the
+  // tombstone-inclusive command read model: a thread id stays bound to its
+  // aggregate forever. A caller that gates creation on an active-only lookup
+  // would keep re-creating a soft-deleted thread and be rejected every time.
+  const getAnyThreadIdRowById = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadIdLookupRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          thread_id AS "threadId"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
+        LIMIT 1
+      `,
+  });
+
   const getThreadRowById = SqlSchema.findOneOption({
     Request: ThreadIdLookupInput,
     Result: ProjectionThreadDbRowSchema,
@@ -1384,7 +1406,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           archived_at AS "archivedAt",
+          settled_at AS "settledAt",
           deleted_at AS "deletedAt"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
+          AND deleted_at IS NULL
+        LIMIT 1
+      `,
+  });
+
+  // Existence only: reads the primary-key column and nothing else, so a caller
+  // that just needs "is this thread still here" never touches the detail tables.
+  const getThreadIdRowById = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadIdLookupRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          thread_id AS "threadId"
         FROM projection_threads
         WHERE thread_id = ${threadId}
           AND deleted_at IS NULL
@@ -1437,6 +1476,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           archived_at AS "archivedAt",
+          settled_at AS "settledAt",
           deleted_at AS "deletedAt"
         FROM projection_threads
         WHERE ${threadId} LIKE ('subagent:' || thread_id || ':%')
@@ -2534,6 +2574,18 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       });
     });
 
+  const threadIdExistsIncludingDeleted: ProjectionSnapshotQueryShape["threadIdExistsIncludingDeleted"] =
+    (threadId) =>
+      getAnyThreadIdRowById({ threadId }).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.threadIdExistsIncludingDeleted:query",
+            "ProjectionSnapshotQuery.threadIdExistsIncludingDeleted:decodeRow",
+          ),
+        ),
+        Effect.map(Option.isSome),
+      );
+
   const getThreadShellById: ProjectionSnapshotQueryShape["getThreadShellById"] = (threadId) =>
     sql
       .withTransaction(
@@ -2829,6 +2881,17 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         }),
       );
 
+  const threadExistsById: ProjectionSnapshotQueryShape["threadExistsById"] = (threadId) =>
+    getThreadIdRowById({ threadId }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.threadExistsById:query",
+          "ProjectionSnapshotQuery.threadExistsById:decodeRow",
+        ),
+      ),
+      Effect.map(Option.isSome),
+    );
+
   return {
     getCommandReadModel,
     getSnapshot,
@@ -2845,10 +2908,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     listGeneratedImageActivitiesByTurn,
     getFullThreadDiffContext,
     getThreadShellById,
+    threadIdExistsIncludingDeleted,
     findSyntheticSubagentParentThread,
     getThreadDetailById,
     getThreadDetailForExportById,
     getThreadDetailSnapshotById,
+    threadExistsById,
   } satisfies ProjectionSnapshotQueryShape;
 });
 

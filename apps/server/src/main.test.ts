@@ -21,6 +21,7 @@ import { NetService } from "@synara/shared/Net";
 import { ServerConfig, type ServerConfigShape } from "./config";
 import { Open, type OpenShape } from "./open";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
+import { fakeProjectionSnapshotQuery } from "./orchestration/testing/fakeProjectionSnapshotQuery";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
 import { Server, type ServerShape } from "./effectServer";
 import { makeServerShutdownController } from "./serverShutdown";
@@ -190,6 +191,30 @@ it.layer(testLayer)("server CLI command", (it) => {
 
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.authToken, "token-secret");
+    }),
+  );
+
+  // A stray space in a .env or a shell quoting slip must not produce a token
+  // that the startup gate reads as absent (it trims) while enforcement reads it
+  // as present (it does not). On a loopback bind that combination locks the user
+  // out: auth is required, no pairing link is printed, and the browser is
+  // refused with no recovery path. Normalizing at construction is what keeps
+  // every reader agreeing that whitespace is no token.
+  it.effect("treats a whitespace-only auth token as no token at all", () =>
+    Effect.gen(function* () {
+      yield* runCli(["--auth-token", "   "]);
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.authToken, undefined);
+    }),
+  );
+
+  it.effect("trims surrounding whitespace from a real auth token", () =>
+    Effect.gen(function* () {
+      yield* runCli(["--auth-token", "  padded-secret  "]);
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.authToken, "padded-secret");
     }),
   );
 
@@ -740,41 +765,29 @@ it.layer(testLayer)("server CLI command", (it) => {
       );
 
       yield* recordStartupHeartbeat.pipe(
-        Effect.provideService(ProjectionSnapshotQuery, {
-          getSnapshot: () =>
-            Effect.succeed({
-              snapshotSequence: 0,
-              spaces: [],
-              projects: [] as OrchestrationReadModel["projects"],
-              threads: [] as OrchestrationReadModel["threads"],
-              updatedAt: new Date(0).toISOString(),
-            }),
-          getCommandReadModel: () =>
-            Effect.succeed({
-              snapshotSequence: 0,
-              spaces: [],
-              projects: [] as OrchestrationReadModel["projects"],
-              threads: [] as OrchestrationReadModel["threads"],
-              updatedAt: new Date(0).toISOString(),
-            }),
-          getCounts,
-          getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
-          listStaleInFlightThreadIds: () => Effect.die("unused"),
-          listManagedWorktreeThreads: () => Effect.die("unused"),
-          getShellSnapshot: () => Effect.die("unused"),
-          getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
-          getProjectShellById: () => Effect.die("unused"),
-          getSpaceShellById: () => Effect.die("unused"),
-          getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
-          getThreadCheckpointContext: () => Effect.die("unused"),
-          listGeneratedImageActivitiesByTurn: () => Effect.die("unused"),
-          getFullThreadDiffContext: () => Effect.die("unused"),
-          getThreadShellById: () => Effect.die("unused"),
-          findSyntheticSubagentParentThread: () => Effect.die("unused"),
-          getThreadDetailById: () => Effect.die("unused"),
-          getThreadDetailForExportById: () => Effect.die("unused"),
-          getThreadDetailSnapshotById: () => Effect.die("unused"),
-        }),
+        Effect.provideService(
+          ProjectionSnapshotQuery,
+          fakeProjectionSnapshotQuery({
+            getSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 0,
+                spaces: [],
+                projects: [] as OrchestrationReadModel["projects"],
+                threads: [] as OrchestrationReadModel["threads"],
+                updatedAt: new Date(0).toISOString(),
+              }),
+            getCommandReadModel: () =>
+              Effect.succeed({
+                snapshotSequence: 0,
+                spaces: [],
+                projects: [] as OrchestrationReadModel["projects"],
+                threads: [] as OrchestrationReadModel["threads"],
+                updatedAt: new Date(0).toISOString(),
+              }),
+            getCounts,
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+          }),
+        ),
         Effect.provideService(AnalyticsService, {
           record: recordTelemetry,
           flush: Effect.void,

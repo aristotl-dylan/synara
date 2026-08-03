@@ -2,6 +2,8 @@ import {
   PROVIDER_DISPLAY_NAMES,
   ThreadId,
   type OrchestrationEvent,
+  type OrchestrationThreadStreamItem,
+  type ProjectId,
   type OrchestrationShellSnapshot,
   type OrchestrationShellStreamEvent,
   type OrchestrationThread,
@@ -59,22 +61,33 @@ import { useStore } from "../store";
 import { createAllThreadsSelector } from "../storeSelectors";
 import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
 import { terminalActivityFromEvent } from "../terminalActivity";
+import { createShellAggregator } from "../shellAggregation";
 import {
+  listWsEnvironmentClients,
   onServerConfigUpdated,
   onServerProviderStatusesUpdated,
   onServerSettingsUpdated,
   onServerWelcome,
   onThreadStreamFailure,
-} from "../wsNativeApi";
+  onWsEnvironmentRegistryChange,
+} from "../wsEnvironmentRegistry";
+import { LOCAL_ENVIRONMENT_ID } from "~/environmentIdentity";
+import { createEnvironmentDescriptorSync } from "../environmentDescriptorSync";
+import { createThreadStreamAggregator } from "../threadStreamAggregation";
+import { createEnvironmentProviderStatusSync } from "../environmentProviderStatusSync";
+import { createRemoteEnvironmentClientSync } from "../remoteEnvironmentClientSync";
 import {
+  addWsBuildSkewListener,
   addWsCompatibilityIssueListener,
   addWsTransportStateListener,
+  readLatestWsBuildSkew,
   readLatestWsCompatibilityIssue,
+  type WsBuildSkewState,
 } from "../wsTransportEvents";
 import { providerQueryKeys } from "../lib/providerReactQuery";
 import { invalidateProjectFileQueriesForCwds, projectQueryKeys } from "../lib/projectReactQuery";
 import { collectActiveTerminalThreadIds } from "../lib/terminalStateCleanup";
-import { useProjectRunStore } from "../projectRunStore";
+import { applyProjectDevServerEvent, useProjectRunStore } from "../projectRunStore";
 import { dockTerminalThreadId } from "../lib/dockTerminalScope";
 import { TaskCompletionNotifications } from "../notifications/taskCompletion";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
@@ -85,13 +98,7 @@ import {
   subscribeThreadDetailEvictions,
   useRetainedThreadDetailIds,
 } from "../threadDetailSubscriptionRetention";
-import {
-  advanceThreadDetailResumeCursor,
-  buildThreadSubscribeInput,
-  clearThreadDetailResumeCursor,
-  getThreadDetailResumeCursor,
-  setThreadDetailResumeCursor,
-} from "../threadDetailResumeCursors";
+import { resolveProjectEnvironmentId, threadResumeCursors } from "../environmentRouting";
 import { canApplyThreadSnapshot, selectOrphanedThreadDetailIds } from "./-threadDetailOwnership";
 import { getThreadFromState, getThreadsFromState } from "../threadDerivation";
 import { useAppDensity } from "../hooks/useAppDensity";
@@ -245,6 +252,7 @@ function RootRouteView() {
     <>
       <ToastProvider position="top-center">
         <AnchoredToastProvider>
+          <TransportBuildSkewNotice />
           <GitProgressToastPreviewDev />
           <EventRouter />
           <ProviderStatusRefreshCoordinator />
@@ -261,6 +269,42 @@ function RootRouteView() {
       </ToastProvider>
       {desktopWindowControls}
     </>
+  );
+}
+
+/**
+ * Version skew degrades the session instead of hard-failing it: the app stays
+ * readable and the transport refuses writes, so this notice must stay visible
+ * for the whole session rather than being dismissible.
+ */
+function TransportBuildSkewNotice() {
+  // Skew is per-environment; this notice covers the local server, which is the
+  // only environment that can currently dispatch writes (see issue #18).
+  const [skew, setSkew] = useState<WsBuildSkewState | null>(() =>
+    readLatestWsBuildSkew(LOCAL_ENVIRONMENT_ID),
+  );
+  useEffect(
+    () => addWsBuildSkewListener(LOCAL_ENVIRONMENT_ID, setSkew, { replayCurrent: true }),
+    [],
+  );
+  if (!skew) return null;
+
+  return (
+    <div
+      role="status"
+      className="pointer-events-none fixed inset-x-0 top-0 z-[240] flex justify-center px-3 pt-2"
+    >
+      {/*
+       * Pointer-transparent like its wrapper. The notice carries no controls,
+       * and a skewed session lasts until the user updates, so an interactive
+       * pill would swallow every click in the top centre of the app for the
+       * whole session.
+       */}
+      <p className="rounded-full border border-amber-500/40 bg-card/95 px-3 py-1 text-[11px] text-muted-foreground shadow-lg backdrop-blur-md">
+        Read-only: this client ({skew.clientBuild}) and server ({skew.serverBuild}) run mismatched
+        builds. Update both to the same version to make changes.
+      </p>
+    </div>
   );
 }
 
@@ -1046,7 +1090,7 @@ function EventRouter() {
       // immediately instead of buffering while waiting for a snapshot — which
       // is also what previously triggered the unsubscribe-resubscribe race that
       // re-shipped full history.
-      const resumeCursor = getThreadDetailResumeCursor(threadId);
+      const resumeCursor = threadResumeCursors(threadId).get(threadId);
       if (resumeCursor === undefined) {
         threadSnapshotSequenceById.delete(threadId);
       } else {
@@ -1074,7 +1118,7 @@ function EventRouter() {
         if (event.sequence > latestThreadSequence) {
           latestThreadSequence = event.sequence;
           threadSnapshotSequenceById.set(threadId, latestThreadSequence);
-          advanceThreadDetailResumeCursor(threadId, latestThreadSequence);
+          threadResumeCursors(threadId).advance(threadId, latestThreadSequence);
           queueDomainEvent(event);
         }
       }
@@ -1130,7 +1174,7 @@ function EventRouter() {
       await Promise.all(
         additions.map((threadId) =>
           api.orchestration
-            .subscribeThread(buildThreadSubscribeInput(threadId))
+            .subscribeThread(threadResumeCursors(threadId).buildSubscribeInput(threadId))
             .catch(() => undefined),
         ),
       );
@@ -1168,7 +1212,7 @@ function EventRouter() {
         // Every caller of this restart wants authoritative history (wiped or
         // never-synced detail), so a cursor resume would skip exactly the
         // snapshot being requested.
-        clearThreadDetailResumeCursor(threadId);
+        threadResumeCursors(threadId).clear(threadId);
         await api.orchestration.subscribeThread({ threadId }).catch(() => undefined);
       }).finally(() => {
         threadSnapshotRequestInFlight.delete(threadId);
@@ -1420,7 +1464,7 @@ function EventRouter() {
               continue;
             }
             threadSnapshotSequenceById.set(threadId, event.sequence);
-            advanceThreadDetailResumeCursor(threadId, event.sequence);
+            threadResumeCursors(threadId).advance(threadId, event.sequence);
             queueDomainEvent(event);
           }
         })
@@ -1471,7 +1515,7 @@ function EventRouter() {
           threadId,
           Math.max(currentSequence, snapshot.snapshotSequence),
         );
-        advanceThreadDetailResumeCursor(threadId, snapshot.snapshotSequence);
+        threadResumeCursors(threadId).advance(threadId, snapshot.snapshotSequence);
         // Apply even when the cursor did not advance. The projection is
         // authoritative and can repair a client that advanced its cursor while
         // dropping or failing to reduce one of the corresponding live events.
@@ -1577,7 +1621,13 @@ function EventRouter() {
         void replayThreadEvents(item.thread.id, item.sequence).catch(() => undefined);
       }
     });
-    const unsubThreadEvent = api.orchestration.onThreadEvent((item) => {
+    // Handles one thread-stream item, WHICHEVER environment delivered it.
+    //
+    // Every piece of per-thread bookkeeping below is keyed by thread id and the
+    // cursor writes resolve the owning environment themselves, so the handler
+    // is environment-agnostic by construction — which is what lets the same
+    // function serve every client.
+    const handleThreadStreamItem = (item: OrchestrationThreadStreamItem) => {
       if (item.kind === "snapshot") {
         const threadId = item.snapshot.thread.id;
         threadSnapshotRequestInFlight.delete(threadId);
@@ -1587,7 +1637,7 @@ function EventRouter() {
         if (!canApplyThreadSnapshot({ threadId, leasedThreadIds: subscribedThreadIds })) {
           threadSnapshotSequenceById.delete(threadId);
           pendingThreadEventsById.delete(threadId);
-          clearThreadDetailResumeCursor(threadId);
+          threadResumeCursors(threadId).clear(threadId);
           return;
         }
         syncServerThreadDetailHotPath(item.snapshot.thread);
@@ -1599,14 +1649,14 @@ function EventRouter() {
         if (useStore.getState().threadDetailSyncById?.[threadId] !== "synced") {
           threadSnapshotSequenceById.delete(threadId);
           pendingThreadEventsById.delete(threadId);
-          clearThreadDetailResumeCursor(threadId);
+          threadResumeCursors(threadId).clear(threadId);
           return;
         }
         threadSnapshotSequenceById.set(threadId, item.snapshot.snapshotSequence);
         threadSnapshotNotFoundRetryAttempted.delete(threadId);
         // Snapshots replace cached detail wholesale, so overwrite the cursor
         // even when it is lower than the previous one (server-side reset).
-        setThreadDetailResumeCursor(threadId, item.snapshot.snapshotSequence);
+        threadResumeCursors(threadId).set(threadId, item.snapshot.snapshotSequence);
         nextThreadProjectionReconcileAtById.set(
           threadId,
           Date.now() + THREAD_DETAIL_PROJECTION_RECONCILE_INTERVAL_MS,
@@ -1641,13 +1691,31 @@ function EventRouter() {
         return;
       }
       threadSnapshotSequenceById.set(threadId, item.event.sequence);
-      advanceThreadDetailResumeCursor(threadId, item.event.sequence);
+      threadResumeCursors(threadId).advance(threadId, item.event.sequence);
       nextThreadProjectionReconcileAtById.set(
         threadId,
         Date.now() + THREAD_DETAIL_PROJECTION_RECONCILE_INTERVAL_MS,
       );
       queueDomainEvent(item.event);
+    };
+
+    // Listen on EVERY environment, not just the local one.
+    //
+    // `subscribeThread` is routed to the thread's owning host, so for a remote
+    // thread the stream arrives on that host's connection. Subscribing here
+    // only to the local client meant a remote thread's transcript was delivered
+    // to a socket nobody was reading: the chat rendered empty or frozen, with
+    // no error anywhere, because nothing failed — the events simply had no
+    // listener.
+    const threadStreamAggregator = createThreadStreamAggregator(handleThreadStreamItem);
+    threadStreamAggregator.sync(listWsEnvironmentClients());
+    const unsubThreadStreamRegistry = onWsEnvironmentRegistryChange(() => {
+      threadStreamAggregator.sync(listWsEnvironmentClients());
     });
+    const unsubThreadEvent = () => {
+      unsubThreadStreamRegistry();
+      threadStreamAggregator.detachAll();
+    };
     const unsubThreadStreamFailure = onThreadStreamFailure((failure) => {
       const threadId = ThreadId.makeUnsafe(failure.threadId);
       if (disposed || !subscribedThreadIds.has(threadId)) {
@@ -1656,7 +1724,7 @@ function EventRouter() {
       // The stream is dead with retries and reconnects exhausted: forget its
       // cursor so a future resubscribe requests a fresh snapshot, and surface
       // the failure so the thread view stops posing as an empty conversation.
-      clearThreadDetailResumeCursor(threadId);
+      threadResumeCursors(threadId).clear(threadId);
       threadSnapshotSequenceById.delete(threadId);
       threadSnapshotRequestInFlight.delete(threadId);
       threadSnapshotRefreshPending.delete(threadId);
@@ -1710,18 +1778,21 @@ function EventRouter() {
     // Dev servers are first-class server processes; mirror their lifecycle into the
     // client store so the sidebar indicator survives reconnects and stays consistent
     // across tabs without owning any thread/terminal state.
+    // Attributes an existing run to its owning host so a snapshot only replaces
+    // the rows it actually speaks for.
+    const projectRunOwnerOf = (projectId: ProjectId) => resolveProjectEnvironmentId(projectId);
     const invalidateLocalServers = () => {
       void queryClient.invalidateQueries({ queryKey: serverQueryKeys.localServers() });
     };
     const unsubDevServerEvent = api.projects.onDevServerEvent((event) => {
-      const store = useProjectRunStore.getState();
-      if (event.type === "snapshot") {
-        store.replaceAll(event.servers);
-      } else if (event.type === "upserted") {
-        store.upsertRun(event.server);
-      } else {
-        store.removeRun(event.projectId);
-      }
+      applyProjectDevServerEvent({
+        event,
+        // This is the LOCAL client's stream, so its snapshot speaks only for
+        // local and must not clear another host's runs.
+        environmentId: LOCAL_ENVIRONMENT_ID,
+        ownerOf: projectRunOwnerOf,
+        store: useProjectRunStore.getState(),
+      });
       invalidateLocalServers();
     });
     // The channel's initial snapshot may have arrived before this listener was
@@ -1732,7 +1803,7 @@ function EventRouter() {
         if (disposed) {
           return;
         }
-        useProjectRunStore.getState().replaceAll(servers);
+        useProjectRunStore.getState().replaceAll(servers, LOCAL_ENVIRONMENT_ID, projectRunOwnerOf);
         invalidateLocalServers();
       })
       .catch(() => undefined);
@@ -1952,6 +2023,43 @@ function EventRouter() {
     syncServerShellSnapshot,
     syncServerThreadDetailHotPath,
   ]);
+
+  // Remote environments' shells merge into the same store, keyed by environment.
+  // The local environment is streamed by the effect above; this covers the rest,
+  // which is what makes the sidebar aggregate across servers.
+  useEffect(() => {
+    const aggregator = createShellAggregator({
+      syncServerShellSnapshot: (snapshot, environmentId) =>
+        useStore.getState().syncServerShellSnapshot(snapshot, environmentId),
+    });
+    // Descriptors are what give the "Start in" picker and the pairing screen a
+    // host's real name and its reachability; without this the directory would
+    // sit at "checking" forever and refuse every remote start.
+    const descriptors = createEnvironmentDescriptorSync();
+    // Provider statuses are what let the picker say whether a host can actually
+    // run a chat, rather than silently offering one that has nothing to talk to.
+    const providerStatuses = createEnvironmentProviderStatusSync();
+    // The source of every remote entry in the registry above. A host the server
+    // brought up to `ready` is registered here — and ONLY here — which is what
+    // makes the three syncs above pick it up without any of them knowing a
+    // remote host exists.
+    const remoteClients = createRemoteEnvironmentClientSync();
+    const syncAll = () => {
+      const clients = listWsEnvironmentClients();
+      aggregator.sync(clients);
+      descriptors.sync(clients);
+      providerStatuses.sync(clients);
+    };
+    syncAll();
+    const unsubscribe = onWsEnvironmentRegistryChange(syncAll);
+    return () => {
+      unsubscribe();
+      remoteClients.dispose();
+      aggregator.detachAll();
+      descriptors.dispose();
+      providerStatuses.dispose();
+    };
+  }, []);
 
   useLayoutEffect(() => {
     const reconcile = reconcileThreadSubscriptionsRef.current;

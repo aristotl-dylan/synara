@@ -28,7 +28,7 @@ import {
   type EffectRpcWebSocketClient,
 } from "../test/effectRpcWebSocketMock";
 import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test/browserHarness";
-import { resetWsNativeApiForTest } from "../wsNativeApi";
+import { resetWsEnvironmentRegistry } from "../wsEnvironmentRegistry";
 
 const THREAD_ID = "thread-kb-toast-test" as ThreadId;
 const PROJECT_ID = "project-1" as ProjectId;
@@ -229,9 +229,15 @@ const worker = setupWorker(
         });
         return;
       }
+      // Every subscription the app opens must be listed here. One that is not
+      // falls through to the catch-all, which answers a stream request with
+      // `{}`; the schema failure reads as a dead socket and reconnects the
+      // whole client on a ~1s loop. See the longer note in
+      // EventRouter.browser.tsx.
       if (
         method === WS_METHODS.subscribeServerProviderStatuses ||
         method === WS_METHODS.subscribeServerSettings ||
+        method === WS_METHODS.subscribeRemoteEnvironmentStatuses ||
         method === WS_METHODS.subscribeTerminalEvents ||
         method === WS_METHODS.subscribeOrchestrationDomainEvents ||
         method === WS_METHODS.subscribeProjectDevServerEvents ||
@@ -333,12 +339,12 @@ describe("Keybindings update toast", () => {
   });
 
   afterAll(async () => {
-    await resetWsNativeApiForTest();
+    await resetWsEnvironmentRegistry();
     await worker.stop();
   });
 
   beforeEach(async () => {
-    await resetWsNativeApiForTest();
+    await resetWsEnvironmentRegistry();
     localStorage.clear();
     document.body.innerHTML = "";
     serverConfigStreamClient = null;

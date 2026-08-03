@@ -31,6 +31,13 @@ import {
   ExternalMcpRevokeIntegrationInput,
 } from "./externalMcp";
 import { FilesystemBrowseInput, FilesystemBrowseResult } from "./filesystem";
+import {
+  RemoteEnvironmentStatusesPayload,
+  RemoteHostFingerprintInput,
+  RemoteHostFingerprintResult,
+  RemoteHostProbeInput,
+  RemoteHostProbeRpcResult,
+} from "./remoteHost";
 import { StudioListThreadOutputsInput, StudioListThreadOutputsResult } from "./studio";
 import {
   GitCheckoutInput,
@@ -157,6 +164,7 @@ import {
   ServerLifecycleStreamEvent,
   ServerGetSettingsResult,
   ServerListLocalServersResult,
+  ServerPhoneReachabilityResult,
   ServerListWorktreesResult,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
@@ -762,6 +770,27 @@ export const WsServerStopLocalServerRpc = Rpc.make(WS_METHODS.serverStopLocalSer
   error: WsRpcError,
 });
 
+export const WsServerProbeRemoteHostRpc = Rpc.make(WS_METHODS.serverProbeRemoteHost, {
+  payload: RemoteHostProbeInput,
+  success: RemoteHostProbeRpcResult,
+  error: WsRpcError,
+});
+
+export const WsServerGetRemoteHostFingerprintRpc = Rpc.make(
+  WS_METHODS.serverGetRemoteHostFingerprint,
+  {
+    payload: RemoteHostFingerprintInput,
+    success: RemoteHostFingerprintResult,
+    error: WsRpcError,
+  },
+);
+
+export const WsServerGetPhoneReachabilityRpc = Rpc.make(WS_METHODS.serverGetPhoneReachability, {
+  payload: Schema.Struct({}),
+  success: ServerPhoneReachabilityResult,
+  error: WsRpcError,
+});
+
 export const WsServerGetProviderUsageSnapshotRpc = Rpc.make(
   WS_METHODS.serverGetProviderUsageSnapshot,
   {
@@ -852,6 +881,20 @@ export const WsSubscribeServerSettingsRpc = Rpc.make(WS_METHODS.subscribeServerS
   error: WsRpcError,
   stream: true,
 });
+
+/**
+ * Per-host supervision status. Streamed rather than polled so the add dialog's
+ * live stages arrive as the bootstrap emits them.
+ */
+export const WsSubscribeRemoteEnvironmentStatusesRpc = Rpc.make(
+  WS_METHODS.subscribeRemoteEnvironmentStatuses,
+  {
+    payload: Schema.Struct({}),
+    success: RemoteEnvironmentStatusesPayload,
+    error: WsRpcError,
+    stream: true,
+  },
+);
 
 export const WsProviderGetComposerCapabilitiesRpc = Rpc.make(
   WS_METHODS.providerGetComposerCapabilities,
@@ -1062,6 +1105,9 @@ export const WsFeatureRpcGroup = RpcGroup.make(
   WsServerListWorktreesRpc,
   WsServerListLocalServersRpc,
   WsServerStopLocalServerRpc,
+  WsServerProbeRemoteHostRpc,
+  WsServerGetRemoteHostFingerprintRpc,
+  WsServerGetPhoneReachabilityRpc,
   WsServerGetProviderUsageSnapshotRpc,
   WsServerListProviderUsageRpc,
   WsStatsGetProfileStatsRpc,
@@ -1075,6 +1121,7 @@ export const WsFeatureRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerProviderStatusesRpc,
   WsSubscribeServerSettingsRpc,
+  WsSubscribeRemoteEnvironmentStatusesRpc,
   WsProviderGetComposerCapabilitiesRpc,
   WsProviderCompactThreadRpc,
   WsProviderListCommandsRpc,

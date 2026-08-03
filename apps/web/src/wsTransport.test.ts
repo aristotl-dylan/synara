@@ -14,6 +14,8 @@ import {
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
   WsCompatibilityError,
+  EnvironmentId,
+  ThreadId,
   type WsBootstrapNegotiateResult,
 } from "@synara/contracts";
 
@@ -36,19 +38,31 @@ import {
   resolveStreamAdmissionRetry,
   shouldReconnectAfterStreamFailure,
   threadStreamInputsEqual,
+  WsBuildSkewReadOnlyError,
   WsTransport,
   type WsThreadStreamFailure,
 } from "./wsTransport";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
+import { updateEnvironment } from "./storeAggregation";
+import { useStore } from "./store";
+import {
+  localThreadDetailResumeCursors,
+  resetThreadDetailResumeCursorsForTests,
+  threadDetailResumeCursors,
+  type ThreadDetailResumeCursorScope,
+} from "./threadDetailResumeCursors";
 import {
   addWsCompatibilityIssueListener,
   emitWsCompatibilityIssue,
   readLatestWsCompatibilityIssue,
 } from "./wsTransportEvents";
+import { APP_VERSION } from "./branding";
 
 type WsEventType = "open" | "message" | "close" | "error";
 type WsListener = (event?: { data?: unknown }) => void;
 
 const sockets: MockWebSocket[] = [];
+const REMOTE_ENVIRONMENT_ID = EnvironmentId.makeUnsafe("remote-environment");
 
 class MockWebSocket {
   static readonly CONNECTING = 0;
@@ -137,6 +151,8 @@ interface WsTransportInternals {
   readonly activeThreadStreamInputs: Map<string, unknown>;
   readonly threadSubscriptions: Map<string, unknown>;
   readonly threadStreamFailureListeners: Set<(failure: WsThreadStreamFailure) => void>;
+  resumeCursors: ThreadDetailResumeCursorScope;
+  refreshThreadSubscriptionInput(threadId: string): unknown;
   disposed: boolean;
   sessionVersion: number;
   reconnect(): Promise<unknown>;
@@ -583,6 +599,41 @@ describe("WsTransport", () => {
     }
   });
 
+  /**
+   * The reconnect path rebuilds each live subscription's input from the CURRENT
+   * cursor state rather than replaying what it last sent. That matters most
+   * right after a server-generation change: `adoptNegotiation` has just wiped
+   * the cursors, so a replayed input would ask the replacement server to resume
+   * from a sequence in the previous journal's space — the resume it accepts
+   * while having no such history, which streams nothing.
+   *
+   * The helper was pre-existing; this reconnect call site is new and was
+   * unpinned — mutating it to reuse the stored input left all transport tests
+   * green.
+   */
+  it("rebuilds a thread subscription input after the cursors are reset", () => {
+    const { internals } = makeBareTransport();
+    const threadId = "thread-regenerated";
+    const cursors = threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID);
+    internals.resumeCursors = cursors;
+
+    cursors.set(ThreadId.makeUnsafe(threadId), 42);
+    internals.threadSubscriptions.set(threadId, { threadId, afterSequence: 42 });
+    expect(internals.refreshThreadSubscriptionInput(threadId)).toEqual({
+      threadId,
+      afterSequence: 42,
+    });
+
+    // The server generation changed; every cursor is dropped.
+    cursors.resetAll();
+
+    // The next resubscribe must ask for a full snapshot, not replay 42.
+    expect(internals.refreshThreadSubscriptionInput(threadId)).toEqual({ threadId });
+    expect(internals.threadSubscriptions.get(threadId)).toEqual({ threadId });
+
+    resetThreadDetailResumeCursorsForTests();
+  });
+
   it("does not let stale or duplicate thread restarts replace the active stream", async () => {
     const { internals } = makeBareTransport();
     const threadId = "thread-current-generation";
@@ -963,7 +1014,49 @@ describe("WsTransport", () => {
     await transport.dispose();
   });
 
-  it("clears cached negotiation when the reconnect liveness probe fails", async () => {
+  it("renegotiates in the same reconnect when the liveness probe finds a restarted server", async () => {
+    const restarted = { ...NEGOTIATION_RESULT, serverInstanceId: "server-instance-2" };
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport("ws://localhost:3020");
+    const internals = transport as unknown as {
+      reconnect(): Promise<unknown>;
+      probeFeatureConnection: (...args: unknown[]) => Promise<void>;
+      compatibility: WsBootstrapNegotiateResult | null;
+    };
+    await waitForSockets(1);
+    expect(internals.compatibility).toEqual(NEGOTIATION_RESULT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The server restarts: it refuses the stale `/ws` upgrade, so the cached
+    // generation's probe fails. Renegotiation answers the new generation.
+    let probeCalls = 0;
+    internals.probeFeatureConnection = async function (this: typeof internals) {
+      probeCalls += 1;
+      this.compatibility = null;
+      throw new Error("stale server generation");
+    }.bind(internals);
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, restarted)));
+
+    // Nothing external nudges the transport: the reconnect itself must land on
+    // the replacement server rather than rejecting and leaving the client shut.
+    await internals.reconnect();
+
+    expect(probeCalls).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(internals.compatibility).toEqual(restarted);
+    expect(transport.getState()).toBe("open");
+    const reconnectUrl = new URL(sockets.at(-1)!.url);
+    expect(reconnectUrl.pathname).toBe("/ws");
+    expect(reconnectUrl.searchParams.get(WS_COMPATIBILITY_QUERY.serverInstanceId)).toBe(
+      "server-instance-2",
+    );
+
+    await transport.dispose();
+  }, 10_000);
+
+  it("gives up after one fresh negotiation so a server that keeps refusing is not retried forever", async () => {
     const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -974,20 +1067,82 @@ describe("WsTransport", () => {
       compatibility: WsBootstrapNegotiateResult | null;
     };
     await waitForSockets(1);
-    expect(internals.compatibility).toEqual(NEGOTIATION_RESULT);
 
-    internals.probeFeatureConnection = async function (this: typeof internals) {
-      this.compatibility = null;
+    internals.probeFeatureConnection = async () => {
       throw new Error("stale server generation");
-    }.bind(internals);
-    await expect(internals.createSession().clientPromise).rejects.toThrow(
-      "stale server generation",
+    };
+    // The renegotiated session is refused too, so the session rejects after
+    // exactly one fresh negotiation instead of looping; further attempts (with
+    // backoff) belong to openReconnectSession.
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(
+          426,
+          JSON.parse(
+            JSON.stringify(
+              new WsCompatibilityError({
+                message: "Update this client.",
+                code: "WS_PROTOCOL_INCOMPATIBLE",
+                retryable: false,
+                action: "update-client",
+                serverBuild: "0.5.2",
+                protocolEpoch: WS_PROTOCOL_EPOCH,
+                minRevision: WS_PROTOCOL_MIN_REVISION,
+                maxRevision: WS_PROTOCOL_MAX_REVISION,
+              }),
+            ),
+          ),
+        ),
+      ),
     );
 
+    await expect(internals.createSession().clientPromise).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(internals.compatibility).toBeNull();
 
     await transport.dispose();
-  });
+  }, 10_000);
+
+  /**
+   * The session-version half of `openSession`'s guard. A superseded attempt must
+   * not adopt its negotiation or announce itself open over the session that
+   * replaced it: the newer session owns the runtime and the streams, and a late
+   * `setState("open")` from a dead attempt would report a socket nobody holds.
+   *
+   * Pinned because the guard was previously unpinned — deleting the
+   * `sessionVersion` comparison left the whole transport suite green.
+   */
+  it("abandons a session that a newer one superseded mid-negotiation", async () => {
+    // Captured via the resolver itself rather than a closure variable: TS
+    // narrows a `let` assigned only inside a callback to its initializer.
+    const negotiationResolvers: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          negotiationResolvers.push(resolve);
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport("ws://localhost:3020");
+    const internals = transport as unknown as {
+      sessionVersion: number;
+      compatibility: WsBootstrapNegotiateResult | null;
+      clientPromise: Promise<unknown>;
+    };
+    void internals.clientPromise.catch(() => undefined);
+
+    // A newer session starts while the first is still negotiating.
+    internals.sessionVersion += 1;
+    negotiationResolvers[0]?.(jsonResponse(200, NEGOTIATION_RESULT));
+
+    await expect(internals.clientPromise).rejects.toThrow("superseded");
+    // The superseded attempt must not have adopted anything.
+    expect(internals.compatibility).toBeNull();
+    expect(transport.getState()).not.toBe("open");
+
+    await transport.dispose();
+  }, 10_000);
 
   it("mirrors the negotiate endpoint onto the WS host with an HTTP scheme", () => {
     const url = new URL(makeNegotiateHttpUrl("wss://remote.example:8443/?token=old"));
@@ -1025,6 +1180,236 @@ describe("WsTransport", () => {
     );
   });
 
+  it("keeps a proxied environment's mount prefix on every socket path", () => {
+    // Same origin as the local server; the `/env/<id>` prefix is the ONLY thing
+    // that distinguishes them, so overwriting the pathname would silently point
+    // the remote's socket at the local one.
+    const environmentId = "8c51b4b7-c11d-4d16-a9c5-4bd9e3cb12db";
+    const proxied = `ws://local.test/env/${environmentId}/ws`;
+
+    expect(new URL(makeNegotiateHttpUrl(proxied)).pathname).toBe(
+      `/env/${environmentId}/ws/negotiate`,
+    );
+    expect(
+      new URL(
+        makeFeatureSocketUrl(proxied, {
+          protocolEpoch: WS_PROTOCOL_EPOCH,
+          negotiatedRevision: WS_PROTOCOL_MAX_REVISION,
+          serverBuild: "0.5.2",
+          serverInstanceId: "server-instance",
+          capabilities: ["orchestration.cursor-safe-streams"],
+        }),
+      ).pathname,
+    ).toBe(`/env/${environmentId}/ws`);
+  });
+
+  it("binds a transport constructed without an environmentId to the local cursor scope", async () => {
+    // The single-local-server regression bar, pinned directly: an env-unaware
+    // caller's cursor must be the one a default-constructed transport resumes
+    // from. Previously only multi-environment tests covered this keying, so a
+    // regression confined to the default path would not have been caught.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const thread = ThreadId.makeUnsafe("thread-default-env");
+    localThreadDetailResumeCursors().set(thread, 99);
+
+    const transport = new WsTransport({ url: "ws://localhost:3020" });
+    const internals = transport as unknown as {
+      resumeCursors: { get(threadId: ThreadId): number | undefined };
+    };
+    await waitForSockets(1);
+
+    expect(transport.environmentId).toBe(LOCAL_ENVIRONMENT_ID);
+    expect(internals.resumeCursors.get(thread)).toBe(99);
+    expect(internals.resumeCursors).toBe(threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID));
+
+    await transport.dispose();
+    resetThreadDetailResumeCursorsForTests();
+  });
+
+  it("scopes resume-cursor reset to the transport's own environment", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const localCursors = threadDetailResumeCursors(LOCAL_ENVIRONMENT_ID);
+    const remoteCursors = threadDetailResumeCursors(REMOTE_ENVIRONMENT_ID);
+    const thread = ThreadId.makeUnsafe("thread-shared");
+    localCursors.set(thread, 42);
+    remoteCursors.set(thread, 7);
+    // A fence the old journal issued; the restart must invalidate it. Seeded
+    // through the local environment's record, which is where the fence lives —
+    // the store's top-level `shellSnapshotSequence` is derived from it.
+    useStore.setState((state) =>
+      updateEnvironment(state, LOCAL_ENVIRONMENT_ID, (local) => ({
+        ...local,
+        shellSnapshotSequence: 500,
+        // Stamped in the SAME journal as the fence, so the generation change
+        // has to invalidate it too. Left behind, it filters the restored
+        // server's rows out before any pruning runs and the thread stays
+        // invisible with no error surfaced.
+        deletedThreadIdsById: { [ThreadId.makeUnsafe("thread-tombstoned")]: 501 },
+      })),
+    );
+
+    const transport = new WsTransport({ url: "ws://localhost:3020" });
+    const internals = transport as unknown as {
+      createSession(): { clientPromise: Promise<unknown> };
+      compatibility: WsBootstrapNegotiateResult | null;
+    };
+    await waitForSockets(1);
+
+    // The local server restarted; only its journal changed, so only its
+    // cursors may be dropped. The remote environment's sequences are unrelated.
+    internals.compatibility = null;
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(200, { ...NEGOTIATION_RESULT, serverInstanceId: "server-instance-2" }),
+      ),
+    );
+    await internals.createSession().clientPromise;
+
+    expect(localCursors.get(thread)).toBeUndefined();
+    expect(remoteCursors.get(thread)).toBe(7);
+    // The shell fence is invalidated by the same event and for the same reason:
+    // it is a high-water mark in the journal that just went away. Left behind,
+    // the replacement server's lower snapshots are all rejected as stale and the
+    // sidebar keeps rendering content that server no longer holds.
+    expect(useStore.getState().shellSnapshotSequence).toBe(0);
+    expect(useStore.getState().deletedThreadIdsById).toEqual({});
+
+    await transport.dispose();
+    resetThreadDetailResumeCursorsForTests();
+  });
+
+  it("reconnects when the heartbeat goes unanswered on a silently-dead socket", async () => {
+    // A NAT-evicted socket stays readable and "open" forever, so only an
+    // unanswered application-level round trip distinguishes it from an idle
+    // healthy link.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+      // One miss is enough here; the tolerance threshold has its own cases.
+      heartbeatMaxMissedProbes: 1,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+      heartbeatTimer: number | null;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+    internals.runLivenessProbe = vi.fn(() => Promise.reject(new Error("socket is a zombie")));
+
+    await vi.waitFor(() => expect(reconnect).toHaveBeenCalled());
+
+    await transport.dispose();
+  }, 10_000);
+
+  it("keeps probing on a healthy link and stops on dispose", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+      heartbeatTimer: number | null;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+    const probe = vi.fn(() => Promise.resolve());
+    internals.runLivenessProbe = probe;
+
+    // An answered probe must reschedule rather than settle after one round.
+    await vi.waitFor(() => expect(probe.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(reconnect).not.toHaveBeenCalled();
+
+    await transport.dispose();
+    // Disposal must cancel the timer; a surviving one would resurrect the
+    // transport after teardown returned.
+    expect(internals.heartbeatTimer).toBeNull();
+    const callsAfterDispose = probe.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(probe.mock.calls.length).toBe(callsAfterDispose);
+  }, 10_000);
+
+  it("tolerates isolated missed probes and only reconnects after consecutive misses", async () => {
+    // A GC pause or a server compacting a large thread can blow one deadline on
+    // a perfectly healthy link. Reconnecting on that single miss would restart
+    // every stream under exactly the load that caused the delay.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+      heartbeatMaxMissedProbes: 3,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+
+    // Two misses then a success: the counter resets, so no reconnect.
+    let call = 0;
+    const probe = vi.fn(() => {
+      call += 1;
+      return call <= 2 ? Promise.reject(new Error("slow")) : Promise.resolve();
+    });
+    internals.runLivenessProbe = probe;
+
+    await vi.waitFor(() => expect(probe.mock.calls.length).toBeGreaterThanOrEqual(4));
+    expect(reconnect).not.toHaveBeenCalled();
+
+    await transport.dispose();
+  }, 10_000);
+
+  it("reconnects once the missed probes reach the configured threshold", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new WsTransport({
+      url: "ws://localhost:3020",
+      heartbeatIntervalMs: 5,
+      heartbeatTimeoutMs: 5,
+      heartbeatMaxMissedProbes: 3,
+    });
+    const internals = transport as unknown as {
+      runLivenessProbe: (...args: unknown[]) => Promise<void>;
+      reconnect: () => Promise<unknown>;
+    };
+    await waitForSockets(1);
+
+    const reconnect = vi.fn(async () => ({}));
+    internals.reconnect = reconnect;
+    const probe = vi.fn(() => Promise.reject(new Error("socket is a zombie")));
+    internals.runLivenessProbe = probe;
+
+    await vi.waitFor(() => expect(reconnect).toHaveBeenCalled());
+    // A dead socket must not trigger a reconnect before the threshold.
+    expect(probe.mock.calls.length).toBeGreaterThanOrEqual(3);
+
+    await transport.dispose();
+  }, 10_000);
+
   it("notifies state listeners and replays the current state on demand", async () => {
     const transport = new WsTransport();
     const listener = vi.fn();
@@ -1043,5 +1428,118 @@ describe("WsTransport", () => {
     await transport.dispose();
 
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("WsTransport version handshake", () => {
+  const matchingBuild = { ...NEGOTIATION_RESULT, serverBuild: APP_VERSION };
+  const skewedBuild = { ...NEGOTIATION_RESULT, serverBuild: "999.0.0" };
+
+  it("stays fully usable when the server build matches", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse(200, matchingBuild))),
+    );
+    const transport = new WsTransport("ws://localhost:3020");
+    await waitForSockets(1);
+
+    expect(transport.getBuildSkew()).toBeNull();
+
+    await transport.dispose();
+  });
+
+  it("degrades to read-only and refuses writes on a version-skewed server", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse(200, skewedBuild))),
+    );
+    const observed: Array<unknown> = [];
+    const transport = new WsTransport("ws://localhost:3020");
+    transport.onBuildSkew((skew) => observed.push(skew));
+    await waitForSockets(1);
+
+    expect(transport.getBuildSkew()).toEqual({
+      clientBuild: APP_VERSION,
+      serverBuild: "999.0.0",
+    });
+    expect(observed).toContainEqual({ clientBuild: APP_VERSION, serverBuild: "999.0.0" });
+
+    // The write never reaches the wire: it fails before any RPC is dispatched.
+    const sentBefore = sockets[0]?.sent.length ?? 0;
+    await expect(
+      transport.request(ORCHESTRATION_WS_METHODS.dispatchCommand, { command: {} }),
+    ).rejects.toBeInstanceOf(WsBuildSkewReadOnlyError);
+    expect(sockets[0]?.sent.length ?? 0).toBe(sentBefore);
+
+    await transport.dispose();
+  });
+
+  // Regression: the pre-connect check alone cannot catch this. A write issued
+  // before negotiation completes sees no skew yet, awaits the connection, and
+  // would then dispatch unchecked against a mismatched server.
+  it("refuses a write started before the skew is known", async () => {
+    let releaseNegotiation: (() => void) | undefined;
+    const negotiationGate = new Promise<void>((resolve) => {
+      releaseNegotiation = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        await negotiationGate;
+        return jsonResponse(200, skewedBuild);
+      }),
+    );
+
+    const transport = new WsTransport("ws://localhost:3020");
+    // No skew is known at this point — the pre-connect check cannot refuse it.
+    expect(transport.getBuildSkew()).toBeNull();
+    const pending = transport.request(ORCHESTRATION_WS_METHODS.dispatchCommand, { command: {} });
+    const assertion = expect(pending).rejects.toBeInstanceOf(WsBuildSkewReadOnlyError);
+
+    releaseNegotiation?.();
+    await assertion;
+
+    await transport.dispose();
+  });
+
+  it("still admits read methods while degraded", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse(200, skewedBuild))),
+    );
+    const transport = new WsTransport("ws://localhost:3020");
+    await waitForSockets(1);
+
+    // Reads are dispatched (they fail later on the mock socket, but never with
+    // the read-only refusal).
+    await expect(
+      transport.request(ORCHESTRATION_WS_METHODS.getShellSnapshot, {}, { timeoutMs: 10 }),
+    ).rejects.not.toBeInstanceOf(WsBuildSkewReadOnlyError);
+
+    await transport.dispose();
+  });
+
+  it("clears the degraded state after reconnecting to a matching server", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, skewedBuild)));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new WsTransport("ws://localhost:3020");
+    const internals = transport as unknown as {
+      createSession(): { clientPromise: Promise<unknown> };
+      compatibility: WsBootstrapNegotiateResult | null;
+    };
+    await waitForSockets(1);
+    expect(transport.getBuildSkew()).not.toBeNull();
+
+    internals.compatibility = null;
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(200, { ...matchingBuild, serverInstanceId: "server-instance-2" }),
+      ),
+    );
+    await internals.createSession().clientPromise;
+
+    expect(transport.getBuildSkew()).toBeNull();
+
+    await transport.dispose();
   });
 });

@@ -1,5 +1,5 @@
 // FILE: wsTransport.ts
-// Purpose: Browser-side Effect RPC transport over the Synara WebSocket endpoint.
+// Purpose: Browser-side Effect RPC transport over one environment's WebSocket endpoint.
 // Layer: Web transport
 // Exports: WsTransport plus stream-selection helpers used by tests.
 
@@ -31,12 +31,14 @@ import {
   type ProjectDevServerEvent,
   type ServerConfigStreamEvent,
   type ServerLifecycleStreamEvent,
+  type RemoteEnvironmentStatusesPayload,
   type ServerProviderStatusesUpdatedPayload,
   type ServerSettingsUpdatedPayload,
   type TerminalEvent,
   type WsPush,
   type WsPushChannel,
   type WsPushMessage,
+  type EnvironmentId,
   ThreadId,
 } from "@synara/contracts";
 import {
@@ -54,12 +56,17 @@ import {
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
 
+import { classifyBuildSkew, isReadOnlySafeWsMethod } from "@synara/shared/buildSkew";
+
 import { APP_VERSION } from "./branding";
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
+import { withWsPathPrefix, wsUrlPathPrefix } from "./lib/wsUrlPathPrefix";
+import { useStore } from "./store";
 import {
-  buildThreadSubscribeInput,
-  resetThreadDetailResumeCursors,
+  threadDetailResumeCursors,
+  type ThreadDetailResumeCursorScope,
 } from "./threadDetailResumeCursors";
-import type { WsTransportState } from "./wsTransportEvents";
+import type { WsBuildSkewState, WsTransportState } from "./wsTransportEvents";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
 
@@ -70,6 +77,18 @@ type RpcClientInstance =
 class WsTransportRpcError extends Data.TaggedError("WsTransportRpcError")<{
   readonly message: string;
   readonly cause?: unknown;
+}> {}
+
+/**
+ * Thrown instead of issuing a write on a version-skewed connection. Distinct
+ * from a transport failure so UI can present the degraded state rather than a
+ * retryable network error.
+ */
+export class WsBuildSkewReadOnlyError extends Data.TaggedError("WsBuildSkewReadOnlyError")<{
+  readonly message: string;
+  readonly method: string;
+  readonly clientBuild: string;
+  readonly serverBuild: string;
 }> {}
 
 export class WsTransportRequestInterruptedError extends Data.TaggedError(
@@ -162,9 +181,14 @@ const makeBootstrapRpcClient = RpcClient.make(WsBootstrapRpcGroup);
 const REQUEST_TIMEOUT_MS = 60_000;
 const FEATURE_CONNECTION_PROBE_TIMEOUT_MS = 10_000;
 
+// Mounts `path` on the server `rawUrl` addresses, keeping whatever prefix that
+// URL is mounted under. Assigning `url.pathname = path` instead would send a
+// proxied environment's socket (`/env/<id>/ws`) to the LOCAL `/ws` — same
+// origin, right-looking URL, wrong server. The prefix is the only thing that
+// distinguishes them, so it is the one part that must survive.
 function resolveRpcUrl(rawUrl: string, path: string): string {
   const url = new URL(rawUrl);
-  url.pathname = path;
+  url.pathname = withWsPathPrefix(wsUrlPathPrefix(url), path);
   return url.toString();
 }
 
@@ -534,11 +558,55 @@ export function shouldKeepServerLifecycleStream(activeChannels: ReadonlySet<stri
   );
 }
 
+/**
+ * A silently-dead socket (NAT/CGNAT idle eviction, sleeping laptop, a tunnel
+ * whose far side vanished) never fires `close` or `error` in the browser, so
+ * the transport would sit in "open" forever. An application-level probe on the
+ * feature socket turns that into a normal reconnect. The interval is long
+ * enough not to matter on a WAN link and short enough to beat typical NAT idle
+ * timeouts (commonly 300s).
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+export const HEARTBEAT_TIMEOUT_MS = 10_000;
+
+/**
+ * Tearing down every stream is far more expensive than waiting one more
+ * interval, and a single missed deadline does not distinguish a dead socket
+ * from a busy one: a server compacting a large thread, a GC pause, or a
+ * throttled background tab can all blow a 10s deadline while the connection is
+ * perfectly healthy. Reconnecting on one timeout would restart every stream
+ * under exactly the sustained load that caused the delay, so a reconnect
+ * requires this many consecutive misses. A dead socket misses all of them and
+ * is still detected within roughly one NAT idle window.
+ */
+export const HEARTBEAT_MAX_MISSED_PROBES = 3;
+
+export interface WsTransportOptions {
+  readonly url?: string | null;
+  /** Identity of the server this transport talks to; defaults to the local server. */
+  readonly environmentId?: EnvironmentId;
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatTimeoutMs?: number;
+  readonly heartbeatMaxMissedProbes?: number;
+}
+
 export class WsTransport {
+  readonly environmentId: EnvironmentId;
   private readonly explicitUrl: string | null;
+  /** This environment's cursor space. Sequences never cross environments. */
+  private readonly resumeCursors: ThreadDetailResumeCursorScope;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private readonly heartbeatMaxMissedProbes: number;
+  private heartbeatTimer: number | null = null;
+  private heartbeatInFlight = false;
+  private missedHeartbeats = 0;
+  /** Timestamp of the last message received on the feature socket. */
+  private lastInboundAt = 0;
   private readonly listeners = new Map<string, Set<(message: WsPush) => void>>();
   private readonly stateListeners = new Set<(state: WsTransportState) => void>();
   private readonly compatibilityListeners = new Set<(issue: WsCompatibilityError | null) => void>();
+  private readonly buildSkewListeners = new Set<(skew: WsBuildSkewState | null) => void>();
   private readonly threadStreamFailureListeners = new Set<
     (failure: WsThreadStreamFailure) => void
   >();
@@ -576,9 +644,18 @@ export class WsTransport {
   // reconnects still reset replayed push state even after the negotiation
   // cache was cleared by an intervening failure.
   private lastServerInstanceId: string | null = null;
+  private buildSkew: WsBuildSkewState | null = null;
 
-  constructor(url?: string) {
-    this.explicitUrl = url ?? null;
+  constructor(options?: string | WsTransportOptions) {
+    const resolved: WsTransportOptions =
+      typeof options === "string" ? { url: options } : (options ?? {});
+    this.explicitUrl = resolved.url ?? null;
+    this.environmentId = resolved.environmentId ?? LOCAL_ENVIRONMENT_ID;
+    this.resumeCursors = threadDetailResumeCursors(this.environmentId);
+    this.heartbeatIntervalMs = resolved.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
+    this.heartbeatTimeoutMs = resolved.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS;
+    this.heartbeatMaxMissedProbes =
+      resolved.heartbeatMaxMissedProbes ?? HEARTBEAT_MAX_MISSED_PROBES;
     this.clientPromise = this.createSession().clientPromise;
   }
 
@@ -588,6 +665,10 @@ export class WsTransport {
     options?: WsRequestOptions,
   ): Promise<T> {
     if (this.disposed) throw new Error("Transport disposed");
+    // Fail fast when the skew is already known. This is only the first of two
+    // checks: the authoritative one runs after the connection resolves, since
+    // the skew is adopted during negotiation.
+    this.assertNotSkewedWrite(method);
     const requestOptions: WsRequestOptions =
       options?.timeoutMs === undefined ? { ...options, timeoutMs: REQUEST_TIMEOUT_MS } : options;
     const abortScope = makeRequestAbortScope(requestOptions);
@@ -608,6 +689,11 @@ export class WsTransport {
       }
 
       const client = await awaitWithAbort(this.getClient(), abortScope.signal);
+      // Authoritative check. The skew is adopted while the connection resolves,
+      // so a write started during initial connect or a reconnect passes the
+      // pre-connect check with no skew known yet. Re-checking here is what
+      // actually keeps a skewed build from mutating.
+      this.assertNotSkewedWrite(method);
 
       if (method === WS_METHODS.gitRunStackedAction) {
         return (await this.runGitActionStream(client, params, abortScope.signal)) as T;
@@ -768,6 +854,7 @@ export class WsTransport {
     // than resolve later and build a runtime this teardown will not see.
     this.lifetime.abort();
     this.setState("disposed");
+    this.stopHeartbeat();
     this.resetAllStreamCapacityRetries();
     this.resetAllStreamCompletionRetries();
     for (const cleanup of this.streamCleanups.values()) cleanup();
@@ -830,6 +917,59 @@ export class WsTransport {
     }
   }
 
+  /**
+   * Version handshake. A build mismatch degrades the session to read-only
+   * rather than hard-failing: cached state stays readable and every write is
+   * refused client-side so a skewed client can never write cross-version.
+   */
+  private adoptBuildSkew(serverBuild: string): void {
+    const next =
+      classifyBuildSkew({ clientBuild: APP_VERSION, serverBuild }) === "compatible"
+        ? null
+        : ({ clientBuild: APP_VERSION, serverBuild } satisfies WsBuildSkewState);
+    if (this.buildSkew?.serverBuild === next?.serverBuild) return;
+    this.buildSkew = next;
+    for (const listener of this.buildSkewListeners) {
+      try {
+        listener(next);
+      } catch {
+        // Skew UI listeners must not break transport setup.
+      }
+    }
+  }
+
+  /**
+   * Refuses a mutating method while the session is version-skewed. Called both
+   * before and after the connection resolves, because the skew is only adopted
+   * during negotiation.
+   */
+  private assertNotSkewedWrite(method: string): void {
+    const skew = this.buildSkew;
+    if (!skew || isReadOnlySafeWsMethod(method)) return;
+    throw new WsBuildSkewReadOnlyError({
+      message: `${method} is unavailable while this client (${skew.clientBuild}) and server (${skew.serverBuild}) run mismatched builds.`,
+      method,
+      clientBuild: skew.clientBuild,
+      serverBuild: skew.serverBuild,
+    });
+  }
+
+  /** Current degraded read-only state, or null when builds match. */
+  getBuildSkew(): WsBuildSkewState | null {
+    return this.buildSkew;
+  }
+
+  onBuildSkew(
+    listener: (skew: WsBuildSkewState | null) => void,
+    options?: { readonly replayCurrent?: boolean },
+  ): () => void {
+    this.buildSkewListeners.add(listener);
+    if (options?.replayCurrent) listener(this.buildSkew);
+    return () => {
+      this.buildSkewListeners.delete(listener);
+    };
+  }
+
   private adoptNegotiation(compatibility: WsBootstrapNegotiateResult): void {
     if (serverIdentityChanged(this.lastServerInstanceId, compatibility.serverInstanceId)) {
       this.latestPushByChannel.clear();
@@ -841,12 +981,22 @@ export class WsTransport {
       // `compatibility`, so an outage longer than the first retry still
       // detects the change. Interim tradeoff: this also drops resume across
       // plain restarts of the same journal, acceptable until the protocol
-      // carries a durable journal epoch.
-      resetThreadDetailResumeCursors();
+      // carries a durable journal epoch. Scoped to this environment: another
+      // server's journal did not change, and its sequences are unrelated.
+      this.resumeCursors.resetAll();
+      // The shell snapshot fence is the same kind of state as a cursor: a
+      // high-water mark in the old journal's sequence space. Left behind, a
+      // replacement server whose journal restarts lower has every snapshot
+      // rejected as stale, and the sidebar keeps rendering content that server
+      // no longer holds — stale, not merely frozen, with no error surfaced.
+      // Reset alongside the cursors: one generation change, one place that
+      // decides what it invalidates.
+      useStore.getState().clearEnvironmentShellFence(this.environmentId);
     }
     this.lastServerInstanceId = compatibility.serverInstanceId;
     this.compatibility = compatibility;
     this.setCompatibilityIssue(null);
+    this.adoptBuildSkew(compatibility.serverBuild);
   }
 
   /**
@@ -859,6 +1009,25 @@ export class WsTransport {
     client: RpcClientInstance,
     runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>,
   ): Promise<void> {
+    try {
+      await this.runLivenessProbe(client, runtime, FEATURE_CONNECTION_PROBE_TIMEOUT_MS);
+    } catch (error) {
+      this.compatibility = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Round trip on the feature socket that the server answers without side
+   * effects (`unsubscribeShell` resolves to `Effect.void` server-side). Called
+   * on the raw client rather than through `request`, whose client-side
+   * interception of that method would cancel the live shell stream.
+   */
+  private async runLivenessProbe(
+    client: RpcClientInstance,
+    runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>,
+    timeoutMs: number,
+  ): Promise<void> {
     const probe = (
       client as unknown as Record<
         string,
@@ -866,12 +1035,122 @@ export class WsTransport {
       >
     )[ORCHESTRATION_WS_METHODS.unsubscribeShell];
     if (!probe) return;
-    try {
-      await runtime.runPromise(probe({}).pipe(Effect.timeout(FEATURE_CONNECTION_PROBE_TIMEOUT_MS)));
-    } catch (error) {
-      this.compatibility = null;
-      throw error;
+    await runtime.runPromise(probe({}).pipe(Effect.timeout(timeoutMs)));
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer === null) return;
+    window.clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  /**
+   * Detects a socket that died without notifying the browser (NAT idle
+   * eviction, sleeping peer, collapsed tunnel): the connection stays readable
+   * and "open" forever, so only an unanswered application-level round trip
+   * distinguishes it from an idle-but-healthy link.
+   */
+  private scheduleHeartbeat(
+    client: RpcClientInstance,
+    runtime: ManagedRuntime.ManagedRuntime<RpcClient.Protocol, never>,
+    heartbeatSessionVersion: number,
+  ): void {
+    this.stopHeartbeat();
+    if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+    const timerId = window.setTimeout(() => {
+      if (this.heartbeatTimer !== timerId) return;
+      this.heartbeatTimer = null;
+      if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+      if (this.heartbeatInFlight) return;
+
+      // Traffic within the last interval already proves the socket is alive, so
+      // skip the probe entirely. This keeps a heavily-streaming connection from
+      // paying for probes it does not need, and stops a probe queued behind that
+      // traffic from being mistaken for a death.
+      if (Date.now() - this.lastInboundAt < this.heartbeatIntervalMs) {
+        this.missedHeartbeats = 0;
+        this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
+        return;
+      }
+
+      this.heartbeatInFlight = true;
+      void this.runLivenessProbe(client, runtime, this.heartbeatTimeoutMs)
+        .then(() => {
+          this.heartbeatInFlight = false;
+          this.missedHeartbeats = 0;
+          this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
+        })
+        .catch(() => {
+          this.heartbeatInFlight = false;
+          if (this.disposed || this.sessionVersion !== heartbeatSessionVersion) return;
+          this.missedHeartbeats += 1;
+          if (this.missedHeartbeats < this.heartbeatMaxMissedProbes) {
+            // Probably a slow server rather than a dead one. Keep probing: a
+            // live server answers the next round and resets the counter.
+            this.scheduleHeartbeat(client, runtime, heartbeatSessionVersion);
+            return;
+          }
+          // A dead socket cannot be revived by retrying on it. Reconnecting
+          // re-establishes every registered stream and lets the server replay
+          // the persisted tail from this environment's cursors.
+          this.missedHeartbeats = 0;
+          void this.reconnect().catch(() => undefined);
+        });
+    }, this.heartbeatIntervalMs);
+    this.heartbeatTimer = timerId;
+  }
+
+  /**
+   * Opens one feature socket against `cachedCompatibility`, or against a fresh
+   * HTTP negotiation when none is supplied. Only a cached-negotiation session
+   * probes for liveness — a freshly negotiated generation was just proven alive
+   * by the negotiation itself.
+   */
+  private async openSession(
+    sessionVersion: number,
+    cachedCompatibility: WsBootstrapNegotiateResult | null,
+  ): Promise<RpcClientInstance> {
+    const compatibility = cachedCompatibility ?? (await this.negotiateCompatibility());
+    if (this.disposed || this.sessionVersion !== sessionVersion) {
+      throw new Error("WebSocket session superseded during compatibility negotiation.");
     }
+
+    const featureRuntime = ManagedRuntime.make(
+      makeProtocolLayer(makeFeatureSocketUrl(this.explicitUrl, compatibility)),
+    );
+    const featureScope = featureRuntime.runSync(Scope.make());
+    this.runtime = featureRuntime;
+    this.clientScope = featureScope;
+    const client = await featureRuntime.runPromise(Scope.provide(featureScope)(makeRpcClient));
+    this.runtimeByClient.set(client, featureRuntime);
+    if (cachedCompatibility) {
+      await this.probeFeatureConnection(client, featureRuntime);
+    }
+    if (!this.disposed && this.sessionVersion === sessionVersion) {
+      this.adoptNegotiation(compatibility);
+      this.setState("open");
+      // A new socket starts with a clean liveness record; misses counted
+      // against the previous one say nothing about this one. Inbound time
+      // stays unset so the first probe always runs — a new socket has not yet
+      // proven it carries traffic.
+      this.missedHeartbeats = 0;
+      this.lastInboundAt = 0;
+      this.scheduleHeartbeat(client, featureRuntime, sessionVersion);
+    }
+    return client;
+  }
+
+  /** Tears down the runtime a failed session attempt left installed. */
+  private async discardSessionRuntime(): Promise<void> {
+    const runtime = this.runtime;
+    const clientScope = this.clientScope;
+    this.runtime = null;
+    this.clientScope = null;
+    if (!runtime) return;
+    if (clientScope) {
+      await runtime.runPromise(Scope.close(clientScope, Exit.void)).catch(() => undefined);
+    }
+    await runtime.dispose().catch(() => undefined);
   }
 
   private createSession() {
@@ -880,29 +1159,34 @@ export class WsTransport {
     // unchanged, so a reconnect costs exactly one WebSocket handshake.
     const cachedCompatibility = this.compatibility;
     const clientPromise = (async () => {
-      const compatibility = cachedCompatibility ?? (await this.negotiateCompatibility());
-      if (this.disposed || this.sessionVersion !== sessionVersion) {
-        throw new Error("WebSocket session superseded during compatibility negotiation.");
+      try {
+        return await this.openSession(sessionVersion, cachedCompatibility);
+      } catch (error) {
+        // A cached-negotiation session only fails because the cached generation
+        // is gone (the restarted server refuses the stale `/ws` upgrade with
+        // 426). The replacement is usually already listening, and nothing else
+        // would retry: the reconnect promise is shared, so rejecting here just
+        // hands every caller the same failure and leaves the client closed
+        // against a healthy server. Renegotiate once inside this same session.
+        //
+        // Exactly one retry, and only from a cache: the retry negotiates fresh,
+        // so it has no stale state left to invalidate. A second failure is a
+        // real outage and belongs to openReconnectSession's backoff rather than
+        // to an unbounded loop here.
+        if (
+          cachedCompatibility === null ||
+          this.disposed ||
+          this.sessionVersion !== sessionVersion ||
+          isTerminalCompatibilityFailure(error)
+        ) {
+          throw error;
+        }
+        await this.discardSessionRuntime();
+        return await this.openSession(sessionVersion, null);
       }
-
-      const featureRuntime = ManagedRuntime.make(
-        makeProtocolLayer(makeFeatureSocketUrl(this.explicitUrl, compatibility)),
-      );
-      const featureScope = featureRuntime.runSync(Scope.make());
-      this.runtime = featureRuntime;
-      this.clientScope = featureScope;
-      const client = await featureRuntime.runPromise(Scope.provide(featureScope)(makeRpcClient));
-      this.runtimeByClient.set(client, featureRuntime);
-      if (cachedCompatibility) {
-        await this.probeFeatureConnection(client, featureRuntime);
-      }
-      if (!this.disposed && this.sessionVersion === sessionVersion) {
-        this.adoptNegotiation(compatibility);
-        this.setState("open");
-      }
-      return client;
     })().catch((error) => {
       if (!this.disposed && this.sessionVersion === sessionVersion) {
+        this.stopHeartbeat();
         this.compatibility = null;
         const compatibilityError = getTerminalCompatibilityError(error);
         if (compatibilityError) {
@@ -944,6 +1228,7 @@ export class WsTransport {
     const oldClientScope = this.clientScope;
     this.runtime = null;
     this.clientScope = null;
+    this.stopHeartbeat();
     this.resetAllStreamCapacityRetries();
     this.resetAllStreamCompletionRetries();
     for (const cleanup of this.streamCleanups.values()) cleanup();
@@ -1113,6 +1398,10 @@ export class WsTransport {
   }
 
   private emit<C extends WsPushChannel>(channel: C, data: WsPushMessage<C>["data"]): void {
+    // Every server-originated message funnels through here, so this is the one
+    // place that proves the socket is carrying traffic. A busy stream is
+    // stronger evidence of liveness than a probe reply.
+    this.lastInboundAt = Date.now();
     const message = {
       type: "push" as const,
       sequence: ++this.sequence,
@@ -1185,6 +1474,15 @@ export class WsTransport {
               this.emit(WS_CHANNELS.serverSettingsUpdated, payload),
             restartChannel,
           );
+        } else if (channel === WS_CHANNELS.remoteEnvironmentStatusesUpdated) {
+          this.startStream(
+            client,
+            "server.remoteEnvironments",
+            client[WS_METHODS.subscribeRemoteEnvironmentStatuses]({}),
+            (payload: RemoteEnvironmentStatusesPayload) =>
+              this.emit(WS_CHANNELS.remoteEnvironmentStatusesUpdated, payload),
+            restartChannel,
+          );
         } else if (channel === WS_CHANNELS.terminalEvent) {
           this.startStream(
             client,
@@ -1239,6 +1537,8 @@ export class WsTransport {
     else if (channel === WS_CHANNELS.serverProviderStatusesUpdated)
       this.stopStream("server.providers");
     else if (channel === WS_CHANNELS.serverSettingsUpdated) this.stopStream("server.settings");
+    else if (channel === WS_CHANNELS.remoteEnvironmentStatusesUpdated)
+      this.stopStream("server.remoteEnvironments");
     else if (channel === WS_CHANNELS.terminalEvent) this.stopStream("terminal.events");
     else if (channel === WS_CHANNELS.projectDevServerEvent) this.stopStream("project.devServers");
     else if (channel === WS_CHANNELS.automationEvent) this.stopStream("automation.events");
@@ -1302,7 +1602,9 @@ export class WsTransport {
   private refreshThreadSubscriptionInput(threadId: string): unknown {
     if (!this.threadSubscriptions.has(threadId)) return undefined;
     const existingInput = this.threadSubscriptions.get(threadId);
-    const rebuiltInput: unknown = buildThreadSubscribeInput(ThreadId.makeUnsafe(threadId));
+    const rebuiltInput: unknown = this.resumeCursors.buildSubscribeInput(
+      ThreadId.makeUnsafe(threadId),
+    );
     const input = threadStreamInputsEqual(existingInput, rebuiltInput)
       ? existingInput
       : rebuiltInput;

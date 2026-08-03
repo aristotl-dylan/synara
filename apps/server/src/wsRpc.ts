@@ -21,8 +21,6 @@ import {
   type ProjectDevServerEvent,
   type OrchestrationShellStreamEvent,
   type OrchestrationShellStreamItem,
-  type OrchestrationThreadDetailSnapshot,
-  type OrchestrationThreadStreamItem,
   type ServerConfigStreamEvent,
   type ServerDiagnosticsResult,
   type ServerLifecycleStreamEvent,
@@ -46,6 +44,13 @@ import { CheckpointDiffQuery } from "./checkpointing/Services/CheckpointDiffQuer
 import { resolveThreadWorkspaceCwd } from "./checkpointing/Utils";
 import { ServerConfig, type ServerConfigShape } from "./config";
 import { realpathNearestExisting } from "./realpathNearestExisting";
+import {
+  currentRemoteEnvironmentStatuses,
+  remoteEnvironmentStatusStream,
+} from "./remoteEnvironmentSupervisorRuntime";
+import { RemoteHostRateLimitError, sharedRemoteHostBroker } from "./remoteHostBroker";
+import { fetchRemoteHostFingerprint } from "./remoteHostFingerprintService";
+import { detectPhoneReachability } from "./phoneReachability";
 import { listStudioThreadOutputs } from "./studioOutputs";
 import {
   ensureStudioWorkspaceInstructionsFiles,
@@ -67,7 +72,11 @@ import {
 import { Keybindings } from "./keybindings";
 import { createLocalPreviewGrant } from "./localImageFiles";
 import { listLocalServers, stopLocalServer } from "./localServerMonitor";
-import { listManagedWorktrees, pruneProjectedArchivedManagedWorktrees } from "./managedWorktrees";
+import {
+  listManagedWorktrees,
+  listProjectedManagedWorktrees as listProjectedManagedWorktreesEffect,
+  pruneProjectedArchivedManagedWorktrees,
+} from "./managedWorktrees";
 import {
   attachmentPrincipalForSession,
   CurrentManagedAttachmentPrincipal,
@@ -94,7 +103,6 @@ import { ExternalMcpService } from "./externalMcp/Services/ExternalMcpService";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
 import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
-import { isLoopbackHost } from "./startupAccess";
 import { TerminalManager } from "./terminal/Services/Manager";
 import { TerminalThreadTitleTracker } from "./terminal/terminalThreadTitleTracker";
 import { WorkspaceEntries } from "./workspace/Services/WorkspaceEntries";
@@ -105,34 +113,42 @@ import {
   makeWsStreamAdmission,
 } from "./wsStreamAdmission";
 import { ThreadDiagnosticsQuery } from "./diagnostics/Services/ThreadDiagnosticsQuery";
-import { makeWsRequestAdmission } from "./wsRequestAdmission";
+import { makeWsRequestAdmission, type WsRequestAdmission } from "./wsRequestAdmission";
+import { authorizeWsMethod } from "./wsMethodAuthorization";
 import {
-  CurrentWsSessionRole,
+  DEFAULT_WS_SESSION_ROLE,
   provideWsConnectionSession,
   WS_CONNECTION_SESSION_HEADER,
   WsConnectionSessions,
   WsConnectionSessionsLive,
   type WsConnectionSession,
+  type WsConnectionSessionsShape,
 } from "./wsConnectionSessions";
 import {
   negotiateWsCompatibility,
   parseWsNegotiateSearchParams,
+  isWsClientBuildSkewed,
   validateWsFeatureCompatibility,
 } from "./wsCompatibility";
 import {
   isTrustedAppOrigin,
   normalizeCorsOrigin,
-  requiresWebSocketAuthentication,
   shouldRejectUntrustedRequestOrigin,
 } from "./trustedOrigins";
+import {
+  allowsImplicitOwnerSession,
+  type AuthenticatedDeployment,
+  type RemoteAccessDeployment,
+} from "./remoteAccessPolicy";
 import { bufferLiveUiStream, type LiveUiStreamDropReport } from "./wsStreamBackpressure";
 import { makeCursorSafeSnapshotLiveStream } from "./wsSnapshotLiveStream";
+import {
+  makeThreadDetailStream,
+  makeThreadDetailStreamQueries,
+  type ThreadDetailStreamDependencies,
+} from "./wsThreadDetailStream";
 import { PullRequestService } from "./pullRequests/Services/PullRequestService";
 import { resolveGitHubRepository } from "./pullRequests/repositoryResolution";
-
-export function canManageExternalMcp(role: "owner" | "client"): boolean {
-  return role === "owner";
-}
 
 const MAX_DIAGNOSTIC_CHILD_PROCESSES = 80;
 const MAX_DIAGNOSTIC_ARGS_CHARS = 500;
@@ -144,23 +160,50 @@ class WsRequestAdmissionMiddleware extends RpcMiddleware.Service<WsRequestAdmiss
 
 const AdmittedWsFeatureRpcGroup = WsFeatureRpcGroup.middleware(WsRequestAdmissionMiddleware);
 
+/**
+ * Builds the single choke point every feature RPC passes through: it resolves
+ * the connection session, enforces the method authorization table, and applies
+ * per-client concurrency admission. Exported so authorization can be tested
+ * without standing up a socket.
+ */
+export function makeWsAdmissionMiddleware(deps: {
+  readonly admission: Pick<WsRequestAdmission, "guard">;
+  readonly connectionSessions: Pick<WsConnectionSessionsShape, "lookup">;
+  readonly config: RemoteAccessDeployment;
+}): RpcMiddleware.RpcMiddleware<never, WsRpcError, never> {
+  return (effect, options) => {
+    // Handler fibers descend from the RPC server fiber (forked at layer build),
+    // not from the connection's HTTP upgrade fiber, so connection-scoped
+    // services must be re-provided here from the connection-session registry.
+    const session = deps.connectionSessions.lookup(
+      Headers.get(options.headers, WS_CONNECTION_SESSION_HEADER),
+    );
+    // Authorization is enforced here rather than opt-in per handler: a method
+    // added to the owner-only/local-only tables is covered on every route,
+    // including streaming ones.
+    const rejection = authorizeWsMethod({
+      method: options.rpc._tag,
+      role: session?.role ?? DEFAULT_WS_SESSION_ROLE,
+      config: deps.config,
+      // Unresolved sessions fail safe: treat the build as skewed so an
+      // unidentified connection cannot mutate either.
+      buildSkewed: session?.buildSkewed ?? true,
+    });
+    if (rejection) return Effect.fail(rejection);
+    const scoped = provideWsConnectionSession(effect, session);
+    return RpcSchema.isStreamSchema(options.rpc.successSchema)
+      ? scoped
+      : deps.admission.guard(options.clientId, options.rpc._tag, scoped);
+  };
+}
+
 const wsRequestAdmissionMiddlewareLayer = Layer.effect(
   WsRequestAdmissionMiddleware,
   Effect.gen(function* () {
     const admission = yield* makeWsRequestAdmission;
     const connectionSessions = yield* WsConnectionSessions;
-    return ((effect, options) => {
-      // Handler fibers descend from the RPC server fiber (forked at layer build),
-      // not from the connection's HTTP upgrade fiber, so connection-scoped
-      // services must be re-provided here from the connection-session registry.
-      const scoped = provideWsConnectionSession(
-        effect,
-        connectionSessions.lookup(Headers.get(options.headers, WS_CONNECTION_SESSION_HEADER)),
-      );
-      return RpcSchema.isStreamSchema(options.rpc.successSchema)
-        ? scoped
-        : admission.guard(options.clientId, options.rpc._tag, scoped);
-    }) satisfies RpcMiddleware.RpcMiddleware<never, WsRpcError, never>;
+    const config = yield* ServerConfig;
+    return makeWsAdmissionMiddleware({ admission, connectionSessions, config });
   }),
 );
 
@@ -657,11 +700,52 @@ const makeWsRpcHandlersLayer = () =>
           ),
         ),
       );
+      // Pure read used by server.listWorktrees. Falls back to an empty list on
+      // scan failure rather than surfacing an error, matching the prune path's
+      // behavior for a failed inventory scan.
+      const listProjectedManagedWorktrees = listProjectedManagedWorktreesEffect({
+        worktreesDir: config.worktreesDir,
+        git,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("managed worktree inventory scan failed", {
+            cause: String(cause),
+          }).pipe(Effect.as([])),
+        ),
+      );
       const getOrchestrationHighWaterSequence = orchestrationEngine.getEventHighWaterSequence.pipe(
         Effect.mapError((cause) =>
           toWsRpcError(cause, "Failed to capture orchestration high-water sequence"),
         ),
       );
+
+      const threadDetailStreamDependencies: ThreadDetailStreamDependencies = {
+        // Which query answers the resume fence is the whole point of the cheap
+        // path, so it lives in a factory a test can pin — not inline here.
+        ...makeThreadDetailStreamQueries(projectionReadModelQuery, toWsRpcError),
+        subscribeLive: (threadId) =>
+          orchestrationEngine.subscribeDomainEvents.pipe(
+            Effect.map((stream) =>
+              bufferLiveUiStream(
+                stream.pipe(Stream.filter((event) => isThreadDetailEventFor(threadId, event))),
+                {
+                  label: "orchestration.thread-detail",
+                  onDroppedEvents: (report) => recordThreadStreamDrop(threadId, report),
+                },
+              ),
+            ),
+          ),
+        getHighWaterSequence: getOrchestrationHighWaterSequence,
+        replay: (threadId, fromSequenceExclusive, throughSequenceInclusive) =>
+          orchestrationEngine
+            .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
+            .pipe(
+              Stream.filter((event) => isThreadDetailEventFor(threadId, event)),
+              Stream.mapError((cause) => toWsRpcError(cause, "Failed to replay thread events")),
+            ),
+        onResnapshotRequired: (threadId, report) =>
+          recordThreadResnapshotRequired(threadId, report),
+      };
 
       const toShellStreamEvent = (
         event: OrchestrationEvent,
@@ -744,20 +828,8 @@ const makeWsRpcHandlersLayer = () =>
       const rpcEffect = <A, E, R>(effect: Effect.Effect<A, E, R>, fallbackMessage: string) =>
         effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage)));
 
-      const requireOwner = Effect.gen(function* () {
-        if (!canManageExternalMcp(yield* CurrentWsSessionRole)) {
-          return yield* Effect.fail(
-            new WsRpcError({ message: "Owner authorization is required for this operation." }),
-          );
-        }
-        if (!isLoopbackHost(config.host) || config.publicUrl !== undefined) {
-          return yield* Effect.fail(
-            new WsRpcError({
-              message: "External MCP management is available only on a loopback-only instance.",
-            }),
-          );
-        }
-      });
+      // Owner-only and loopback-only enforcement for these methods lives in the
+      // admission middleware's authorization table (wsMethodAuthorization.ts).
 
       return AdmittedWsFeatureRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -904,92 +976,7 @@ const makeWsRpcHandlersLayer = () =>
               key: `orchestration.thread:${input.threadId}`,
               threadId: input.threadId,
             },
-            makeCursorSafeSnapshotLiveStream({
-              // Cursor resume: a client holding cached detail replays only the
-              // gap. Out-of-range cursors (negative or overflowing gap) fall
-              // back to the snapshot inside the stream factory.
-              resumeFromSequence: input.afterSequence,
-              // A hard-purged thread leaves no rows to replay while the journal
-              // head stays above the cursor, so the gap check alone would
-              // accept the resume and stream nothing. Falling through to the
-              // snapshot path surfaces THREAD_SNAPSHOT_NOT_FOUND instead.
-              resumeSubjectExists: projectionReadModelQuery
-                .getThreadDetailSnapshotById(input.threadId)
-                .pipe(
-                  Effect.map(Option.isSome),
-                  Effect.mapError((cause) =>
-                    toWsRpcError(cause, "Failed to verify thread before cursor resume"),
-                  ),
-                ),
-              onResnapshotRequired: (report) =>
-                recordThreadResnapshotRequired(input.threadId, report),
-              subscribeLive: orchestrationEngine.subscribeDomainEvents.pipe(
-                Effect.map((stream) =>
-                  bufferLiveUiStream(
-                    stream.pipe(
-                      Stream.filter((event) => isThreadDetailEventFor(input.threadId, event)),
-                    ),
-                    {
-                      label: "orchestration.thread-detail",
-                      onDroppedEvents: (report) => recordThreadStreamDrop(input.threadId, report),
-                    },
-                  ),
-                ),
-              ),
-              snapshot: projectionReadModelQuery.getThreadDetailSnapshotById(input.threadId).pipe(
-                Effect.flatMap(
-                  Option.match({
-                    onNone: () =>
-                      projectionReadModelQuery.getSnapshotSequence().pipe(
-                        Effect.map(({ snapshotSequence }) => ({
-                          detail: Option.none<OrchestrationThreadDetailSnapshot>(),
-                          snapshotSequence,
-                        })),
-                      ),
-                    onSome: (detail) =>
-                      Effect.succeed({
-                        detail: Option.some(detail),
-                        snapshotSequence: detail.snapshotSequence,
-                      }),
-                  }),
-                ),
-                Effect.mapError((cause) => toWsRpcError(cause, "Failed to load thread snapshot")),
-              ),
-              snapshotSequence: (snapshot) => snapshot.snapshotSequence,
-              getHighWaterSequence: getOrchestrationHighWaterSequence,
-              replay: (fromSequenceExclusive, throughSequenceInclusive) =>
-                orchestrationEngine
-                  .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
-                  .pipe(
-                    Stream.filter((event) => isThreadDetailEventFor(input.threadId, event)),
-                    Stream.mapError((cause) =>
-                      toWsRpcError(cause, "Failed to replay thread events"),
-                    ),
-                  ),
-            }).pipe(
-              Stream.flatMap((item) => {
-                if (item.kind === "event") {
-                  return Stream.succeed<OrchestrationThreadStreamItem>({
-                    kind: "event",
-                    event: item.event,
-                  });
-                }
-                // A silently empty snapshot would leave the client waiting forever
-                // for thread history; fail identifiably so it can surface the state.
-                return Option.isSome(item.snapshot.detail)
-                  ? Stream.succeed<OrchestrationThreadStreamItem>({
-                      kind: "snapshot",
-                      snapshot: item.snapshot.detail.value,
-                    })
-                  : Stream.fail(
-                      new WsRpcError({
-                        message: `Thread detail snapshot not found for thread ${input.threadId}.`,
-                        code: "THREAD_SNAPSHOT_NOT_FOUND",
-                        retryable: false,
-                      }),
-                    );
-              }),
-            ),
+            makeThreadDetailStream(threadDetailStreamDependencies, input),
           ),
         [ORCHESTRATION_WS_METHODS.unsubscribeThread]: () => Effect.void,
         [WS_METHODS.subscribeOrchestrationDomainEvents]: (_, { clientId }) =>
@@ -1360,31 +1347,28 @@ const makeWsRpcHandlersLayer = () =>
           ),
         [WS_METHODS.serverUpdateProvider]: (input) => providerHealth.updateProvider(input),
         [WS_METHODS.serverListExternalMcpIntegrations]: () =>
-          rpcEffect(
-            requireOwner.pipe(Effect.andThen(externalMcp.listIntegrations())),
-            "Failed to list external MCP integrations",
-          ),
+          rpcEffect(externalMcp.listIntegrations(), "Failed to list external MCP integrations"),
         [WS_METHODS.serverCreateExternalMcpIntegration]: (input) =>
           rpcEffect(
-            requireOwner.pipe(Effect.andThen(externalMcp.createIntegration(input))),
+            externalMcp.createIntegration(input),
             "Failed to create external MCP integration",
           ),
         [WS_METHODS.serverRevokeExternalMcpIntegration]: (input) =>
           rpcEffect(
-            requireOwner.pipe(
-              Effect.andThen(externalMcp.revokeIntegration(input.integrationId)),
-              Effect.map((revoked) => ({ revoked })),
-            ),
+            externalMcp
+              .revokeIntegration(input.integrationId)
+              .pipe(Effect.map((revoked) => ({ revoked }))),
             "Failed to revoke external MCP integration",
           ),
         [WS_METHODS.serverRefreshExternalMcpPairing]: (input) =>
-          rpcEffect(
-            requireOwner.pipe(Effect.andThen(externalMcp.refreshPairing(input))),
-            "Failed to refresh external MCP pairing",
-          ),
+          rpcEffect(externalMcp.refreshPairing(input), "Failed to refresh external MCP pairing"),
+        // A method named "list" must not delete anything. Retention pruning is
+        // triggered by thread.archive, which is what actually creates archived
+        // worktrees; listing is a pure read, so a version-skewed or read-only
+        // client hydrating its UI cannot cause filesystem removal.
         [WS_METHODS.serverListWorktrees]: () =>
           rpcEffect(
-            pruneManagedWorktrees.pipe(Effect.map((worktrees) => ({ worktrees }))),
+            listProjectedManagedWorktrees.pipe(Effect.map((worktrees) => ({ worktrees }))),
             "Failed to list managed worktrees",
           ),
         [WS_METHODS.serverListLocalServers]: () =>
@@ -1394,6 +1378,47 @@ const makeWsRpcHandlersLayer = () =>
           ),
         [WS_METHODS.serverStopLocalServer]: (input) =>
           rpcEffect(stopLocalServerAndTrackedProjectRun(input), "Failed to stop local server"),
+        [WS_METHODS.serverProbeRemoteHost]: (input) =>
+          Effect.gen(function* () {
+            const broker = sharedRemoteHostBroker();
+            const probe = yield* Effect.tryPromise({
+              try: () => broker.probe(input.host, input.target),
+              catch: (cause) => cause,
+            }).pipe(
+              Effect.mapError((cause) =>
+                cause instanceof RemoteHostRateLimitError
+                  ? new WsRpcError({
+                      message: cause.message,
+                      retryable: true,
+                      retryAfterMs: cause.retryAfterMs,
+                    })
+                  : toWsRpcError(cause, "Failed to check the remote host"),
+              ),
+            );
+            return { probe, connectivity: broker.connectivity(input.host.hostId) };
+          }),
+        // Fetches the host's PUBLIC key fingerprint so the user can compare it
+        // against the machine they own before trusting it. Failure comes back as
+        // a result with an `error` and no fingerprints — never as a trust prompt
+        // with nothing to compare.
+        [WS_METHODS.serverGetRemoteHostFingerprint]: (input) =>
+          rpcEffect(
+            Effect.promise(() => fetchRemoteHostFingerprint(input.host)),
+            "Failed to read the host's key fingerprint",
+          ),
+        // The pairing screen's production caller for Tailscale detection. Every
+        // failure inside `detectPhoneReachability` already degrades to the SSH
+        // fallback, so this cannot leave the screen without an answer.
+        [WS_METHODS.serverGetPhoneReachability]: () =>
+          rpcEffect(
+            Effect.promise(() =>
+              detectPhoneReachability({
+                localPort: config.port,
+                sshDestination: config.host ?? "<host>",
+              }),
+            ),
+            "Failed to check how a phone can reach this server",
+          ),
         [WS_METHODS.statsGetProfileStats]: (input) =>
           rpcEffect(profileStatsQuery.getProfileStats(input), "Failed to load profile stats"),
         [WS_METHODS.statsGetProfileTokenStats]: (input) =>
@@ -1609,6 +1634,29 @@ const makeWsRpcHandlersLayer = () =>
               Stream.mapError((cause) => toWsRpcError(cause, "Server settings stream failed")),
             ),
           ),
+        /**
+         * Per-host supervision status.
+         *
+         * Snapshot first, then live updates — the same shape as the provider
+         * status stream, so a client that subscribes after a host settled still
+         * learns its phase instead of waiting for a push that may never come.
+         */
+        [WS_METHODS.subscribeRemoteEnvironmentStatuses]: (_, { clientId }) =>
+          streamAdmission.guard(
+            clientId,
+            { key: "server.remoteEnvironmentStatuses" },
+            Stream.concat(
+              Stream.sync(() => ({ statuses: currentRemoteEnvironmentStatuses() })),
+              bufferLiveUiStream(remoteEnvironmentStatusStream(), {
+                label: "server.remote-environment-statuses",
+                onDroppedEvents: failLiveUiStreamForSnapshotResync,
+              }).pipe(Stream.map((statuses) => ({ statuses }))),
+            ).pipe(
+              Stream.mapError((cause) =>
+                toWsRpcError(cause, "Remote environment status stream failed"),
+              ),
+            ),
+          ),
 
         [WS_METHODS.providerGetComposerCapabilities]: (input) =>
           rpcEffect(
@@ -1740,18 +1788,37 @@ function trustedWebSocketRequestUrl(
     : null;
 }
 
+/**
+ * Policy-driven WebSocket admission. A remote-reachable deployment ALWAYS
+ * resolves a real authenticated session; only a local-only deployment may keep
+ * the implicit-owner path, and then only when the legacy query token (if one is
+ * configured) matches. Auth enforcement is never derived from `--auth-token`
+ * presence, so removing the token cannot open a remote socket.
+ */
+/**
+ * Classifies the connecting client's build from the upgrade URL, for the
+ * connection session the admission middleware then reads.
+ *
+ * Extracted so this step is reachable by a test. Every existing skew test
+ * injects `buildSkewed` into a session directly, so the URL -> classification
+ * -> session wiring had no coverage at all: replacing the call below with
+ * `false` left 92 tests green across six skew-related files. That matters
+ * because this is the only server-side classification there is — the code it
+ * feeds exists precisely because a client's own guard cannot be trusted, so a
+ * silent regression here disarms enforcement for every client while the
+ * client-side read-only banner keeps claiming writes are blocked.
+ */
+export function resolveWsUpgradeBuildSkew(searchParams: URLSearchParams): boolean {
+  return isWsClientBuildSkewed(searchParams);
+}
+
 export function authenticateRpcWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: AuthenticatedDeployment;
   readonly legacyToken: string | null;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
 }): Effect.Effect<AuthenticatedSession | null, AuthError> {
-  if (
-    !requiresWebSocketAuthentication(input.config) ||
-    (isLoopbackHost(input.config.host) &&
-      !input.config.publicUrl &&
-      input.legacyToken === input.config.authToken)
-  ) {
+  if (allowsImplicitOwnerSession({ config: input.config, legacyToken: input.legacyToken })) {
     return Effect.succeed(null);
   }
   return input.serverAuth.authenticateWebSocketUpgrade(input.request);
@@ -1813,6 +1880,9 @@ export function makeWebsocketRpcRouteLayer<R>(
               headers: { "Cache-Control": "no-store" },
             });
           }
+          // Server-side skew enforcement, so the middleware can refuse
+          // mutations regardless of whether the client honors its own guard.
+          const buildSkewed = resolveWsUpgradeBuildSkew(url.searchParams);
           const legacyToken = url.searchParams.get("token");
           const authenticatedSession = yield* authenticateRpcWebSocketUpgrade({
             config,
@@ -1825,6 +1895,7 @@ export function makeWebsocketRpcRouteLayer<R>(
             return yield* runWithConnectionSession(request, {
               role: "owner",
               attachmentPrincipal: LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
+              buildSkewed,
             });
           }
 
@@ -1833,6 +1904,7 @@ export function makeWebsocketRpcRouteLayer<R>(
             runWithConnectionSession(request, {
               role: authenticatedSession.role,
               attachmentPrincipal: attachmentPrincipalForSession(authenticatedSession.sessionId),
+              buildSkewed,
             }),
           );
         }).pipe(

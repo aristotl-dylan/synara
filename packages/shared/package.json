@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./buildSkew": {
+      "types": "./src/buildSkew.ts",
+      "import": "./src/buildSkew.ts"
+    },
     "./model": {
       "types": "./src/model.ts",
       "import": "./src/model.ts"
@@ -31,6 +35,10 @@
     "./errorMessages": {
       "types": "./src/errorMessages.ts",
       "import": "./src/errorMessages.ts"
+    },
+    "./posixShell": {
+      "types": "./src/posixShell.ts",
+      "import": "./src/posixShell.ts"
     },
     "./shell": {
       "types": "./src/shell.ts",
@@ -259,6 +267,50 @@
     "./browserAnnotations": {
       "types": "./src/browserAnnotations.ts",
       "import": "./src/browserAnnotations.ts"
+    },
+    "./remoteCommand": {
+      "types": "./src/remoteCommand.ts",
+      "import": "./src/remoteCommand.ts"
+    },
+    "./environmentProxyPath": {
+      "types": "./src/environmentProxyPath.ts",
+      "import": "./src/environmentProxyPath.ts"
+    },
+    "./proxyFrameQueue": {
+      "types": "./src/proxyFrameQueue.ts",
+      "import": "./src/proxyFrameQueue.ts"
+    },
+    "./wsFrameSplit": {
+      "types": "./src/wsFrameSplit.ts",
+      "import": "./src/wsFrameSplit.ts"
+    },
+    "./proxyHeaders": {
+      "types": "./src/proxyHeaders.ts",
+      "import": "./src/proxyHeaders.ts"
+    },
+    "./tailscaleServe": {
+      "types": "./src/tailscaleServe.ts",
+      "import": "./src/tailscaleServe.ts"
+    },
+    "./remoteHostProbe": {
+      "types": "./src/remoteHostProbe.ts",
+      "import": "./src/remoteHostProbe.ts"
+    },
+    "./remoteHostConnectivity": {
+      "types": "./src/remoteHostConnectivity.ts",
+      "import": "./src/remoteHostConnectivity.ts"
+    },
+    "./remoteHostDraft": {
+      "types": "./src/remoteHostDraft.ts",
+      "import": "./src/remoteHostDraft.ts"
+    },
+    "./remoteHostFingerprint": {
+      "types": "./src/remoteHostFingerprint.ts",
+      "import": "./src/remoteHostFingerprint.ts"
+    },
+    "./rateLimiter": {
+      "types": "./src/rateLimiter.ts",
+      "import": "./src/rateLimiter.ts"
     }
   },
   "scripts": {

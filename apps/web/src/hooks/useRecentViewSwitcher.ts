@@ -14,6 +14,7 @@ import {
   buildRecentViewDisplayEntries,
   deriveCurrentRecentView,
   pruneRecentViews,
+  shouldPruneRecentViewsOnHydration,
   recentViewKey,
   resolveRecentViewNavigationIndex,
   type RecentView,
@@ -26,6 +27,7 @@ import { useRecentViewsStore } from "../recentViewsStore";
 import { collectLeaves } from "../splitView.logic";
 import { useSplitViewStore } from "../splitViewStore";
 import { useStore } from "../store";
+import { selectAllEnvironmentsHydrated, selectLocalThreadsHydrated } from "../storeAggregation";
 import { useThreadDetailPrewarm } from "../threadDetailPrewarm";
 import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
 import {
@@ -71,7 +73,10 @@ export function useRecentViewSwitcher(input: UseRecentViewSwitcherInput) {
   const terminalStateByThreadId = useTerminalStateStore((state) => state.terminalStateByThreadId);
   const openChatThreadPage = useTerminalStateStore((state) => state.openChatThreadPage);
   const openTerminalThreadPage = useTerminalStateStore((state) => state.openTerminalThreadPage);
-  const threadsHydrated = useStore((state) => state.threadsHydrated);
+  // Local-scoped on purpose: gates the recent-view pruner, which drops
+  // persisted views whose targets are absent.
+  const threadsHydrated = useStore(selectLocalThreadsHydrated);
+  const allEnvironmentsHydrated = useStore(selectAllEnvironmentsHydrated);
   const routeSplitViewId =
     typeof routeSearch.splitViewId === "string" ? routeSearch.splitViewId : undefined;
   const settingsSection = typeof routeSearch.section === "string" ? routeSearch.section : undefined;
@@ -212,10 +217,28 @@ export function useRecentViewSwitcher(input: UseRecentViewSwitcherInput) {
   }, [prewarmThreadDetails, recentThreadIds]);
 
   useEffect(() => {
-    if (!threadsHydrated || didHydrationPruneRef.current) return;
+    // Waits for EVERY environment, not just local. This prune runs once and
+    // deletes permanently, so firing it while a remote host is still connecting
+    // would drop that host's recent views with no second pass to restore them —
+    // the `didHydrationPruneRef` latch makes the race unrecoverable rather than
+    // merely early.
+    if (
+      !shouldPruneRecentViewsOnHydration({
+        threadsHydrated,
+        allEnvironmentsHydrated,
+        alreadyPruned: didHydrationPruneRef.current,
+      })
+    ) {
+      return;
+    }
     didHydrationPruneRef.current = true;
     pruneRecentViewsStore(buildRecentViewAvailability());
-  }, [buildRecentViewAvailability, pruneRecentViewsStore, threadsHydrated]);
+  }, [
+    allEnvironmentsHydrated,
+    buildRecentViewAvailability,
+    pruneRecentViewsStore,
+    threadsHydrated,
+  ]);
 
   const activateRecentView = (view: RecentView) => {
     switch (view.kind) {

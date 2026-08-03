@@ -40,6 +40,7 @@ import {
   type WsConnectionSessionsShape,
 } from "./wsConnectionSessions";
 import { makeCurrentWsFeatureCompatibilitySearchParams } from "./wsCompatibility";
+import serverPackage from "../package.json" with { type: "json" };
 
 const PingRpc = Rpc.make("test.ping", {
   payload: Schema.Struct({ label: Schema.String }),
@@ -363,7 +364,10 @@ async function connectExistingSession(
 }
 
 function featureSocketUrl(server: RunningTestServer, token: string): string {
-  const searchParams = makeCurrentWsFeatureCompatibilitySearchParams("test-client");
+  // Present the server's own build: an unparseable placeholder is classified
+  // as skewed (by design) and would degrade every connection in this suite to
+  // read-only. Skew itself is covered in wsMethodAuthorization.test.ts.
+  const searchParams = makeCurrentWsFeatureCompatibilitySearchParams(serverPackage.version);
   searchParams.set("wsToken", token);
   return `${server.origin}/ws?${searchParams.toString()}`;
 }
@@ -824,11 +828,50 @@ describe("websocketRpcRouteLayer connection lifecycle", () => {
       expect(server.connectionSessions.lookup(sessionKey)).toEqual({
         role: "owner",
         attachmentPrincipal: { ownerKind: "session", ownerId: issued.sessionId },
+        // The upgrade records the client's build classification so the
+        // admission middleware can refuse cross-version mutations. This
+        // harness connects with the server's own build, so it is compatible.
+        buildSkewed: false,
       });
 
       socket.close();
       await waitForClose(socket);
       await waitForObserved(() => server.connectionSessions.lookup(sessionKey) === undefined);
+    } finally {
+      await server.close();
+    }
+  }, 4_000);
+
+  it("records a MISMATCHED client build as skewed on the real upgrade path", async () => {
+    // The other half of the assertion above, and the one that was missing.
+    // Every existing skew test injects `buildSkewed` into a session directly,
+    // and the matching-build case above cannot tell a working classifier from
+    // a hardcoded `false` — so replacing the call at wsRpc.ts:1858 with
+    // `false` left 53 tests green here and 92 across the skew files.
+    //
+    // This is the ONLY server-side classification there is. The code it feeds
+    // exists precisely because a client's own guard cannot be trusted, so a
+    // silent regression disarms enforcement for every client while the
+    // client-side banner keeps claiming writes are blocked.
+    const server = await startTestServer();
+    try {
+      const issued = await Effect.runPromise(server.sessions.issue({ role: "owner" }));
+      const websocket = await Effect.runPromise(
+        server.sessions.issueWebSocketToken(issued.sessionId),
+      );
+      // Negotiation still has to succeed, so only the BUILD differs from the
+      // server's — everything else is the compatible handshake.
+      const searchParams = makeCurrentWsFeatureCompatibilitySearchParams(serverPackage.version);
+      searchParams.set(WS_COMPATIBILITY_QUERY.clientBuild, "0.0.0-different-build");
+      searchParams.set("wsToken", websocket.token);
+      const socket = await connect(`${server.origin}/ws?${searchParams.toString()}`);
+
+      expect(server.observedConnectionSessionKeys).toHaveLength(1);
+      const sessionKey = server.observedConnectionSessionKeys[0]!;
+      expect(server.connectionSessions.lookup(sessionKey)?.buildSkewed).toBe(true);
+
+      socket.close();
+      await waitForClose(socket);
     } finally {
       await server.close();
     }

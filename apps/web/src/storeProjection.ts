@@ -1,8 +1,24 @@
 // FILE: storeProjection.ts
 // Purpose: Owns normalized slice writes, sidebar projections, and snapshot integration.
 // Exports: Pure projection transitions used by the facade and orchestration reducer.
+//
+// Everything below the exported boundary operates on ONE `EnvironmentState` —
+// a single server's rows. That is the point of the shape: such a transition
+// physically cannot reach another environment's data, so the "scoped this
+// collection but not its sibling" class of bug has nowhere to live there, and
+// the `*OutsideEnvironment` carry-over filters the flat store needed are gone
+// because there is nothing foreign left to carry.
+//
+// The exported functions are the ROUTING layer, and they carry a weaker
+// guarantee: they pick an owning environment by runtime lookup, so routing to
+// the wrong one is an ordinary bug that only a test catches. Two live examples
+// got through review — a detail-wipe helper that hardcoded the local cursor
+// scope, and `environmentIdForProject` whose every call site could be mutated
+// to LOCAL with the full suite still green. When adding a routed transition,
+// test it, and mutate BOTH the lookup and the call site: they fail separately.
 
 import {
+  type EnvironmentId,
   type MessageId,
   type OrchestrationReadModel,
   type OrchestrationShellSnapshot,
@@ -13,10 +29,16 @@ import {
 } from "@synara/contracts";
 import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
+import { LOCAL_ENVIRONMENT_ID } from "./environmentIdentity";
 import {
-  clearThreadDetailResumeCursor,
-  resetThreadDetailResumeCursors,
-  retainThreadDetailResumeCursors,
+  environmentIdForProject,
+  environmentIdForThread,
+  updateEnvironment,
+  withoutEnvironment,
+} from "./storeAggregation";
+import {
+  localThreadDetailResumeCursors,
+  threadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
 import { getThreadFromState, getThreadsFromState } from "./threadDerivation";
 import {
@@ -57,6 +79,7 @@ import {
   EMPTY_TURN_DIFF_BY_THREAD,
   EMPTY_TURN_DIFF_IDS_BY_THREAD,
   type AppState,
+  type EnvironmentState,
   type ThreadDetailSyncState,
 } from "./storeState";
 import type {
@@ -85,6 +108,7 @@ function toThreadShell(thread: Thread): ThreadShell {
     error: thread.error,
     createdAt: thread.createdAt,
     archivedAt: thread.archivedAt ?? null,
+    settledAt: thread.settledAt ?? null,
     updatedAt: thread.updatedAt,
     isPinned: thread.isPinned ?? false,
     envMode: thread.envMode,
@@ -213,11 +237,11 @@ const activityId = (activity: Thread["activities"][number]): string => activity.
 const proposedPlanId = (plan: Thread["proposedPlans"][number]): string => plan.id;
 const turnDiffId = (summary: Thread["turnDiffSummaries"][number]): TurnId => summary.turnId;
 
-export function upsertProject(
-  state: AppState,
+function upsertProjectInEnvironment(
+  state: EnvironmentState,
   incoming: ProjectNormalizationInput,
   matchPolicy: ProjectMatchPolicy,
-): AppState {
+): EnvironmentState {
   if (state.deletedProjectIdsById?.[incoming.id] !== undefined) {
     return state;
   }
@@ -248,10 +272,10 @@ export function upsertProject(
   };
 }
 
-export function upsertSpace(
-  state: AppState,
+function upsertSpaceInEnvironment(
+  state: EnvironmentState,
   incoming: OrchestrationReadModel["spaces"][number] | OrchestrationSpaceShell,
-): AppState {
+): EnvironmentState {
   const existing = state.spaces.find((space) => space.id === incoming.id);
   const nextSpace = normalizeSpace(incoming, existing);
   if (existing === nextSpace) return state;
@@ -266,11 +290,11 @@ export function upsertSpace(
   };
 }
 
-export function removeSpace(
-  state: AppState,
+function removeSpaceInEnvironment(
+  state: EnvironmentState,
   spaceId: Space["id"],
   assignmentUpdatedAt?: string,
-): AppState {
+): EnvironmentState {
   const spaces = state.spaces.filter((space) => space.id !== spaceId);
   let projectsChanged = false;
   const projects = state.projects.map((project) => {
@@ -293,11 +317,11 @@ export function removeSpace(
   return { ...state, spaces, projects: projectsChanged ? projects : state.projects };
 }
 
-export function applySpaceOrder(
-  state: AppState,
+function applySpaceOrderInEnvironment(
+  state: EnvironmentState,
   orderedSpaceIds: ReadonlyArray<Space["id"]>,
   updatedAt?: string,
-): AppState {
+): EnvironmentState {
   const orderById = new Map(orderedSpaceIds.map((spaceId, index) => [spaceId, index] as const));
   const spaces = state.spaces
     .map((space) => {
@@ -331,6 +355,7 @@ function sidebarThreadSummariesEqual(
     left.session === right.session &&
     left.createdAt === right.createdAt &&
     (left.archivedAt ?? null) === (right.archivedAt ?? null) &&
+    (left.settledAt ?? null) === (right.settledAt ?? null) &&
     left.updatedAt === right.updatedAt &&
     (left.isPinned ?? false) === (right.isPinned ?? false) &&
     left.latestTurn === right.latestTurn &&
@@ -372,6 +397,7 @@ function buildSidebarThreadSummary(
     session: thread.session,
     createdAt: thread.createdAt,
     archivedAt: thread.archivedAt ?? null,
+    settledAt: thread.settledAt ?? null,
     updatedAt: thread.updatedAt,
     isPinned: thread.isPinned ?? false,
     latestTurn: thread.latestTurn,
@@ -404,7 +430,7 @@ function buildSidebarThreadSummary(
  * id. That copied the whole array once per thread — quadratic memory traffic in the thread count —
  * and, worse, guaranteed a brand-new array reference on every single snapshot even when not one id
  * had moved. Every consumer memoizing on `state.threadIds` therefore recomputed on each snapshot,
- * and the "nothing changed" fast path in `syncServerReadModel` could never fire, because its
+ * and the "nothing changed" fast path in `syncServerReadModelInEnvironment` could never fire, because its
  * identity check on this exact field always failed.
  *
  * Seeding the finished order up front makes the loop's `ensureThreadRegistered` calls no-ops, so
@@ -431,7 +457,7 @@ function reuseThreadIdRegistry(
   return [...nextThreadIds];
 }
 
-function ensureThreadRegistered(state: AppState, threadId: ThreadId): AppState {
+function ensureThreadRegistered(state: EnvironmentState, threadId: ThreadId): EnvironmentState {
   const threadIds = state.threadIds ?? EMPTY_THREAD_IDS;
   if (threadIds.includes(threadId)) {
     return state;
@@ -501,13 +527,13 @@ function resolveTurnStateEntry(
 }
 
 function writeThreadShellProjection(
-  state: AppState,
+  state: EnvironmentState,
   nextThread: {
     shell: ThreadShell;
     session: ThreadSession | null;
     turnState: ThreadTurnState;
   },
-): AppState {
+): EnvironmentState {
   const threadId = nextThread.shell.id;
   let nextState = ensureThreadRegistered(state, threadId);
 
@@ -562,7 +588,7 @@ function writeThreadShellProjection(
  * the whole record be returned by reference when a snapshot changes nothing.
  */
 function rebuildThreadShellRecords(
-  state: AppState,
+  state: EnvironmentState,
   snapshotThreads: readonly OrchestrationShellSnapshot["threads"][number][],
 ): {
   threadShellById: Record<ThreadId, ThreadShell>;
@@ -608,10 +634,10 @@ function rebuildThreadShellRecords(
 }
 
 function writeThreadDetailSyncState(
-  state: AppState,
+  state: EnvironmentState,
   threadId: ThreadId,
   syncState: ThreadDetailSyncState,
-): AppState {
+): EnvironmentState {
   if (state.threadDetailSyncById?.[threadId] === syncState) {
     return state;
   }
@@ -624,15 +650,16 @@ function writeThreadDetailSyncState(
   };
 }
 
-function clearThreadDetailSyncState(state: AppState, threadId: ThreadId): AppState {
+function clearThreadDetailSyncState(state: EnvironmentState, threadId: ThreadId): EnvironmentState {
   // Single-thread detail-wipe choke point: every transition that removes or
   // invalidates a thread's cached detail (removeThreadState, eviction, sync
   // failure reset) funnels through here, so this is where the resume-cursor
   // invariant is enforced — wiped detail must never leave a cursor that would
   // let a resubscribe gap-replay on top of missing history. The full-sync
   // paths cover their bulk invalidations separately: the shell snapshot prunes
-  // with `retainThreadDetailResumeCursors`, the read-model resync resets all.
-  clearThreadDetailResumeCursor(threadId);
+  // with `retain`, the read-model resync retains its own threads and clears
+  // their cursors.
+  localThreadDetailResumeCursors().clear(threadId);
   if (
     state.threadDetailSyncById === undefined ||
     !Object.hasOwn(state.threadDetailSyncById, threadId)
@@ -643,10 +670,10 @@ function clearThreadDetailSyncState(state: AppState, threadId: ThreadId): AppSta
   return { ...state, threadDetailSyncById };
 }
 
-export function markThreadDetailSyncFailedInClientState(
-  state: AppState,
+function markThreadDetailSyncFailedInEnvironment(
+  state: EnvironmentState,
   threadId: ThreadId,
-): AppState {
+): EnvironmentState {
   // Applied detail outranks a late stream failure: keep rendering the data we have.
   if (state.threadDetailSyncById?.[threadId] === "synced") {
     return state;
@@ -654,17 +681,21 @@ export function markThreadDetailSyncFailedInClientState(
   return writeThreadDetailSyncState(state, threadId, "failed");
 }
 
-export function clearThreadDetailSyncFailureInClientState(
-  state: AppState,
+function clearThreadDetailSyncFailureInEnvironment(
+  state: EnvironmentState,
   threadId: ThreadId,
-): AppState {
+): EnvironmentState {
   if (state.threadDetailSyncById?.[threadId] !== "failed") {
     return state;
   }
   return clearThreadDetailSyncState(state, threadId);
 }
 
-function writeThreadState(state: AppState, nextThread: Thread, previousThread?: Thread): AppState {
+function writeThreadState(
+  state: EnvironmentState,
+  nextThread: Thread,
+  previousThread?: Thread,
+): EnvironmentState {
   const nextShell = toThreadShell(nextThread);
   const nextTurnState = toThreadTurnState(nextThread);
   const previousShell = state.threadShellById?.[nextThread.id];
@@ -826,7 +857,7 @@ function writeThreadState(state: AppState, nextThread: Thread, previousThread?: 
   return nextState;
 }
 
-function removeThreadState(state: AppState, threadId: ThreadId): AppState {
+function removeThreadState(state: EnvironmentState, threadId: ThreadId): EnvironmentState {
   const { [threadId]: _removedShell, ...threadShellById } =
     state.threadShellById ?? EMPTY_THREAD_SHELL_BY_ID;
   const { [threadId]: _removedSession, ...threadSessionById } =
@@ -881,7 +912,10 @@ function removeThreadState(state: AppState, threadId: ThreadId): AppState {
   );
 }
 
-export function evictThreadDetailFromClientState(state: AppState, threadId: ThreadId): AppState {
+function evictThreadDetailInEnvironment(
+  state: EnvironmentState,
+  threadId: ThreadId,
+): EnvironmentState {
   const detailRecords = [
     state.messageIdsByThreadId,
     state.messageByThreadId,
@@ -939,11 +973,16 @@ export function evictThreadDetailFromClientState(state: AppState, threadId: Thre
  * deletes we only have a lower bound — the delete cannot have been recorded before the newest
  * snapshot we have already integrated, so `shellSnapshotSequence + 1` is safe. Re-deleting keeps
  * the highest known sequence, because retiring later is always the safe direction.
+ *
+ * The fence is this environment's own, because the caller has already routed to
+ * the row's owner. Stamping a remote row's tombstone against the LOCAL fence
+ * used to be possible, and it meant retirement later compared the tombstone
+ * against a counter it had no relationship to.
  */
 function nextTombstoneSequence<TId extends string>(
   tombstones: Record<TId, number> | undefined,
   id: TId,
-  state: AppState,
+  state: EnvironmentState,
   deletedAtSequence: number | undefined,
 ): number {
   const candidate = deletedAtSequence ?? (state.shellSnapshotSequence ?? 0) + 1;
@@ -957,6 +996,14 @@ function nextTombstoneSequence<TId extends string>(
  * A tombstone only has to survive until an authoritative snapshot generated at or after the
  * deletion proves the row is gone. Snapshots older than that can still carry the deleted row, so
  * they must never retire it; that is what keeps the resurrection guard intact.
+ *
+ * Every tombstone reachable here belongs to the environment being retired
+ * against, so no ownership filter is needed. It used to be: a tombstone lives
+ * in exactly ONE server's sequence space, and while the maps were shared a
+ * remote server idling at sequence 5000 retired a local tombstone written at
+ * 101 purely because 5000 >= 101 — and since a remote snapshot never lists
+ * local ids, the "still present" check passed too, so the next local snapshot
+ * resurrected a thread the user had deleted.
  */
 function retireDeletionTombstones<TId extends string>(
   tombstones: Record<TId, number> | undefined,
@@ -985,9 +1032,81 @@ function retireDeletionTombstones<TId extends string>(
  * would have filtered them may already have been retired by the newer snapshot — at which point
  * the row silently comes back. The tombstone map cannot tell "never deleted" from "deleted and
  * already confirmed gone", so the whole stale payload has to be rejected before it is merged.
+ *
+ * The fence it compares against is this environment's own, because it is the
+ * only one reachable from here. Snapshot sequences are per-server SQLite
+ * autoincrement values: two servers both emitting snapshot 1 are unrelated
+ * events, and a shared counter made the second look stale and dropped it.
  */
-function isStaleSnapshot(state: AppState, snapshotSequence: number): boolean {
+function isStaleSnapshot(state: EnvironmentState, snapshotSequence: number): boolean {
   return snapshotSequence < (state.shellSnapshotSequence ?? 0);
+}
+
+/**
+ * Clears this environment's journal-scoped state: its shell snapshot fence and
+ * its deletion tombstones.
+ *
+ * The fence is generation-sensitive state exactly like a resume cursor: it is a
+ * high-water mark in a journal's sequence space, and a replacement server may
+ * serve a journal whose sequences restart low. Keeping it across a generation
+ * change makes every snapshot from the new server look stale, so the store
+ * silently rejects them and keeps rendering content the server no longer holds
+ * — a sidebar that is not merely frozen but wrong, with no error surfaced.
+ *
+ * The TOMBSTONES are the same class of state and were previously left behind,
+ * which is reachable today on a plain single-server install. They are stamped
+ * with sequences from the journal that just went away, and they filter rows in
+ * `syncServerShellSnapshotInEnvironment` BEFORE any pruning happens — so the
+ * older reasoning here ("a fresh snapshot is already in flight and prunes the
+ * stale rows naturally") does not reach them. Concretely: hydrate at 500,
+ * delete a thread (tombstone 501), restore the server from backup so its
+ * journal restarts at 3, and the thread stays invisible with no error until the
+ * new journal happens to pass 501. The inverse polarity is worse — a low
+ * tombstone is retired by an unrelated new sequence and a deleted row comes
+ * back. Either way it is an old-journal number compared against new-journal
+ * sequences, the cross-space comparison this store shape exists to prevent.
+ *
+ * Still not the ROWS: a fresh snapshot is genuinely in flight on a generation
+ * change and will prune them, whereas dropping them here would blank the
+ * sidebar for that round trip and buy nothing. Rows are derived from the new
+ * journal; the fence and tombstones are assertions about the old one.
+ */
+export function clearEnvironmentShellFence(
+  state: AppState,
+  environmentId: EnvironmentId,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) => {
+    const hasFence = (environment.shellSnapshotSequence ?? 0) !== 0;
+    const hasThreadTombstones = Object.keys(environment.deletedThreadIdsById ?? {}).length > 0;
+    const hasProjectTombstones = Object.keys(environment.deletedProjectIdsById ?? {}).length > 0;
+    if (!hasFence && !hasThreadTombstones && !hasProjectTombstones) {
+      return environment;
+    }
+    return {
+      ...environment,
+      shellSnapshotSequence: 0,
+      deletedThreadIdsById: {},
+      deletedProjectIdsById: {},
+    };
+  });
+}
+
+/**
+ * Drops an environment entirely: its fence and the rows it owned, in one step.
+ *
+ * Teardown differs from a generation change in the one way that matters — no
+ * snapshot is coming. Rows left behind would keep showing threads attributed to
+ * a server that is gone, and nothing would ever prune them.
+ *
+ * Under the flat store this had to walk five thread-keyed records and an
+ * ownership map, retaining the ids that belonged to everyone else; missing one
+ * of them leaked rows. Positional ownership reduces it to deleting the record.
+ */
+export function discardEnvironmentProjection(
+  state: AppState,
+  environmentId: EnvironmentId,
+): AppState {
+  return withoutEnvironment(state, environmentId);
 }
 
 /**
@@ -997,11 +1116,11 @@ function isStaleSnapshot(state: AppState, snapshotSequence: number): boolean {
  * resurrecting a row. That is `isStaleSnapshot`, applied before any merge happens.
  */
 function retireConfirmedDeletionTombstones(
-  state: AppState,
+  state: EnvironmentState,
   snapshotSequence: number,
   presentThreadIds: ReadonlySet<string>,
   presentProjectIds: ReadonlySet<string>,
-): AppState {
+): EnvironmentState {
   if (snapshotSequence < (state.shellSnapshotSequence ?? 0)) {
     return state;
   }
@@ -1028,11 +1147,11 @@ function retireConfirmedDeletionTombstones(
   };
 }
 
-export function removeDeletedThreadFromClientState(
-  state: AppState,
+function removeDeletedThreadInEnvironment(
+  state: EnvironmentState,
   threadId: ThreadId,
   deletedAtSequence?: number,
-): AppState {
+): EnvironmentState {
   const sequence = nextTombstoneSequence(
     state.deletedThreadIdsById,
     threadId,
@@ -1055,7 +1174,7 @@ export function removeDeletedThreadFromClientState(
       };
 }
 
-function removeProjectState(state: AppState, projectId: Project["id"]): AppState {
+function removeProjectState(state: EnvironmentState, projectId: Project["id"]): EnvironmentState {
   const threadIds = new Set<ThreadId>();
   for (const shell of Object.values(state.threadShellById ?? EMPTY_THREAD_SHELL_BY_ID)) {
     if (shell.projectId === projectId) {
@@ -1082,11 +1201,11 @@ function removeProjectState(state: AppState, projectId: Project["id"]): AppState
       };
 }
 
-export function removeDeletedProjectFromClientState(
-  state: AppState,
+function removeDeletedProjectInEnvironment(
+  state: EnvironmentState,
   projectId: Project["id"],
   deletedAtSequence?: number,
-): AppState {
+): EnvironmentState {
   const sequence = nextTombstoneSequence(
     state.deletedProjectIdsById,
     projectId,
@@ -1110,12 +1229,12 @@ export function removeDeletedProjectFromClientState(
 }
 
 function commitThreadProjection(
-  state: AppState,
+  state: EnvironmentState,
   threadId: ThreadId,
   options?: {
     updateSidebarSummary?: boolean;
   },
-): AppState {
+): EnvironmentState {
   const nextThread = getThreadFromState(state, threadId);
   if (!nextThread) {
     return state;
@@ -1191,15 +1310,15 @@ function withDerivedThreadStateSignals(thread: Thread): Thread {
   };
 }
 
-export function applyThreadUpdate(
-  state: AppState,
+function applyThreadUpdateInEnvironment(
+  state: EnvironmentState,
   threadId: ThreadId,
   updater: (thread: Thread) => Thread,
   options?: {
     recomputeSummarySignals?: boolean;
     updateSidebarSummary?: boolean;
   },
-): AppState {
+): EnvironmentState {
   const currentThread = getThreadFromState(state, threadId);
   if (!currentThread) {
     return state;
@@ -1216,15 +1335,35 @@ export function applyThreadUpdate(
   });
 }
 
-export function syncServerShellSnapshot(
-  state: AppState,
+/**
+ * Integrates one environment's authoritative shell snapshot into ITS OWN slice.
+ *
+ * Every prune below is unconditional, which is the whole benefit of the shape.
+ * Under the flat store this function had to widen each prune with the ids owned
+ * by other environments — threads, then projects, then the spaces those
+ * projects reference — because the collections were shared. Three of the six
+ * ownership bugs were a prune here that had not been widened: the first
+ * cross-environment snapshot deleted the other server's projects while its
+ * threads survived, leaving sidebar rows pointing at projects no longer in the
+ * store. Nothing foreign is reachable from an `EnvironmentState`, so the
+ * widening is not merely unnecessary, it is unwritable.
+ */
+function syncServerShellSnapshotInEnvironment(
+  state: EnvironmentState,
   snapshot: OrchestrationShellSnapshot,
-): AppState {
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): EnvironmentState {
   if (isStaleSnapshot(state, snapshot.snapshotSequence)) {
     return state;
   }
-  rememberProjectUiState(state.projects);
-  rememberProjectLocalNames(state.projects);
+  // Local only. The remembered caches are keyed by cwd alone, so recording a
+  // remote environment's projects here lets a remote copy sharing a checkout
+  // path overwrite the local project's expansion and alias. This function runs
+  // for every environment, so the guard belongs here and not at the caller.
+  if (environmentId === LOCAL_ENVIRONMENT_ID) {
+    rememberProjectUiState(state.projects);
+    rememberProjectLocalNames(state.projects);
+  }
   const deletedProjectIdsById = state.deletedProjectIdsById ?? {};
   const deletedThreadIdsById = state.deletedThreadIdsById ?? {};
   const snapshotThreads = snapshot.threads.filter(
@@ -1235,14 +1374,16 @@ export function syncServerShellSnapshot(
   const snapshotProjects = snapshot.projects.filter(
     (project) => deletedProjectIdsById[project.id] === undefined,
   );
-  const spaces = mapSpaces(snapshot.spaces ?? [], state.spaces ?? []);
   const projects = mapProjects(snapshotProjects, state.projects);
+  const spaces = mapSpaces(snapshot.spaces ?? [], state.spaces ?? []);
   const nextThreadIds = new Set(snapshotThreads.map((thread) => thread.id));
-  // The retains below prune detail slices down to the snapshot's threads; any
-  // resume cursor for a pruned thread must fall with its detail.
-  retainThreadDetailResumeCursors(nextThreadIds);
+  // The retains below prune detail slices down to the surviving threads; any
+  // resume cursor for a pruned thread must fall with its detail. Scoped to this
+  // environment's cursor space — another environment's cursors are indexed by
+  // its own journal and are not this snapshot's business.
+  threadDetailResumeCursors(environmentId).retain(nextThreadIds);
 
-  const normalizedState: AppState = {
+  const normalizedState: EnvironmentState = {
     ...state,
     threadIds: reuseThreadIdRegistry(state.threadIds, nextThreadIds),
     ...rebuildThreadShellRecords(state, snapshotThreads),
@@ -1284,6 +1425,14 @@ export function syncServerShellSnapshot(
       spaces,
       projects,
       sidebarThreadSummaryById,
+      // This environment's own data has arrived. The flag is per-environment
+      // precisely because its consumers PRUNE on it — pinned projects, pinned
+      // threads and recent views — and local-scoped UI reads the local record
+      // via `selectLocalEnvironment`. While it was shared, a remote snapshot
+      // landing first flipped it true with local rows still absent, and those
+      // pruners dropped pins whose targets had simply not loaded: user data
+      // deleted with no later snapshot to restore it, because the pruned set is
+      // what gets persisted.
       threadsHydrated: true,
     },
     snapshot.snapshotSequence,
@@ -1293,12 +1442,12 @@ export function syncServerShellSnapshot(
 }
 
 function syncServerThreadDetailWithOptions(
-  state: AppState,
+  state: EnvironmentState,
   thread: ReadModelThread,
   options?: {
     updateSidebarSummary?: boolean;
   },
-): AppState {
+): EnvironmentState {
   const previousThread = getThreadFromState(state, thread.id);
   const nextThreadDetail = options
     ? mergeReadModelThreadDetailWithLiveHotPath(thread, previousThread)
@@ -1320,7 +1469,10 @@ function syncServerThreadDetailWithOptions(
   );
 }
 
-export function syncServerThreadDetail(state: AppState, thread: ReadModelThread): AppState {
+function syncServerThreadDetailInEnvironment(
+  state: EnvironmentState,
+  thread: ReadModelThread,
+): EnvironmentState {
   if (
     state.deletedProjectIdsById?.[thread.projectId] !== undefined ||
     state.deletedThreadIdsById?.[thread.id] !== undefined
@@ -1330,7 +1482,10 @@ export function syncServerThreadDetail(state: AppState, thread: ReadModelThread)
   return syncServerThreadDetailWithOptions(state, thread);
 }
 
-export function syncServerThreadDetailHotPath(state: AppState, thread: ReadModelThread): AppState {
+function syncServerThreadDetailHotPathInEnvironment(
+  state: EnvironmentState,
+  thread: ReadModelThread,
+): EnvironmentState {
   if (
     state.deletedProjectIdsById?.[thread.projectId] !== undefined ||
     state.deletedThreadIdsById?.[thread.id] !== undefined
@@ -1340,18 +1495,21 @@ export function syncServerThreadDetailHotPath(state: AppState, thread: ReadModel
   return syncServerThreadDetailWithOptions(state, thread, { updateSidebarSummary: false });
 }
 
-export function applyShellEvent(state: AppState, event: OrchestrationShellStreamEvent): AppState {
+function applyShellEventInEnvironment(
+  state: EnvironmentState,
+  event: OrchestrationShellStreamEvent,
+): EnvironmentState {
   switch (event.kind) {
     case "space-upserted":
-      return upsertSpace(state, event.space);
+      return upsertSpaceInEnvironment(state, event.space);
     case "space-removed":
-      return removeSpace(state, event.spaceId, event.updatedAt);
+      return removeSpaceInEnvironment(state, event.spaceId, event.updatedAt);
     case "space-order-updated":
-      return applySpaceOrder(state, event.orderedSpaceIds);
+      return applySpaceOrderInEnvironment(state, event.orderedSpaceIds);
     case "project-upserted":
-      return upsertProject(state, event.project, "id-or-cwd");
+      return upsertProjectInEnvironment(state, event.project, "id-or-cwd");
     case "project-removed":
-      return removeDeletedProjectFromClientState(state, event.projectId, event.sequence);
+      return removeDeletedProjectInEnvironment(state, event.projectId, event.sequence);
     case "thread-upserted": {
       if (
         state.deletedProjectIdsById?.[event.thread.projectId] !== undefined ||
@@ -1371,10 +1529,25 @@ export function applyShellEvent(state: AppState, event: OrchestrationShellStream
   }
 }
 
-export function syncServerReadModel(state: AppState, readModel: OrchestrationReadModel): AppState {
+/**
+ * Full read-model sync for the LOCAL environment's slice.
+ *
+ * Served by the page's own server (bootstrap and local-state repair), so it is
+ * authoritative for the local record and reaches nothing else. Under the flat
+ * store it had to carry remote projects and threads across its prunes by hand,
+ * or "Repair local state" and desktop bootstrap recovery deleted every remote
+ * project while leaving its threads behind.
+ */
+function syncServerReadModelInEnvironment(
+  state: EnvironmentState,
+  readModel: OrchestrationReadModel,
+): EnvironmentState {
   if (isStaleSnapshot(state, readModel.snapshotSequence)) {
     return state;
   }
+  // Safe to record unconditionally: this path is local-only by construction —
+  // `syncServerReadModel` always targets LOCAL_ENVIRONMENT_ID — so `state` is
+  // the local slice and never a remote one.
   rememberProjectUiState(state.projects);
   rememberProjectLocalNames(state.projects);
   const deletedProjectIdsById = state.deletedProjectIdsById ?? {};
@@ -1391,6 +1564,8 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     (readModel.spaces ?? []).filter((space) => space.deletedAt === null),
     state.spaces ?? [],
   );
+  // `mapProjects` returns its input on a no-op resync, so the previous array is
+  // reused by reference and selectors downstream keep their memoized identity.
   const projects = mapProjects(
     readModel.projects.filter(
       (project) => project.deletedAt === null && deletedProjectIdsById[project.id] === undefined,
@@ -1409,13 +1584,22 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
       return normalizeThreadFromReadModel(thread, existing);
     });
   const nextThreadIds = new Set(nextThreads.map((thread) => thread.id));
-  // This full resync (including the "Repair local state" action) replaces
-  // every thread's detail wholesale: pruned threads lose their detail, and a
-  // surviving thread's cursor would vouch for history the replacement does not
-  // contain. No cursor survives — the next subscribe takes a snapshot and
+  // This full resync (including the "Repair local state" action) prunes detail
+  // slices down to the read model's threads; any resume cursor for a pruned
+  // thread must fall with its detail or a later resubscribe would gap-replay
+  // on top of history this prune just discarded.
+  localThreadDetailResumeCursors().retain(nextThreadIds);
+  // A surviving thread's detail is replaced wholesale by this read model, so a
+  // cursor ahead of the replacement would resume past history the new detail
+  // does not contain. Drop them all: the next subscribe takes a snapshot and
   // re-establishes one that matches what is actually cached.
-  resetThreadDetailResumeCursors();
-  let normalizedState: AppState = {
+  //
+  // Still a retain/clear pair rather than a bare reset: the cursor registry is
+  // keyed by environment and this call is scoped to the local one, so a reset
+  // would drop cursors for threads on servers this read model has no authority
+  // over.
+  localThreadDetailResumeCursors().clearMany([...nextThreadIds]);
+  let normalizedState: EnvironmentState = {
     ...state,
     threadIds: reuseThreadIdRegistry(state.threadIds, nextThreadIds),
     threadShellById: retainThreadScopedRecord(state.threadShellById, nextThreadIds),
@@ -1485,7 +1669,10 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     // by a snapshot that predates the deletion.
     const advanced =
       readModel.snapshotSequence > (state.shellSnapshotSequence ?? 0)
-        ? { ...state, shellSnapshotSequence: readModel.snapshotSequence }
+        ? {
+            ...state,
+            shellSnapshotSequence: readModel.snapshotSequence,
+          }
         : state;
     return retireConfirmedDeletionTombstones(
       advanced,
@@ -1506,5 +1693,187 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     readModel.snapshotSequence,
     livePresentThreadIds,
     livePresentProjectIds,
+  );
+}
+
+// ── Routing boundary ─────────────────────────────────────────────────
+//
+// Everything above operates on a single `EnvironmentState`. These are the
+// exported transitions the facade and the event reducer call: each picks the
+// environment that owns the row and hands its slice down. Ownership is
+// positional — read out of the records themselves — so there is no side table
+// to keep in step, and a transition that forgets to scope is not a bug that
+// slips through review but a type error.
+
+/**
+ * Integrates one environment's authoritative shell snapshot.
+ *
+ * `environmentId` defaults to the local server, so single-server callers are
+ * unchanged.
+ */
+export function syncServerShellSnapshot(
+  state: AppState,
+  snapshot: OrchestrationShellSnapshot,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    syncServerShellSnapshotInEnvironment(environment, snapshot, environmentId),
+  );
+}
+
+/**
+ * Full read-model sync. Local-only: it is served by the page's own server
+ * (bootstrap and local-state repair).
+ */
+export function syncServerReadModel(state: AppState, readModel: OrchestrationReadModel): AppState {
+  return updateEnvironment(state, LOCAL_ENVIRONMENT_ID, (environment) =>
+    syncServerReadModelInEnvironment(environment, readModel),
+  );
+}
+
+export function syncServerThreadDetail(
+  state: AppState,
+  thread: ReadModelThread,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    syncServerThreadDetailInEnvironment(environment, thread),
+  );
+}
+
+export function syncServerThreadDetailHotPath(
+  state: AppState,
+  thread: ReadModelThread,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    syncServerThreadDetailHotPathInEnvironment(environment, thread),
+  );
+}
+
+export function applyShellEvent(
+  state: AppState,
+  event: OrchestrationShellStreamEvent,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    applyShellEventInEnvironment(environment, event),
+  );
+}
+
+export function upsertProject(
+  state: AppState,
+  incoming: ProjectNormalizationInput,
+  matchPolicy: ProjectMatchPolicy,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    upsertProjectInEnvironment(environment, incoming, matchPolicy),
+  );
+}
+
+export function upsertSpace(
+  state: AppState,
+  incoming: OrchestrationReadModel["spaces"][number] | OrchestrationSpaceShell,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    upsertSpaceInEnvironment(environment, incoming),
+  );
+}
+
+export function removeSpace(
+  state: AppState,
+  spaceId: Space["id"],
+  assignmentUpdatedAt?: string,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    removeSpaceInEnvironment(environment, spaceId, assignmentUpdatedAt),
+  );
+}
+
+export function applySpaceOrder(
+  state: AppState,
+  orderedSpaceIds: ReadonlyArray<Space["id"]>,
+  updatedAt?: string,
+  environmentId: EnvironmentId = LOCAL_ENVIRONMENT_ID,
+): AppState {
+  return updateEnvironment(state, environmentId, (environment) =>
+    applySpaceOrderInEnvironment(environment, orderedSpaceIds, updatedAt),
+  );
+}
+
+/**
+ * Applies a pure thread transition inside the environment that owns the thread.
+ *
+ * The owner is looked up rather than assumed: this is reached from the event
+ * reducer with nothing but a thread id, and writing a remote thread's update
+ * into the local slice would both corrupt the local record and lose the update.
+ */
+export function applyThreadUpdate(
+  state: AppState,
+  threadId: ThreadId,
+  updater: (thread: Thread) => Thread,
+  options?: {
+    updateSidebarSummary?: boolean;
+    recomputeSummarySignals?: boolean;
+  },
+): AppState {
+  return updateEnvironment(state, environmentIdForThread(state, threadId), (environment) =>
+    applyThreadUpdateInEnvironment(environment, threadId, updater, options),
+  );
+}
+
+export function markThreadDetailSyncFailedInClientState(
+  state: AppState,
+  threadId: ThreadId,
+): AppState {
+  return updateEnvironment(state, environmentIdForThread(state, threadId), (environment) =>
+    markThreadDetailSyncFailedInEnvironment(environment, threadId),
+  );
+}
+
+export function clearThreadDetailSyncFailureInClientState(
+  state: AppState,
+  threadId: ThreadId,
+): AppState {
+  return updateEnvironment(state, environmentIdForThread(state, threadId), (environment) =>
+    clearThreadDetailSyncFailureInEnvironment(environment, threadId),
+  );
+}
+
+export function evictThreadDetailFromClientState(state: AppState, threadId: ThreadId): AppState {
+  return updateEnvironment(state, environmentIdForThread(state, threadId), (environment) =>
+    evictThreadDetailInEnvironment(environment, threadId),
+  );
+}
+
+/**
+ * Tombstones a thread in its owning environment.
+ *
+ * Routing is what keeps the tombstone's sequence meaningful: it is stamped
+ * against, and later retired against, the fence of the server that recorded the
+ * deletion. A remote thread tombstoned into the local slice would be compared
+ * with a counter it has no relationship to.
+ */
+export function removeDeletedThreadFromClientState(
+  state: AppState,
+  threadId: ThreadId,
+  deletedAtSequence?: number,
+): AppState {
+  return updateEnvironment(state, environmentIdForThread(state, threadId), (environment) =>
+    removeDeletedThreadInEnvironment(environment, threadId, deletedAtSequence),
+  );
+}
+
+/** Tombstones a project in its owning environment; see the thread case above. */
+export function removeDeletedProjectFromClientState(
+  state: AppState,
+  projectId: Project["id"],
+  deletedAtSequence?: number,
+): AppState {
+  return updateEnvironment(state, environmentIdForProject(state, projectId), (environment) =>
+    removeDeletedProjectInEnvironment(environment, projectId, deletedAtSequence),
   );
 }

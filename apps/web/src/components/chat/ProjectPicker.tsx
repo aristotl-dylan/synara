@@ -10,11 +10,16 @@ import {
   useDeferredValue,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactElement,
 } from "react";
 import { type ProjectDirectoryEntry, type ProjectId, type SpaceId } from "@synara/contracts";
 import { readNativeApi } from "../../nativeApi";
+import { environmentLabel } from "../../environmentDirectory";
+import { resolveEnvironmentCapabilityRefusal } from "../../environmentCapabilities";
+import { LOCAL_ENVIRONMENT_ID } from "../../environmentIdentity";
+import { useEnvironmentScopeId } from "../../environmentScope";
 import { useStore } from "../../store";
 import { createSidebarDisplayThreadsSelector } from "../../storeSelectors";
 import { PlusIcon, XIcon } from "~/lib/icons";
@@ -174,7 +179,10 @@ export const ProjectPicker = memo(function ProjectPicker({
   const [isLoadingDirectories, setIsLoadingDirectories] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [directoryEntries, setDirectoryEntries] = useState<readonly ProjectDirectoryEntry[]>([]);
+  const [resetTriggerFocused, setResetTriggerFocused] = useState(false);
+  const resetInFlightRef = useRef(false);
   const isProjectSelectionMode = selectionMode === "project";
+  const environmentScopeId = useEnvironmentScopeId();
 
   const activeFolderOptions = useMemo(() => {
     const seen = new Set<string>();
@@ -452,6 +460,19 @@ export const ProjectPicker = memo(function ProjectPicker({
       return;
     }
 
+    // The folder picker opens on the machine the user is sitting at, so on a
+    // remote host it would choose a path that host does not have. Refuse
+    // explicitly rather than silently adding a local folder to a remote server.
+    const refusal = resolveEnvironmentCapabilityRefusal({
+      capability: "desktop-dialogs",
+      isLocalEnvironment: environmentScopeId === LOCAL_ENVIRONMENT_ID,
+      environmentLabel: environmentLabel(environmentScopeId),
+    });
+    if (refusal) {
+      setErrorMessage(refusal.description);
+      return;
+    }
+
     setIsPicking(true);
     setErrorMessage(null);
     try {
@@ -473,9 +494,14 @@ export const ProjectPicker = memo(function ProjectPicker({
       setIsPicking(false);
       setErrorMessage(error instanceof Error ? error.message : "Unable to open the folder picker.");
     }
-  }, [isPicking, onCreateProjectFromPath, onSelectWorkspaceRoot]);
+  }, [environmentScopeId, isPicking, onCreateProjectFromPath, onSelectWorkspaceRoot]);
 
   const handleResetToHome = useCallback(() => {
+    if (resetInFlightRef.current) {
+      return;
+    }
+    resetInFlightRef.current = true;
+    setErrorMessage(null);
     try {
       // Statement form, not `onResetToHome?.()` or a ternary, for the same reason as
       // `handleAddNewProject`: any value block inside a `try` is one the compiler rejects.
@@ -485,17 +511,24 @@ export const ProjectPicker = memo(function ProjectPicker({
       }
       void Promise.resolve(reset)
         .then(() => {
+          resetInFlightRef.current = false;
           setOpen(false);
         })
         .catch((error) => {
+          resetInFlightRef.current = false;
           setErrorMessage(error instanceof Error ? error.message : "Unable to update project.");
+          setOpen(true);
         });
     } catch (error) {
+      resetInFlightRef.current = false;
       setErrorMessage(error instanceof Error ? error.message : "Unable to update project.");
+      setOpen(true);
     }
   }, [onResetToHome]);
 
   const shouldShowResetToHome = showResetToHome || isProjectSelectionMode;
+  const canResetFromTrigger =
+    renderTrigger === undefined && selectedFolderOption !== null && onResetToHome !== undefined;
   const addProjectLabel =
     addActionLabel ?? (isProjectSelectionMode ? "New project" : "Add new project");
   const loadingAddProjectLabel = isProjectSelectionMode
@@ -545,21 +578,63 @@ export const ProjectPicker = memo(function ProjectPicker({
       onOpenChange={handleOpenChange}
       open={open}
     >
-      <ComboboxTrigger
-        render={
-          renderTrigger ?? (
-            <PickerTriggerButton
-              data-testid={
-                isProjectSelectionMode ? "project-picker-trigger" : "workspace-picker-trigger"
-              }
-              icon={<FolderClosed className="size-3.5" />}
-              label={triggerLabel}
-              hideChevron
-              {...(triggerClassName ? { className: triggerClassName } : {})}
-            />
-          )
-        }
-      />
+      {renderTrigger ? (
+        <ComboboxTrigger render={renderTrigger} />
+      ) : (
+        <div className="group/project-picker-trigger relative inline-flex min-w-0 max-w-full">
+          <ComboboxTrigger
+            render={
+              <PickerTriggerButton
+                data-testid={
+                  isProjectSelectionMode ? "project-picker-trigger" : "workspace-picker-trigger"
+                }
+                icon={
+                  <FolderClosed
+                    className={cn(
+                      "size-3.5 transition-opacity duration-150 ease-out motion-reduce:transition-none",
+                      canResetFromTrigger && "group-hover/project-picker-trigger:opacity-0",
+                      resetTriggerFocused && "opacity-0",
+                    )}
+                  />
+                }
+                label={triggerLabel}
+                hideChevron
+                {...(triggerClassName ? { className: triggerClassName } : {})}
+              />
+            }
+          />
+          {canResetFromTrigger ? (
+            <button
+              type="button"
+              data-testid="project-picker-reset-trigger"
+              aria-label={resetActionLabel}
+              title={resetActionLabel}
+              className={cn(
+                "group/reset-project pointer-events-none absolute top-1/2 left-0.5 z-10 inline-flex size-5 -translate-y-1/2 cursor-pointer items-center justify-center",
+                "opacity-0 transition-opacity duration-150 ease-out",
+                "focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
+                "group-hover/project-picker-trigger:pointer-events-auto group-hover/project-picker-trigger:opacity-100",
+                "motion-reduce:transition-none",
+              )}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onFocus={() => setResetTriggerFocused(true)}
+              onBlur={() => setResetTriggerFocused(false)}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                handleResetToHome();
+              }}
+            >
+              <span className="inline-flex size-3.5 items-center justify-center rounded-full bg-muted-foreground/58 text-background transition-colors duration-150 group-hover/reset-project:bg-muted-foreground/75 motion-reduce:transition-none">
+                <XIcon className="size-2" aria-hidden />
+              </span>
+            </button>
+          ) : null}
+        </div>
+      )}
       <ComboboxPopup align={align} side={side} className="p-0">
         <PickerPanelShell
           searchPlaceholder={searchPlaceholder}

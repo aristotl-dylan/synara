@@ -4,6 +4,7 @@
 
 import { Fragment, type ReactNode, createElement, useEffect } from "react";
 import {
+  type EnvironmentId,
   type OrchestrationEvent,
   type OrchestrationReadModel,
   type OrchestrationShellSnapshot,
@@ -16,11 +17,14 @@ import { resolveThreadBranchRegressionGuard } from "@synara/shared/git";
 import { create } from "zustand";
 
 import { resolveCreateBranchFlowCompletedMerge } from "./storeNormalization";
+import { environmentIdForProject, updateEnvironment } from "./storeAggregation";
 import {
   applySpaceOrder,
   applyShellEvent,
   applyThreadUpdate,
+  clearEnvironmentShellFence,
   clearThreadDetailSyncFailureInClientState,
+  discardEnvironmentProjection,
   evictThreadDetailFromClientState,
   markThreadDetailSyncFailedInClientState,
   removeDeletedProjectFromClientState,
@@ -36,6 +40,7 @@ import {
   readPersistedState,
   rememberProjectLocalNames,
   rememberProjectUiState,
+  selectPersistableProjects,
 } from "./storePersistence";
 import { initialState, type AppState } from "./storeState";
 import type { Project, ThreadWorkspacePatch } from "./types";
@@ -96,11 +101,57 @@ export function markThreadUnread(state: AppState, threadId: ThreadId): AppState 
   });
 }
 
+/**
+ * Applies a local project-list edit inside the environment that owns the
+ * project.
+ *
+ * These are UI-only mutations (expansion, order, local rename), but they still
+ * have to be written through the owning environment rather than onto the merged
+ * `projects` array: the aggregate is derived and recomputed after every write,
+ * so an edit applied to it directly would be silently discarded on the next
+ * transition.
+ */
+function updateOwningProject(
+  state: AppState,
+  projectId: Project["id"],
+  update: (project: Project) => Project,
+): AppState {
+  return updateEnvironment(state, environmentIdForProject(state, projectId), (environment) => {
+    let changed = false;
+    const projects = environment.projects.map((project) => {
+      if (project.id !== projectId) return project;
+      const nextProject = update(project);
+      if (nextProject === project) return project;
+      changed = true;
+      return nextProject;
+    });
+    return changed ? { ...environment, projects } : environment;
+  });
+}
+
+/** Applies a local project-list edit to every environment's own list. */
+function updateAllProjects(state: AppState, update: (project: Project) => Project): AppState {
+  return Object.keys(state.environmentById).reduce(
+    (nextState, environmentId) =>
+      updateEnvironment(nextState, environmentId as EnvironmentId, (environment) => {
+        let changed = false;
+        const projects = environment.projects.map((project) => {
+          const nextProject = update(project);
+          if (nextProject === project) return project;
+          changed = true;
+          return nextProject;
+        });
+        return changed ? { ...environment, projects } : environment;
+      }),
+    state,
+  );
+}
+
 export function toggleProject(state: AppState, projectId: Project["id"]): AppState {
-  return {
-    ...state,
-    projects: state.projects.map((p) => (p.id === projectId ? { ...p, expanded: !p.expanded } : p)),
-  };
+  return updateOwningProject(state, projectId, (project) => ({
+    ...project,
+    expanded: !project.expanded,
+  }));
 }
 
 export function setProjectExpanded(
@@ -108,53 +159,55 @@ export function setProjectExpanded(
   projectId: Project["id"],
   expanded: boolean,
 ): AppState {
-  let changed = false;
-  const projects = state.projects.map((p) => {
-    if (p.id !== projectId || p.expanded === expanded) return p;
-    changed = true;
-    return { ...p, expanded };
-  });
-  return changed ? { ...state, projects } : state;
+  return updateOwningProject(state, projectId, (project) =>
+    project.expanded === expanded ? project : { ...project, expanded },
+  );
 }
 
 export function setAllProjectsExpanded(state: AppState, expanded: boolean): AppState {
-  let changed = false;
-  const projects = state.projects.map((project) => {
-    if (project.expanded === expanded) return project;
-    changed = true;
-    return { ...project, expanded };
-  });
-  return changed ? { ...state, projects } : state;
+  return updateAllProjects(state, (project) =>
+    project.expanded === expanded ? project : { ...project, expanded },
+  );
 }
 
 export function collapseProjectsExcept(
   state: AppState,
   activeProjectId: Project["id"] | null,
 ): AppState {
-  let changed = false;
-  const projects = state.projects.map((project) => {
+  return updateAllProjects(state, (project) => {
     const nextExpanded = activeProjectId !== null && project.id === activeProjectId;
-    if (project.expanded === nextExpanded) return project;
-    changed = true;
-    return { ...project, expanded: nextExpanded };
+    return project.expanded === nextExpanded ? project : { ...project, expanded: nextExpanded };
   });
-  return changed ? { ...state, projects } : state;
 }
 
+/**
+ * Reorders two projects within the environment that owns them.
+ *
+ * Cross-environment drags are a no-op: the aggregate's order is local-first and
+ * then by environment id, so moving a project across that boundary would be
+ * undone by the next recomputation. Reordering inside one server's list is the
+ * only move the shape can honour, and it is the only one the sidebar offers.
+ */
 export function reorderProjects(
   state: AppState,
   draggedProjectId: Project["id"],
   targetProjectId: Project["id"],
 ): AppState {
   if (draggedProjectId === targetProjectId) return state;
-  const draggedIndex = state.projects.findIndex((project) => project.id === draggedProjectId);
-  const targetIndex = state.projects.findIndex((project) => project.id === targetProjectId);
-  if (draggedIndex < 0 || targetIndex < 0) return state;
-  const projects = [...state.projects];
-  const [draggedProject] = projects.splice(draggedIndex, 1);
-  if (!draggedProject) return state;
-  projects.splice(targetIndex, 0, draggedProject);
-  return { ...state, projects };
+  const environmentId = environmentIdForProject(state, draggedProjectId);
+  if (environmentIdForProject(state, targetProjectId) !== environmentId) return state;
+  return updateEnvironment(state, environmentId, (environment) => {
+    const draggedIndex = environment.projects.findIndex(
+      (project) => project.id === draggedProjectId,
+    );
+    const targetIndex = environment.projects.findIndex((project) => project.id === targetProjectId);
+    if (draggedIndex < 0 || targetIndex < 0) return environment;
+    const projects = [...environment.projects];
+    const [draggedProject] = projects.splice(draggedIndex, 1);
+    if (!draggedProject) return environment;
+    projects.splice(targetIndex, 0, draggedProject);
+    return { ...environment, projects };
+  });
 }
 
 export function renameProjectLocally(
@@ -163,24 +216,18 @@ export function renameProjectLocally(
   name: string | null,
 ): AppState {
   const normalizedName = name?.trim() ?? null;
-  let changed = false;
-  const projects = state.projects.map((project) => {
-    if (project.id !== projectId) {
-      return project;
-    }
+  return updateOwningProject(state, projectId, (project) => {
     const nextLocalName = normalizedName && normalizedName.length > 0 ? normalizedName : null;
     const nextName = nextLocalName ?? project.remoteName;
     if (project.localName === nextLocalName && project.name === nextName) {
       return project;
     }
-    changed = true;
     return {
       ...project,
       name: nextName,
       localName: nextLocalName,
     };
   });
-  return changed ? { ...state, projects } : state;
 }
 
 export function setError(state: AppState, threadId: ThreadId, error: string | null): AppState {
@@ -262,7 +309,18 @@ export function setThreadWorkspace(
 // ── Zustand store ────────────────────────────────────────────────────
 
 interface AppStore extends AppState {
-  syncServerShellSnapshot: (snapshot: OrchestrationShellSnapshot) => void;
+  /** `environmentId` defaults to the local server, so existing callers are unaffected. */
+  syncServerShellSnapshot: (
+    snapshot: OrchestrationShellSnapshot,
+    environmentId?: EnvironmentId,
+  ) => void;
+  /**
+   * Server-generation change: drop this environment's stale snapshot fence so
+   * the replacement server's snapshots are not rejected as out of date.
+   */
+  clearEnvironmentShellFence: (environmentId: EnvironmentId) => void;
+  /** Environment torn down for good: drop its fence and the rows it owned. */
+  discardEnvironmentProjection: (environmentId: EnvironmentId) => void;
   syncServerThreadDetail: (thread: ReadModelThread) => void;
   syncServerThreadDetailHotPath: (thread: ReadModelThread) => void;
   syncServerReadModel: (readModel: OrchestrationReadModel) => void;
@@ -290,7 +348,12 @@ interface AppStore extends AppState {
 
 export const useStore = create<AppStore>((set) => ({
   ...readPersistedState(initialState),
-  syncServerShellSnapshot: (snapshot) => set((state) => syncServerShellSnapshot(state, snapshot)),
+  syncServerShellSnapshot: (snapshot, environmentId) =>
+    set((state) => syncServerShellSnapshot(state, snapshot, environmentId)),
+  clearEnvironmentShellFence: (environmentId) =>
+    set((state) => clearEnvironmentShellFence(state, environmentId)),
+  discardEnvironmentProjection: (environmentId) =>
+    set((state) => discardEnvironmentProjection(state, environmentId)),
   syncServerThreadDetail: (thread) => set((state) => syncServerThreadDetail(state, thread)),
   syncServerThreadDetailHotPath: (thread) =>
     set((state) => syncServerThreadDetailHotPath(state, thread)),
@@ -348,8 +411,13 @@ export const useStore = create<AppStore>((set) => ({
 
 // Persist state changes with debouncing to avoid localStorage thrashing
 useStore.subscribe((state) => {
-  rememberProjectUiState(state.projects);
-  rememberProjectLocalNames(state.projects);
+  // The LOCAL slice, not `state.projects`: the aggregate concatenates every
+  // environment's projects, and these caches are keyed by cwd alone, so a
+  // remote copy sharing a checkout path would overwrite the local project's
+  // remembered expansion and alias.
+  const persistableProjects = selectPersistableProjects(state);
+  rememberProjectUiState(persistableProjects);
+  rememberProjectLocalNames(persistableProjects);
   debouncedPersistState.maybeExecute(state);
 });
 

@@ -10,9 +10,9 @@ import {
   type ModelSelection,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
-  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   type ClaudeCodeEffort,
   type ProviderKind,
+  type ThreadId,
   type UploadChatAttachment,
 } from "@synara/contracts";
 import {
@@ -29,18 +29,21 @@ import {
   type PersistedComposerImageAttachment,
 } from "../composerDraftDomain";
 import { readComposerImageBlob } from "./composerImageBlobStore";
+import {
+  ComposerImagePreparationError,
+  prepareComposerImageFile,
+} from "./composerImagePreparation";
 import { normalizeComposerImageSource } from "./composerImageSource";
 import { randomUUID } from "./utils";
-import { resolveWsHttpUrl } from "./wsHttpUrl";
+import { withClientBuildIdentity } from "./wsHttpUrl";
+import { resolveThreadHttpUrl } from "../environmentRouting";
 
 const ATTACHMENT_CANCEL_CONCURRENCY = 2;
 const ATTACHMENT_CANCEL_BODY_MAX_BYTES = 512;
 
 export { cloneComposerImageAttachment };
+export { effectiveComposerAttachmentCount } from "./composerAttachmentCapacity";
 
-export const IMAGE_SIZE_LIMIT_LABEL = `${Math.round(
-  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES / (1024 * 1024),
-)}MB`;
 export const FILE_SIZE_LIMIT_LABEL = `${Math.round(
   PROVIDER_SEND_TURN_MAX_FILE_BYTES / (1024 * 1024),
 )}MB`;
@@ -53,6 +56,18 @@ export interface ComposerImageBuildResult {
 export interface ComposerFileBuildResult {
   files: ComposerFileAttachment[];
   error: string | null;
+}
+
+function composerImageAttachmentFromFile(file: File): ComposerImageAttachment {
+  return {
+    type: "image",
+    id: randomUUID(),
+    name: file.name || "image",
+    mimeType: file.type,
+    sizeBytes: file.size,
+    previewUrl: URL.createObjectURL(file),
+    file,
+  };
 }
 
 // Centralizes the shared file/count/size guard while each attachment type maps its own draft shape.
@@ -89,32 +104,38 @@ function collectComposerAttachmentFiles(input: {
   return { files, error };
 }
 
-// Converts File objects into the exact attachment draft shape used by the chat composer.
-export function buildComposerImageAttachmentsFromFiles(input: {
+/**
+ * Asynchronous image intake for every user-facing composer entry point. Count
+ * checks happen before decoding, and accepted files are optimized one at a time
+ * to avoid concurrent full-resolution canvas allocations.
+ */
+export async function prepareComposerImageAttachmentsFromFiles(input: {
   files: readonly File[];
   existingAttachmentCount: number;
-}): ComposerImageBuildResult {
-  const result = collectComposerAttachmentFiles({
-    files: input.files,
-    existingAttachmentCount: input.existingAttachmentCount,
-    maxBytes: PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
-    sizeLimitLabel: IMAGE_SIZE_LIMIT_LABEL,
-    acceptsFile: (file) => file.type.startsWith("image/"),
-    unsupportedFileError: (file) =>
-      `Unsupported file type for '${file.name}'. Please attach image files only.`,
-  });
+}): Promise<ComposerImageBuildResult> {
+  const images: ComposerImageAttachment[] = [];
+  let error: string | null = null;
 
-  const images = result.files.map<ComposerImageAttachment>((file) => ({
-    type: "image",
-    id: randomUUID(),
-    name: file.name || "image",
-    mimeType: file.type,
-    sizeBytes: file.size,
-    previewUrl: URL.createObjectURL(file),
-    file,
-  }));
+  for (const file of input.files) {
+    if (!file.type.startsWith("image/")) {
+      error = `Unsupported file type for '${file.name}'. Please attach image files only.`;
+      continue;
+    }
+    if (input.existingAttachmentCount + images.length >= PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+      error = `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} references per message.`;
+      break;
+    }
+    try {
+      images.push(composerImageAttachmentFromFile(await prepareComposerImageFile(file)));
+    } catch (cause) {
+      error =
+        cause instanceof ComposerImagePreparationError
+          ? cause.message
+          : `Synara could not prepare '${file.name || "image"}'.`;
+    }
+  }
 
-  return { images, error: result.error };
+  return { images, error };
 }
 
 // Converts non-image File objects into in-memory file attachment drafts.
@@ -232,7 +253,17 @@ function isManagedAttachmentId(value: unknown): value is string {
   );
 }
 
-async function cancelManagedAttachments(attachmentIds: readonly string[]): Promise<void> {
+/**
+ * Cancels staged attachments on the server that STAGED them.
+ *
+ * `threadId` is required for the same reason the upload needs it: the staging
+ * routes are per-server, so cancelling against the local server would leave a
+ * remote host's staged bytes to expire on their own while cancelling nothing.
+ */
+async function cancelManagedAttachments(
+  threadId: string,
+  attachmentIds: readonly string[],
+): Promise<void> {
   let nextIndex = 0;
   const worker = async () => {
     while (nextIndex < attachmentIds.length) {
@@ -242,12 +273,18 @@ async function cancelManagedAttachments(attachmentIds: readonly string[]): Promi
       const body = JSON.stringify({ attachmentId });
       if (new TextEncoder().encode(body).byteLength > ATTACHMENT_CANCEL_BODY_MAX_BYTES) continue;
       try {
-        await fetch(resolveWsHttpUrl(ATTACHMENT_CANCEL_ROUTE_PATH), {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body,
-        });
+        await fetch(
+          resolveThreadHttpUrl(
+            threadId as ThreadId,
+            withClientBuildIdentity(ATTACHMENT_CANCEL_ROUTE_PATH),
+          ),
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body,
+          },
+        );
       } catch {
         // Staged attachments also have a server-owned expiry. Compensation is
         // deliberately best-effort and must never replace the dispatch/upload error.
@@ -285,8 +322,14 @@ export async function stageUploadComposerAttachments(input: {
         name: attachment.name,
         mimeType: attachment.mimeType,
       });
+      // Resolved against the thread's OWNING environment: an ambient resolution
+      // would post a remote thread's file bytes to the local server, which then
+      // stages an attachment the host actually running the turn cannot read.
       const response = await fetch(
-        resolveWsHttpUrl(`${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`),
+        resolveThreadHttpUrl(
+          input.threadId as ThreadId,
+          withClientBuildIdentity(`${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`),
+        ),
         {
           method: "POST",
           credentials: "include",
@@ -309,7 +352,7 @@ export async function stageUploadComposerAttachments(input: {
       attachments.push(payload);
     }
   } catch (error) {
-    await cancelManagedAttachments(managedAttachmentIds);
+    await cancelManagedAttachments(input.threadId, managedAttachmentIds);
     throw error;
   }
 
@@ -317,7 +360,7 @@ export async function stageUploadComposerAttachments(input: {
   const cleanup = async () => {
     if (disposition !== "pending") return;
     disposition = "cleaned";
-    await cancelManagedAttachments(managedAttachmentIds);
+    await cancelManagedAttachments(input.threadId, managedAttachmentIds);
   };
   const commit = () => {
     if (disposition === "pending") disposition = "committed";
@@ -347,41 +390,6 @@ export async function buildUploadComposerAttachments(input: {
   assistantSelections: ReadonlyArray<ComposerAssistantSelectionAttachment>;
 }): Promise<UploadChatAttachment[]> {
   return (await stageUploadComposerAttachments(input)).attachments;
-}
-
-interface AttachmentIdCarrier {
-  id: string;
-}
-
-interface EffectiveComposerAttachmentCountDraft {
-  images?: ReadonlyArray<AttachmentIdCarrier> | undefined;
-  files?: ReadonlyArray<unknown> | undefined;
-  assistantSelections?: ReadonlyArray<unknown> | undefined;
-  persistedAttachments?: ReadonlyArray<AttachmentIdCarrier> | undefined;
-}
-
-/**
- * Attachment count a draft must be checked against for the per-turn attachment
- * limit (AppSnap capture, manual image attach, manual file attach). Counts live
- * images/files/assistantSelections plus any `persistedAttachments` rows not yet
- * represented in `images` — persisted rows are common right after a restart,
- * while blob hydration is still pending, and omitting them would let the limit
- * check be bypassed.
- */
-export function effectiveComposerAttachmentCount(
-  draft: EffectiveComposerAttachmentCountDraft | undefined,
-): number {
-  if (!draft) return 0;
-  const hydratedImageIds = new Set((draft.images ?? []).map((image) => image.id));
-  const pendingPersistedCount = (draft.persistedAttachments ?? []).filter(
-    (attachment) => !hydratedImageIds.has(attachment.id),
-  ).length;
-  return (
-    (draft.images?.length ?? 0) +
-    (draft.files?.length ?? 0) +
-    (draft.assistantSelections?.length ?? 0) +
-    pendingPersistedCount
-  );
 }
 
 /**

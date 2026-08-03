@@ -1,0 +1,228 @@
+// FILE: remoteHostFingerprint.ts
+// Purpose: Fetch and render a remote host's public-key fingerprint so a user can
+//          compare it against the machine they actually own BEFORE trusting it.
+// Layer: Shared runtime (server + tests)
+// Exports: buildSshResolveArgv, parseResolvedSshTarget, buildSshKeyscanArgv,
+//          parseHostKeyFingerprints, preferredHostKey, SSH_KEYSCAN_TIMEOUT_SECONDS
+//
+// Why this exists
+// ---------------
+// A "trust this host key" button that does not show a fingerprint is a button
+// that trusts whatever answered the connection. The whole security value of
+// first-contact trust is the user comparing a string we obtained over the
+// network against a string they read on the console of a machine they own. So
+// the fingerprint is fetched, rendered, and shown — and it is computed locally
+// from the key blob rather than parsed out of a tool's prose, because the digest
+// IS the thing being verified.
+//
+// Two hops, on purpose
+// --------------------
+// `destination` may be a `~/.ssh/config` Host alias or `user@host`, neither of
+// which `ssh-keyscan` understands — it wants a bare hostname. So ssh itself is
+// asked to resolve the destination (`ssh -G`, which reads the user's config and
+// prints the effective `hostname`/`port` without connecting to anything), and
+// only the resolved pair is keyscanned. Re-implementing ssh_config resolution
+// here would be a second, divergent parser for a file ssh already owns.
+//
+// Every command is an argv ARRAY. No string is ever handed to a shell, so no
+// value below can be interpreted as syntax regardless of what it contains.
+
+import * as Crypto from "node:crypto";
+
+import type { RemoteHostConfig } from "@synara/contracts";
+
+import { RemoteHostConfigError, validateRemoteHostConfig } from "./remoteCommand";
+
+/**
+ * `ssh-keyscan`'s own connect/banner timeout. It must terminate: an address that
+ * completes a TCP handshake and then says nothing would otherwise hold the
+ * add-host dialog open forever with no way to tell it from a slow link.
+ */
+export const SSH_KEYSCAN_TIMEOUT_SECONDS = 8;
+
+/** Wall-clock deadline for the whole keyscan, enforced by the caller as well. */
+export const SSH_KEYSCAN_DEADLINE_MS = 15_000;
+
+export interface ResolvedSshTarget {
+  readonly hostname: string;
+  readonly port: number;
+}
+
+export interface HostKeyFingerprint {
+  /** ssh's wire name, e.g. `ssh-ed25519`. */
+  readonly keyType: string;
+  /** Short name for display, e.g. `ed25519`. */
+  readonly displayType: string;
+  /** `SHA256:…`, byte-identical to what `ssh-keygen -lf` prints. */
+  readonly fingerprint: string;
+}
+
+/**
+ * Asks ssh to resolve a destination WITHOUT connecting.
+ *
+ * `-G` prints the effective configuration after applying `~/.ssh/config`,
+ * `Match` blocks and defaults, then exits. It performs no network I/O, so this
+ * is safe to run before the user has trusted anything.
+ */
+export function buildSshResolveArgv(config: RemoteHostConfig): {
+  readonly command: string;
+  readonly args: readonly string[];
+} {
+  const validated = validateRemoteHostConfig(config);
+  return {
+    command: validated.sshBinary ?? "ssh",
+    // `--` so a destination can never be read as an option, matching buildSshArgv.
+    args: ["-G", "--", validated.destination],
+  };
+}
+
+function assertKeyscanSafe(field: string, value: string): void {
+  // ssh-keyscan has no `--`, so a dashed hostname WOULD be parsed as an option.
+  // This is the only reason the check must exist here separately from
+  // validateRemoteHostConfig: that gate protects a command which does have `--`.
+  if (value.startsWith("-")) {
+    throw new RemoteHostConfigError(field, `A resolved ${field} may not start with "-".`);
+  }
+  if (value.length === 0 || /\s/.test(value) || value.includes("\u0000")) {
+    throw new RemoteHostConfigError(
+      field,
+      `A resolved ${field} may not be empty or contain whitespace or NUL bytes.`,
+    );
+  }
+}
+
+/**
+ * Reads `hostname` and `port` out of `ssh -G` output.
+ *
+ * The output is `key value` per line with lower-cased keys. Only the FIRST
+ * occurrence of each key is honoured, which is ssh's own first-value-wins rule —
+ * taking the last would report a different target than ssh will actually dial.
+ */
+export function parseResolvedSshTarget(stdout: string): ResolvedSshTarget {
+  let hostname: string | undefined;
+  let port: number | undefined;
+
+  for (const line of stdout.split("\n")) {
+    const separator = line.indexOf(" ");
+    if (separator === -1) continue;
+    const key = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    if (key === "hostname" && hostname === undefined) hostname = value;
+    else if (key === "port" && port === undefined) {
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 65_535) port = parsed;
+    }
+  }
+
+  if (hostname === undefined) {
+    throw new RemoteHostConfigError("destination", "ssh did not report a hostname for this host.");
+  }
+  assertKeyscanSafe("hostname", hostname);
+  return { hostname, port: port ?? 22 };
+}
+
+export function buildSshKeyscanArgv(target: ResolvedSshTarget): {
+  readonly command: string;
+  readonly args: readonly string[];
+} {
+  assertKeyscanSafe("hostname", target.hostname);
+  if (!Number.isSafeInteger(target.port) || target.port <= 0 || target.port > 65_535) {
+    throw new RemoteHostConfigError("port", `Refusing to scan an invalid port: ${target.port}.`);
+  }
+  return {
+    command: "ssh-keyscan",
+    args: [
+      "-T",
+      String(SSH_KEYSCAN_TIMEOUT_SECONDS),
+      "-p",
+      String(target.port),
+      // Hostname LAST and never adjacent to a value flag, so it cannot be
+      // swallowed as one flag's argument.
+      target.hostname,
+    ],
+  };
+}
+
+/** ssh's wire key names, mapped to what a human reads on a fingerprint line. */
+const KEY_TYPE_DISPLAY: Readonly<Record<string, string>> = {
+  "ssh-ed25519": "ed25519",
+  "ssh-rsa": "RSA",
+  "ssh-dss": "DSA",
+  "ecdsa-sha2-nistp256": "ECDSA",
+  "ecdsa-sha2-nistp384": "ECDSA",
+  "ecdsa-sha2-nistp521": "ECDSA",
+  "sk-ssh-ed25519@openssh.com": "ed25519-sk",
+  "sk-ecdsa-sha2-nistp256@openssh.com": "ECDSA-sk",
+};
+
+/**
+ * Strength order for picking ONE key to show. ed25519 first: it is what modern
+ * sshd offers by default and the shortest fingerprint to compare by eye.
+ */
+const KEY_TYPE_PREFERENCE: readonly string[] = [
+  "ssh-ed25519",
+  "sk-ssh-ed25519@openssh.com",
+  "ecdsa-sha2-nistp256",
+  "ecdsa-sha2-nistp384",
+  "ecdsa-sha2-nistp521",
+  "ssh-rsa",
+];
+
+const BASE64_KEY_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Computes the fingerprint the same way OpenSSH does: base64 of the SHA-256 of
+ * the RAW key blob, with base64 padding stripped.
+ *
+ * It is computed here rather than scraped from `ssh-keygen -l` output because
+ * the digest is the security-relevant value; deriving it ourselves from the blob
+ * means a fingerprint we display and a key we would trust cannot disagree.
+ */
+function fingerprintFromBase64Key(base64Key: string): string {
+  const digest = Crypto.createHash("sha256").update(Buffer.from(base64Key, "base64")).digest();
+  return `SHA256:${digest.toString("base64").replace(/=+$/, "")}`;
+}
+
+/**
+ * Parses `ssh-keyscan` stdout into fingerprints.
+ *
+ * Lines are `host keytype base64blob`. Comment lines (`#`, which is where
+ * ssh-keyscan puts the server's banner) are skipped, and anything that is not a
+ * recognised key type with a well-formed base64 blob is dropped rather than
+ * guessed at — a malformed line must not become a fingerprint a user then
+ * "verifies".
+ */
+export function parseHostKeyFingerprints(stdout: string): readonly HostKeyFingerprint[] {
+  const seen = new Set<string>();
+  const results: HostKeyFingerprint[] = [];
+
+  for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 3) continue;
+    const [, keyType, base64Key] = parts as [string, string, string];
+    if (!(keyType in KEY_TYPE_DISPLAY)) continue;
+    if (!BASE64_KEY_PATTERN.test(base64Key)) continue;
+    if (seen.has(keyType)) continue;
+    seen.add(keyType);
+    results.push({
+      keyType,
+      displayType: KEY_TYPE_DISPLAY[keyType] as string,
+      fingerprint: fingerprintFromBase64Key(base64Key),
+    });
+  }
+
+  return results;
+}
+
+/** The single key to show the user, or undefined when the scan yielded none. */
+export function preferredHostKey(
+  fingerprints: readonly HostKeyFingerprint[],
+): HostKeyFingerprint | undefined {
+  for (const keyType of KEY_TYPE_PREFERENCE) {
+    const match = fingerprints.find((entry) => entry.keyType === keyType);
+    if (match) return match;
+  }
+  return fingerprints[0];
+}

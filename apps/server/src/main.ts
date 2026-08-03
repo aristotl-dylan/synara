@@ -19,16 +19,17 @@ import {
 import {
   DEFAULT_PORT,
   deriveServerPaths,
-  normalizeHttpsPublicOrigin,
   preparePrivateServerPaths,
-  remoteAccessPolicyError,
   resolveCanonicalWorkspaceRoots,
   resolveStaticDir,
   ServerConfig,
   type RuntimeMode,
   type ServerConfigShape,
 } from "./config";
+import { AUTH_TOKEN_FILE_ENV, AuthTokenFileError, resolveAuthToken } from "./authTokenFile";
+import { ENVIRONMENT_ID_FILE_ENV } from "./provisioningIdentity";
 import { fixPath, resolveBaseDir } from "./os-jank";
+import { normalizeHttpsPublicOrigin, remoteAccessPolicyError } from "./remoteAccessPolicy";
 import { Open } from "./open";
 import { ServerAuth } from "./auth/Services/ServerAuth";
 import * as SqlitePersistence from "./persistence/Layers/Sqlite";
@@ -41,7 +42,7 @@ import { ProviderRuntimeReconcilerLive } from "./provider/Layers/ProviderRuntime
 import { Server } from "./effectServer";
 import { ServerLoggerLive } from "./serverLogger";
 import { ServerSettingsService } from "./serverSettings";
-import { formatHostForUrl, isLoopbackHost, isWildcardHost } from "./startupAccess";
+import { formatHostForUrl, isLoopbackHost, isWildcardHost, resolveBindHost } from "./startupAccess";
 import { AnalyticsServiceLayerLive } from "./telemetry/Layers/AnalyticsService";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
@@ -87,6 +88,7 @@ interface CliInput {
   readonly allowInsecureRemote: BooleanFlagInput;
   readonly noBrowser: BooleanFlagInput;
   readonly authToken: Option.Option<string>;
+  readonly authTokenFile: Option.Option<string>;
   readonly autoBootstrapProjectFromCwd: BooleanFlagInput;
   readonly logProviderEvents: BooleanFlagInput;
   readonly logWebSocketEvents: BooleanFlagInput;
@@ -156,6 +158,14 @@ const CliEnvConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  authTokenFile: Config.string(AUTH_TOKEN_FILE_ENV).pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  environmentIdFile: Config.string(ENVIRONMENT_ID_FILE_ENV).pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   desktopShutdownToken: Config.string("SYNARA_DESKTOP_SHUTDOWN_TOKEN").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -218,13 +228,48 @@ const ServerConfigLive = (input: CliInput) =>
       const baseDir = yield* resolveBaseDir(configuredHome);
       const userHomeDir = OS.homedir();
       const derivedPaths = yield* deriveServerPaths(baseDir, devUrl);
+      // A provisioned environment id OVERRIDES the derived path. The default
+      // generates an id when the file is missing, which for a remote install
+      // would mean inventing one and then failing the broker's handshake
+      // against the id bootstrap actually wrote.
+      const environmentIdPath =
+        env.environmentIdFile !== undefined && env.environmentIdFile.trim().length > 0
+          ? env.environmentIdFile.trim()
+          : derivedPaths.environmentIdPath;
       yield* Effect.try({
         try: () => preparePrivateServerPaths(derivedPaths),
         catch: (cause) =>
           new StartupError({ message: "Failed to secure Synara's local state directory", cause }),
       });
       const noBrowser = resolveBooleanConfig(input.noBrowser, env.noBrowser, mode === "desktop");
-      const authToken = Option.getOrUndefined(input.authToken) ?? env.authToken;
+      // A credential FILE beats the environment: the supervisor unit sets the
+      // file, and a stale SYNARA_AUTH_TOKEN in an operator's shell must never
+      // win over the credential the broker provisioned and will present.
+      //
+      // Whichever source wins is then normalized, because three call sites
+      // disagree otherwise: the startup gate tests `!authToken?.trim()` while
+      // enforcement and the legacy query-token check test the raw value. A
+      // whitespace-only token would be absent to the gate (so startup succeeds
+      // and no pairing link is printed) but present to enforcement (so every
+      // request needs a session) — a loopback user locked out with no recovery
+      // path by a stray space in a .env or a file the supervisor wrote empty.
+      // A token that is only whitespace is no token, everywhere.
+      const authToken =
+        (yield* Effect.try({
+          try: () =>
+            resolveAuthToken({
+              authToken: Option.getOrUndefined(input.authToken) ?? env.authToken,
+              authTokenFile: Option.getOrUndefined(input.authTokenFile) ?? env.authTokenFile,
+            }),
+          catch: (cause) =>
+            new StartupError({
+              message:
+                cause instanceof AuthTokenFileError
+                  ? cause.message
+                  : `Failed to read the ${AUTH_TOKEN_FILE_ENV} credential`,
+              cause,
+            }),
+        }))?.trim() || undefined;
       const desktopShutdownToken = env.desktopShutdownToken ?? liveProcessDesktopShutdownToken;
       const autoBootstrapProjectFromCwd = resolveBooleanConfig(
         input.autoBootstrapProjectFromCwd,
@@ -249,7 +294,10 @@ const ServerConfigLive = (input: CliInput) =>
       // Omitting Node's host listens on an unspecified address, which exposes
       // the server beyond the local machine on common platforms. Keep every
       // mode loopback-only unless remote access is explicit and authenticated.
-      const host = Option.getOrUndefined(input.host) ?? env.host ?? "127.0.0.1";
+      // Resolved through resolveBindHost so a blank SYNARA_HOST/--host becomes
+      // the wildcard it actually binds as, rather than a value the policy gate
+      // would mistake for loopback.
+      const host = resolveBindHost(Option.getOrUndefined(input.host) ?? env.host);
       const remotePolicyError = remoteAccessPolicyError({
         host,
         authToken,
@@ -276,6 +324,7 @@ const ServerConfigLive = (input: CliInput) =>
         host,
         baseDir,
         ...derivedPaths,
+        environmentIdPath,
         staticDir,
         devUrl,
         publicUrl,
@@ -504,6 +553,12 @@ const authTokenFlag = Flag.string("auth-token").pipe(
   Flag.withAlias("token"),
   Flag.optional,
 );
+const authTokenFileFlag = Flag.string("auth-token-file").pipe(
+  Flag.withDescription(
+    `Path to a file containing the auth token (equivalent to ${AUTH_TOKEN_FILE_ENV}). Takes precedence over --auth-token; keeps the credential out of the process environment.`,
+  ),
+  Flag.optional,
+);
 const autoBootstrapProjectFromCwdFlag = optionalBooleanFlag("auto-bootstrap-project-from-cwd", {
   description: "Create a project for the current working directory on startup when missing.",
 });
@@ -539,6 +594,7 @@ const baseServerCommand = Command.make("synara", {
   allowInsecureRemote: allowInsecureRemoteFlag,
   noBrowser: noBrowserFlag,
   authToken: authTokenFlag,
+  authTokenFile: authTokenFileFlag,
   autoBootstrapProjectFromCwd: autoBootstrapProjectFromCwdFlag,
   logProviderEvents: logProviderEventsFlag,
   logWebSocketEvents: logWebSocketEventsFlag,

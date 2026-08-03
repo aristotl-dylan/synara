@@ -71,7 +71,11 @@ import {
   CodexJsonlFramer,
   CodexJsonlWriter,
 } from "./codexAppServerTransport.ts";
-import { buildCodexTurnInput, type CodexTurnInputItem } from "./codexTurnInput.ts";
+import {
+  buildCodexTurnInput,
+  type CodexImageInputItem,
+  type CodexTurnInputItem,
+} from "./codexTurnInput.ts";
 import {
   parseCodexModelListResponse,
   parseCodexPluginListResponse,
@@ -248,7 +252,7 @@ interface CodexVoiceTranscriptionAuthContext {
 export interface CodexAppServerSendTurnInput {
   readonly threadId: ThreadId;
   readonly input?: string;
-  readonly attachments?: ReadonlyArray<{ type: "image"; url: string }>;
+  readonly attachments?: ReadonlyArray<CodexImageInputItem>;
   readonly skills?: ReadonlyArray<ProviderSkillReference>;
   readonly mentions?: ReadonlyArray<ProviderMentionReference>;
   readonly model?: string;
@@ -415,7 +419,7 @@ const CODEX_BROWSER_TOOL_ROUTING_INSTRUCTIONS = `
 
 ## Browser tool routing
 
-Prefer Synara's built-in visible browser for browser work. In code mode, call its MCP methods directly inside \`functions.exec\` with the exact \`tools.mcp__synara__browser_*\` prefix (for example, \`await tools.mcp__synara__browser_open({ url })\` and \`await tools.mcp__synara__browser_snapshot({})\`). The available suffixes are ${BROWSER_TOOL_NAMES.map((name) => `\`${name.slice("browser_".length)}\``).join(", ")}.
+Prefer Synara's built-in browser for browser work. It may continue in the background without changing the user's active chat. In code mode, call its MCP methods directly inside \`functions.exec\` with the exact \`tools.mcp__synara__browser_*\` prefix (for example, \`await tools.mcp__synara__browser_open({ url })\` and \`await tools.mcp__synara__browser_snapshot({})\`). The available suffixes are ${BROWSER_TOOL_NAMES.map((name) => `\`${name.slice("browser_".length)}\``).join(", ")}.
 
 For element actions, keep the \`snapshotId\` returned by the fresh snapshot and use the exact shapes \`browser_type({ target: { ref, snapshotId }, text })\`, \`browser_click({ target: { ref, snapshotId } })\`, and \`browser_press({ keys: ["Enter"] })\`. Wait for observable changes with \`browser_wait({ conditions: [{ kind: "url", glob: "*expected*" }] })\` or another published condition. Never pass a bare \`ref\` without its \`snapshotId\`.
 

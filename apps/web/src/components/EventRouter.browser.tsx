@@ -32,8 +32,14 @@ const threadSnapshotFailureListeners = vi.hoisted(
     >(),
 );
 
-vi.mock("../wsNativeApi", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../wsNativeApi")>();
+// `__root` subscribes through the environment registry, not `wsNativeApi`
+// directly — the registry became the entry point when the transport layer was
+// keyed by environment (#16), and this mock kept pointing at the old module.
+// A mock that misses its target is silent: the listener set stayed empty, the
+// resubscribe under test could never fire, and the assertion read as a missing
+// request rather than as an unwired mock.
+vi.mock("../wsEnvironmentRegistry", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../wsEnvironmentRegistry")>();
   return {
     ...actual,
     onThreadStreamFailure: (
@@ -48,6 +54,8 @@ vi.mock("../wsNativeApi", async (importOriginal) => {
 import { useComposerDraftStore } from "../composerDraftStore";
 import { getRouter } from "../router";
 import { useStore } from "../store";
+import { LOCAL_ENVIRONMENT_ID } from "../environmentIdentity";
+import { updateEnvironment } from "../storeAggregation";
 import {
   createShellSnapshotFromReadModel,
   flattenEffectRpcRequestPayload,
@@ -60,7 +68,7 @@ import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test
 import { getThreadFromState } from "../threadDerivation";
 import { resetThreadDetailResumeCursorsForTests } from "../threadDetailResumeCursors";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
-import { resetWsNativeApiForTest } from "../wsNativeApi";
+import { resetWsEnvironmentRegistry } from "../wsEnvironmentRegistry";
 
 const THREAD_ID = ThreadId.makeUnsafe("thread-root-browser-test");
 const OTHER_THREAD_ID = ThreadId.makeUnsafe("thread-other-browser-test");
@@ -288,9 +296,20 @@ const worker = setupWorker(
         });
         return;
       }
+      // Subscriptions this fixture holds open without ever sending a chunk.
+      //
+      // The list must cover EVERY subscription the app opens. A missing one
+      // falls through to the catch-all below, which answers a stream request
+      // with `{}` — the stream fails its schema, and the transport treats any
+      // non-admission stream failure as a dead socket and reconnects the WHOLE
+      // client. Every other stream is interrupted and restarted on a ~1s loop,
+      // which resets `nextThreadProjectionReconcileAtById` on each new snapshot
+      // and starves the projection reconcile that four tests here wait on.
+      // Nothing reports an error; the suite just times out somewhere else.
       if (
         method === WS_METHODS.subscribeServerProviderStatuses ||
         method === WS_METHODS.subscribeServerSettings ||
+        method === WS_METHODS.subscribeRemoteEnvironmentStatuses ||
         method === WS_METHODS.subscribeTerminalEvents ||
         method === WS_METHODS.subscribeOrchestrationDomainEvents ||
         method === WS_METHODS.subscribeProjectDevServerEvents ||
@@ -449,12 +468,12 @@ describe("EventRouter scoped orchestration sync", () => {
   });
 
   afterAll(async () => {
-    await resetWsNativeApiForTest();
+    await resetWsEnvironmentRegistry();
     await worker.stop();
   });
 
   beforeEach(async () => {
-    await resetWsNativeApiForTest();
+    await resetWsEnvironmentRegistry();
     threadSnapshotFailureListeners.clear();
     fixture = buildFixture();
     document.body.innerHTML = "";
@@ -469,23 +488,37 @@ describe("EventRouter scoped orchestration sync", () => {
       draftThreadsByThreadId: {},
       projectDraftThreadIdByProjectId: {},
     });
-    useStore.setState({
-      projects: [],
-      threadIds: [],
-      threadShellById: {},
-      threadSessionById: {},
-      threadTurnStateById: {},
-      messageIdsByThreadId: {},
-      messageByThreadId: {},
-      activityIdsByThreadId: {},
-      activityByThreadId: {},
-      proposedPlanIdsByThreadId: {},
-      proposedPlanByThreadId: {},
-      turnDiffIdsByThreadId: {},
-      turnDiffSummaryByThreadId: {},
-      sidebarThreadSummaryById: {},
-      threadsHydrated: false,
-    });
+    // The snapshot fence must fall with the state it guards. Left behind, it
+    // carries a high-water mark from an earlier file into this one and every
+    // fixture snapshot here is rejected as stale, so the store never hydrates
+    // and the assertions below wait on UI that cannot appear.
+    //
+    // Deliberately NOT a wholesale `initialState` reset: this suite's fixtures
+    // rely on `threadDetailSyncById` surviving between mounts, and clearing it
+    // changes what the draft-promotion resubscribe path observes. Reset the
+    // rows and the fence, and leave the detail-sync bookkeeping alone.
+    useStore.setState((state) =>
+      updateEnvironment(state, LOCAL_ENVIRONMENT_ID, (environment) => ({
+        ...environment,
+        shellSnapshotSequence: 0,
+        threadsHydrated: false,
+        spaces: [],
+        projects: [],
+        threadIds: [],
+        threadShellById: {},
+        threadSessionById: {},
+        threadTurnStateById: {},
+        messageIdsByThreadId: {},
+        messageByThreadId: {},
+        activityIdsByThreadId: {},
+        activityByThreadId: {},
+        proposedPlanIdsByThreadId: {},
+        proposedPlanByThreadId: {},
+        turnDiffIdsByThreadId: {},
+        turnDiffSummaryByThreadId: {},
+        sidebarThreadSummaryById: {},
+      })),
+    );
     useWorkspacePathsStore.setState({
       homeDir: null,
       chatWorkspaceRoot: null,
