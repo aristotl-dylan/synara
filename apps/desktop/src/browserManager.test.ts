@@ -183,8 +183,12 @@ describe("DesktopBrowserManager repeated workflow characterization", () => {
       activeTabId: tabId,
       tabs: [{ id: tabId, status: "suspended", isLoading: false }],
     });
+    // The runtime for a destroyed guest is refused. This tracks browserManager's
+    // wording for a live tab whose page is gone — distinct from "tab is not
+    // available" (no such tab) and "not the visible tab" (wrong tab), which are
+    // the two refusals immediately preceding it.
     expect(() => manager.getVisibleAutomationRuntime({ threadId: THREAD_ID, tabId })).toThrow(
-      /has not attached yet/i,
+      /page is not ready/i,
     );
 
     // A duplicate terminal signal for the same physical guest must not publish
