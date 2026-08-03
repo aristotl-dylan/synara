@@ -56,6 +56,7 @@ describe("stopDetachedHost", () => {
     let alive = true;
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill: (pid, signal) => {
         kill(pid, signal);
         alive = false;
@@ -64,7 +65,7 @@ describe("stopDetachedHost", () => {
       sleep: noSleep,
       currentPid: 1,
     });
-    expect(outcome).toEqual({ kind: "stopped", pid: 4242, forced: false });
+    expect(outcome).toMatchObject({ kind: "stopped", pid: 4242, forced: false });
     // SIGTERM lets the server run its finalizers: flush the journal,
     // terminalize open turns, remove its own record.
     expect(kill).toHaveBeenCalledExactlyOnceWith(4242, "SIGTERM");
@@ -76,6 +77,7 @@ describe("stopDetachedHost", () => {
     let alive = true;
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill: (_pid, signal) => {
         signals.push(signal);
         if (signal === "SIGKILL") alive = false;
@@ -85,7 +87,7 @@ describe("stopDetachedHost", () => {
       gracefulTimeoutMs: 300,
       currentPid: 1,
     });
-    expect(outcome).toEqual({ kind: "stopped", pid: 4242, forced: true });
+    expect(outcome).toMatchObject({ kind: "stopped", pid: 4242, forced: true });
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
@@ -97,6 +99,7 @@ describe("stopDetachedHost", () => {
     let polls = 0;
     await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill: (_pid, signal) => signals.push(signal),
       isAlive: () => {
         polls += 1;
@@ -113,6 +116,7 @@ describe("stopDetachedHost", () => {
     writeRecord(4242);
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill: () => undefined,
       isAlive: () => true,
       sleep: noSleep,
@@ -133,6 +137,7 @@ describe("stopDetachedHost", () => {
     writeRecord(4242);
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill: () => {
         const error = new Error("operation not permitted") as NodeJS.ErrnoException;
         error.code = "EPERM";
@@ -153,6 +158,7 @@ describe("stopDetachedHost", () => {
     writeRecord(4242);
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill: () => {
         const error = new Error("no such process") as NodeJS.ErrnoException;
         error.code = "ESRCH";
@@ -170,6 +176,7 @@ describe("stopDetachedHost", () => {
     const kill = vi.fn();
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       kill,
       isAlive: () => true,
       sleep: noSleep,
@@ -179,6 +186,133 @@ describe("stopDetachedHost", () => {
       reason: "the recorded host is this process",
     });
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+describe("stopDetachedHost draining", () => {
+  it("waits for running turns to reach zero before signalling", async () => {
+    writeRecord(4242);
+    const counts = [2, 2, 1, 0];
+    let read = 0;
+    const signals: string[] = [];
+    let alive = true;
+    const outcome = await stopDetachedHost({
+      recordPath,
+      currentPid: 1,
+      readActiveTurns: async () => counts[Math.min(read++, counts.length - 1)] ?? 0,
+      drainPollIntervalMs: 10,
+      drainTimeoutMs: 10_000,
+      kill: (_pid, signal) => {
+        signals.push(signal);
+        alive = false;
+      },
+      isAlive: () => alive,
+      sleep: noSleep,
+    });
+    // No signal until the count drained: the turn is the user's work.
+    expect(signals[0]).toBe("SIGTERM");
+    expect(outcome).toMatchObject({ kind: "stopped", forced: false });
+    if (outcome.kind === "stopped") {
+      expect(outcome.drain?.drained).toBe(true);
+      expect(outcome.drain?.lastRunningTurns).toBe(0);
+    }
+    // Read once per poll until zero: 2, 2, 1, 0.
+    expect(read).toBe(4);
+  });
+
+  it("gives up draining at the deadline and stops anyway", async () => {
+    // A wedged turn that never finishes must not block the update forever.
+    writeRecord(4242);
+    let alive = true;
+    const outcome = await stopDetachedHost({
+      recordPath,
+      currentPid: 1,
+      readActiveTurns: async () => 1, // never drains
+      drainPollIntervalMs: 100,
+      drainTimeoutMs: 300,
+      kill: () => {
+        alive = false;
+      },
+      isAlive: () => alive,
+      sleep: noSleep,
+    });
+    expect(outcome).toMatchObject({ kind: "stopped" });
+    if (outcome.kind === "stopped") {
+      expect(outcome.drain?.drained).toBe(false);
+      expect(outcome.drain?.lastRunningTurns).toBe(1);
+      expect(outcome.drain?.waitedMs).toBeGreaterThanOrEqual(300);
+    }
+  });
+
+  it("does not block when the count is unknown", async () => {
+    // A host that will not report a count (null) must not hang the update —
+    // hanging on 'unknown' is worse than an interrupted turn.
+    writeRecord(4242);
+    let alive = true;
+    let reads = 0;
+    const outcome = await stopDetachedHost({
+      recordPath,
+      currentPid: 1,
+      readActiveTurns: async () => {
+        reads += 1;
+        return null;
+      },
+      drainTimeoutMs: 10_000,
+      kill: () => {
+        alive = false;
+      },
+      isAlive: () => alive,
+      sleep: noSleep,
+    });
+    expect(outcome).toMatchObject({ kind: "stopped" });
+    if (outcome.kind === "stopped") {
+      expect(outcome.drain?.drained).toBe(false);
+      expect(outcome.drain?.lastRunningTurns).toBeNull();
+      expect(outcome.drain?.waitedMs).toBe(0);
+    }
+    // Read exactly once — a null result ends the wait immediately.
+    expect(reads).toBe(1);
+  });
+
+  it("does not wait when no turn is running", async () => {
+    writeRecord(4242);
+    let alive = true;
+    const outcome = await stopDetachedHost({
+      recordPath,
+      currentPid: 1,
+      readActiveTurns: async () => 0,
+      drainTimeoutMs: 10_000,
+      kill: () => {
+        alive = false;
+      },
+      isAlive: () => alive,
+      sleep: noSleep,
+    });
+    if (outcome.kind === "stopped") {
+      expect(outcome.drain?.drained).toBe(true);
+      expect(outcome.drain?.waitedMs).toBe(0);
+    }
+  });
+
+  it("reads activeTurns from the recorded origin's /health by default", async () => {
+    writeRecord(4242);
+    const calls: string[] = [];
+    let alive = true;
+    await stopDetachedHost({
+      recordPath,
+      currentPid: 1,
+      fetchImplementation: (async (url: string) => {
+        calls.push(url);
+        return new Response(JSON.stringify({ activeTurns: 0 }), { status: 200 });
+      }) as unknown as typeof fetch,
+      kill: () => {
+        alive = false;
+      },
+      isAlive: () => alive,
+      sleep: noSleep,
+    });
+    // The record written by writeRecord uses origin http://127.0.0.1:21987.
+    expect(calls[0]).toBe("http://127.0.0.1:21987/health");
   });
 });
 
@@ -210,11 +344,12 @@ describe("stopping a real detached process", () => {
 
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       currentPid: process.pid,
       gracefulTimeoutMs: 8_000,
     });
 
-    expect(outcome).toEqual({ kind: "stopped", pid, forced: false });
+    expect(outcome).toMatchObject({ kind: "stopped", pid, forced: false });
     // Confirmed against the OS, not inferred from the return value.
     expect(() => process.kill(pid!, 0)).toThrow();
   }, 20_000);
@@ -247,12 +382,13 @@ describe("stopping a real detached process", () => {
 
     const outcome = await stopDetachedHost({
       recordPath,
+      readActiveTurns: async () => 0,
       currentPid: process.pid,
       gracefulTimeoutMs: 1_000,
       forceTimeoutMs: 5_000,
     });
 
-    expect(outcome).toEqual({ kind: "stopped", pid, forced: true });
+    expect(outcome).toMatchObject({ kind: "stopped", pid, forced: true });
     expect(() => process.kill(pid!, 0)).toThrow();
   }, 20_000);
 });

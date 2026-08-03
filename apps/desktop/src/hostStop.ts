@@ -18,8 +18,21 @@
 
 import { isProcessAlive, readHostRuntimeRecord } from "./hostRuntimeRecord";
 
+export interface StopDrainResult {
+  /** True when the count reached zero before the deadline. */
+  readonly drained: boolean;
+  /** Last count read; null when the host did not report one (unknown). */
+  readonly lastRunningTurns: number | null;
+  readonly waitedMs: number;
+}
+
 export type StopHostOutcome =
-  | { readonly kind: "stopped"; readonly pid: number; readonly forced: boolean }
+  | {
+      readonly kind: "stopped";
+      readonly pid: number;
+      readonly forced: boolean;
+      readonly drain?: StopDrainResult;
+    }
   | { readonly kind: "not-running" }
   | { readonly kind: "refused"; readonly reason: string }
   | { readonly kind: "failed"; readonly pid: number; readonly reason: string };
@@ -30,6 +43,22 @@ export interface StopDetachedHostInput {
   readonly currentPid?: number;
   readonly gracefulTimeoutMs?: number;
   readonly forceTimeoutMs?: number;
+  /**
+   * How long to wait for running turns to finish before signalling. A turn in
+   * flight is the user's work; stopping without waiting kills it. The wait is
+   * bounded — a wedged turn must not block an update forever — and the SIGTERM
+   * that follows lets the server terminalize whatever is still open.
+   */
+  readonly drainTimeoutMs?: number;
+  readonly drainPollIntervalMs?: number;
+  /**
+   * Reads the host's running-turn count, or null when it cannot be determined.
+   * Defaults to polling `<origin>/health` and reading `activeTurns`. A null
+   * count means "unknown" and does NOT block — we cannot wait on a number we
+   * cannot read, and hanging would be worse than an interrupted turn.
+   */
+  readonly readActiveTurns?: () => Promise<number | null>;
+  readonly fetchImplementation?: typeof fetch;
   /** Test seams. */
   readonly kill?: (pid: number, signal: NodeJS.Signals) => void;
   readonly isAlive?: (pid: number) => boolean;
@@ -38,7 +67,52 @@ export interface StopDetachedHostInput {
 
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 10_000;
 const DEFAULT_FORCE_TIMEOUT_MS = 5_000;
+const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+const DEFAULT_DRAIN_POLL_INTERVAL_MS = 500;
 const POLL_INTERVAL_MS = 100;
+
+/** Reads `activeTurns` from `<origin>/health`; null on any failure or absence. */
+async function fetchActiveTurns(
+  origin: string,
+  fetchImplementation: typeof fetch,
+): Promise<number | null> {
+  try {
+    const response = await fetchImplementation(`${origin}/health`);
+    if (!response.ok) return null;
+    const body = (await response.json()) as { activeTurns?: unknown };
+    return typeof body.activeTurns === "number" ? body.activeTurns : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Waits for the running-turn count to reach zero, bounded by a deadline.
+ *
+ * A null read is treated as zero for the purpose of continuing: we cannot wait
+ * on a count the host will not report, and blocking on "unknown" would hang the
+ * update indefinitely. The bound is the other guard — a genuinely stuck turn
+ * drains-out at the deadline and the stop proceeds anyway.
+ */
+async function drainRunningTurns(input: {
+  readonly read: () => Promise<number | null>;
+  readonly timeoutMs: number;
+  readonly pollMs: number;
+  readonly sleep: (ms: number) => Promise<void>;
+}): Promise<StopDrainResult> {
+  let waited = 0;
+  let last = await input.read();
+  while ((last ?? 0) > 0 && waited < input.timeoutMs) {
+    await input.sleep(input.pollMs);
+    waited += input.pollMs;
+    last = await input.read();
+  }
+  // `drained` is a CONFIRMATION of zero, so null (unknown) is not drained even
+  // though a null does not block the loop. The loop uses `?? 0` to avoid waiting
+  // on a count it cannot read; this uses strict equality to avoid claiming a
+  // drain it never observed.
+  return { drained: last === 0, lastRunningTurns: last, waitedMs: waited };
+}
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -73,22 +147,22 @@ async function waitForExit(input: {
  * either way — but left the record behind pointing at a dead pid. That stale
  * record is what the next launch then has to recognise and reject.
  *
- * SIGKILL only after the graceful window. A host mid-turn can legitimately take
- * seconds to drain, and killing it early converts an orderly update into the
- * crash path.
+ * It drains first. Before signalling, it waits for the host's running-turn
+ * count (polled from `<origin>/health`, field `activeTurns`) to reach zero,
+ * bounded by `drainTimeoutMs`. A turn in flight is the user's work; stopping
+ * without waiting kills it. This mirrors `evaluateUpgradeGate` in
+ * remoteBootstrap, which refuses to swap while `activeTurnCount > 0` — the same
+ * rule the remote path already follows, now available to the local one because
+ * the server reports the count.
  *
- * NOT a drain. The window is a fixed timeout, not a wait for turns to finish:
- * the local server exposes no active-turn count, so there is nothing to ask.
- * `evaluateUpgradeGate` in remoteBootstrap/remoteUpgradePolicy.ts does exactly
- * this job for remote upgrades — it refuses to swap while `activeTurnCount > 0`
- * — but it is fed by the remote handshake, and no equivalent exists here.
+ * The drain is bounded and degrades safely. A wedged turn drains-out at the
+ * deadline and the stop proceeds; a host that will not report a count (null)
+ * does not block at all, because hanging on "unknown" is worse than an
+ * interrupted turn. Whatever is still open when SIGTERM lands is terminalized
+ * by the server's finalizers rather than lost.
  *
- * The consequence, stated plainly because the timeout hides it: an update
- * started during a long turn kills that turn once the window elapses. The turn
- * is terminalized by the server's own finalizers rather than lost, so this is
- * an interrupted turn and not a corrupt database. Closing the gap needs the
- * server to report its active-turn count — a route this stop path can poll —
- * which is server-side work outside this change.
+ * SIGTERM before SIGKILL, SIGKILL only after the graceful window, for the
+ * reasons above.
  */
 export async function stopDetachedHost(input: StopDetachedHostInput): Promise<StopHostOutcome> {
   const kill = input.kill ?? ((pid, signal) => process.kill(pid, signal));
@@ -110,6 +184,18 @@ export async function stopDetachedHost(input: StopDetachedHostInput): Promise<St
     // proceed.
     return { kind: "not-running" };
   }
+
+  // Wait for in-flight turns to finish before signalling. Read from the seam if
+  // given, else poll the recorded origin's /health.
+  const fetchImplementation = input.fetchImplementation ?? fetch;
+  const read =
+    input.readActiveTurns ?? (() => fetchActiveTurns(record.origin, fetchImplementation));
+  const drain = await drainRunningTurns({
+    read,
+    timeoutMs: input.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS,
+    pollMs: input.drainPollIntervalMs ?? DEFAULT_DRAIN_POLL_INTERVAL_MS,
+    sleep,
+  });
 
   try {
     kill(record.pid, "SIGTERM");
@@ -133,14 +219,14 @@ export async function stopDetachedHost(input: StopDetachedHostInput): Promise<St
       sleep,
     })
   ) {
-    return { kind: "stopped", pid: record.pid, forced: false };
+    return { kind: "stopped", pid: record.pid, forced: false, drain };
   }
 
   try {
     kill(record.pid, "SIGKILL");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return { kind: "stopped", pid: record.pid, forced: true };
+    if (code === "ESRCH") return { kind: "stopped", pid: record.pid, forced: true, drain };
     return {
       kind: "failed",
       pid: record.pid,
@@ -156,7 +242,7 @@ export async function stopDetachedHost(input: StopDetachedHostInput): Promise<St
       sleep,
     })
   ) {
-    return { kind: "stopped", pid: record.pid, forced: true };
+    return { kind: "stopped", pid: record.pid, forced: true, drain };
   }
 
   // Reported rather than assumed: a host that survives SIGKILL is wedged in

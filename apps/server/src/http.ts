@@ -59,6 +59,7 @@ import {
   reserveManagedAttachmentUpload,
 } from "./managedAttachmentStore";
 import { ManagedAttachmentRepository } from "./persistence/Services/ManagedAttachments";
+import { ProjectionTurnRepository } from "./persistence/Services/ProjectionTurns";
 import {
   authorizeDesktopShutdown,
   DESKTOP_SHUTDOWN_ROUTE_PATH,
@@ -282,21 +283,29 @@ export function makeHealthEffectRouteLayer(readiness: ServerReadiness) {
   return HttpRouter.add(
     "GET",
     "/health",
-    readiness.getSnapshot.pipe(
-      Effect.map((snapshot) =>
-        HttpServerResponse.jsonUnsafe(
-          {
-            status: "ok",
-            startupReady: snapshot.startupReady,
-            pushBusReady: snapshot.pushBusReady,
-            keybindingsReady: snapshot.keybindingsReady,
-            terminalSubscriptionsReady: snapshot.terminalSubscriptionsReady,
-            orchestrationSubscriptionsReady: snapshot.orchestrationSubscriptionsReady,
-          },
-          { status: 200 },
-        ),
-      ),
-    ),
+    Effect.gen(function* () {
+      const snapshot = yield* readiness.getSnapshot;
+      // Best-effort. /health is the readiness probe and must answer even when
+      // the database is unavailable, so a failed count degrades to null rather
+      // than failing the route. A host draining before an update treats null as
+      // "unknown — do not assume drained", so the safe behaviour is preserved.
+      const repository = yield* ProjectionTurnRepository;
+      const activeTurns = yield* repository
+        .countRunningTurns()
+        .pipe(Effect.orElseSucceed(() => null));
+      return HttpServerResponse.jsonUnsafe(
+        {
+          status: "ok",
+          startupReady: snapshot.startupReady,
+          pushBusReady: snapshot.pushBusReady,
+          keybindingsReady: snapshot.keybindingsReady,
+          terminalSubscriptionsReady: snapshot.terminalSubscriptionsReady,
+          orchestrationSubscriptionsReady: snapshot.orchestrationSubscriptionsReady,
+          activeTurns,
+        },
+        { status: 200 },
+      );
+    }),
   );
 }
 

@@ -10,6 +10,7 @@ import { HttpRouter } from "effect/unstable/http";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
+import { ProjectionTurnRepository } from "./persistence/Services/ProjectionTurns";
 import {
   resolveDefaultChatWorkspaceRoot,
   resolveDefaultStudioWorkspaceRoot,
@@ -111,6 +112,23 @@ const projectFaviconResolver: ProjectFaviconResolverShape = {
   resolvePath: () => Effect.succeed(null),
 };
 
+// The health route reports a running-turn count for the update-drain signal.
+// Only that one method is exercised here; the rest die so a stray call is loud.
+const runningTurnCount = { value: 0 };
+const projectionTurnRepositoryStub = ProjectionTurnRepository.of(
+  new Proxy(
+    {
+      countRunningTurns: () => Effect.succeed(runningTurnCount.value),
+    },
+    {
+      get(target, prop, receiver) {
+        if (prop in target) return Reflect.get(target, prop, receiver);
+        return () => Effect.die(`ProjectionTurnRepository.${String(prop)} not stubbed`);
+      },
+    },
+  ) as never,
+);
+
 type TestedRoute =
   | { readonly kind: "health"; readonly readiness: typeof readiness }
   | { readonly kind: "shutdown"; readonly controller: ServerShutdownController }
@@ -177,6 +195,7 @@ async function withEffectServer(
               Layer.succeed(ServerConfig, config),
               Layer.succeed(ServerAuth, serverAuth),
               Layer.succeed(ProjectFaviconResolver, projectFaviconResolver),
+              Layer.succeed(ProjectionTurnRepository, projectionTurnRepositoryStub),
               NodeHttpServer.layerHttpServices,
             ),
           ),
@@ -225,6 +244,20 @@ describe("production Effect HTTP routes", () => {
         pushBusReady: true,
       });
     });
+  });
+
+  it("reports the running-turn count for the update-drain signal", async () => {
+    runningTurnCount.value = 3;
+    try {
+      await withEffectServer(makeConfig(), { kind: "health", readiness }, async (origin) => {
+        const payload = (await (await fetch(`${origin}/health`)).json()) as {
+          activeTurns: number;
+        };
+        expect(payload.activeTurns).toBe(3);
+      });
+    } finally {
+      runningTurnCount.value = 0;
+    }
   });
 
   it("accepts and idempotently replays the dedicated desktop shutdown request", async () => {
