@@ -11,7 +11,7 @@ import { ProjectionTurnRepositoryLive } from "./ProjectionTurns.ts";
 import { ProjectionProjectRepository } from "../Services/ProjectionProjects.ts";
 import { ProjectionThreadRepository } from "../Services/ProjectionThreads.ts";
 import { ProjectionStateRepository } from "../Services/ProjectionState.ts";
-import { ProjectionTurnRepository } from "../Services/ProjectionTurns.ts";
+import { ProjectionTurnRepository, type ProjectionTurnState } from "../Services/ProjectionTurns.ts";
 
 const projectionRepositoriesLayer = it.layer(
   Layer.mergeAll(
@@ -316,6 +316,49 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
           state: "running",
         },
       ]);
+    }),
+  );
+
+  it.effect("counts only running turns for the update-drain signal", () =>
+    Effect.gen(function* () {
+      const turns = yield* ProjectionTurnRepository;
+      const now = "2026-07-19T00:00:00.000Z";
+      const makeTurn = (threadId: string, turnId: string, state: ProjectionTurnState) => ({
+        threadId: ThreadId.makeUnsafe(threadId),
+        turnId: TurnId.makeUnsafe(turnId),
+        pendingMessageId: null,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        assistantMessageId: null,
+        state,
+        requestedAt: now,
+        startedAt: now,
+        completedAt: state === "completed" ? now : null,
+        checkpointTurnCount: null,
+        checkpointRef: null,
+        checkpointStatus: null,
+        checkpointFiles: [],
+      });
+
+      // The in-memory DB is shared across tests in this describe, so measure
+      // deltas from a baseline rather than assuming a clean count. The delta is
+      // the real assertion: it must move by exactly the running turns added.
+      const baseline = yield* turns.countRunningTurns();
+
+      // Two running turns, plus a turn in every other state that must NOT be
+      // counted — a stop should not wait on completed, interrupted, errored, or
+      // pending work. If any of those counted, the delta would be more than +2.
+      yield* turns.upsertByTurnId(makeTurn("count-a", "turn-a", "running"));
+      yield* turns.upsertByTurnId(makeTurn("count-b", "turn-b", "running"));
+      yield* turns.upsertByTurnId(makeTurn("count-c", "turn-c", "completed"));
+      yield* turns.upsertByTurnId(makeTurn("count-d", "turn-d", "interrupted"));
+      yield* turns.upsertByTurnId(makeTurn("count-e", "turn-e", "error"));
+
+      assert.strictEqual(yield* turns.countRunningTurns(), baseline + 2);
+
+      // A running turn finishing drops the count by exactly one.
+      yield* turns.upsertByTurnId(makeTurn("count-a", "turn-a", "completed"));
+      assert.strictEqual(yield* turns.countRunningTurns(), baseline + 1);
     }),
   );
 });

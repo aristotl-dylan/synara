@@ -435,6 +435,27 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("ProjectionTurnRepository.deleteByThreadId:query")),
     );
 
+  const countRunningTurnsRow = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ count: Schema.Number }),
+    // turn_id IS NOT NULL excludes the pending-start placeholder rows, which are
+    // the only rows carrying a null turn id; a placeholder is never 'running'
+    // anyway, so this is belt-and-braces against a future state change.
+    execute: () =>
+      sql`
+        SELECT COUNT(*) AS "count"
+        FROM projection_turns
+        WHERE state = 'running'
+          AND turn_id IS NOT NULL
+      `,
+  });
+
+  const countRunningTurns: ProjectionTurnRepositoryShape["countRunningTurns"] = () =>
+    countRunningTurnsRow(undefined).pipe(
+      Effect.mapError(toPersistenceSqlError("ProjectionTurnRepository.countRunningTurns:query")),
+      Effect.map((rows) => rows[0]?.count ?? 0),
+    );
+
   return {
     upsertByTurnId,
     replacePendingTurnStart,
@@ -446,6 +467,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
     getManyWaitSnapshot,
     clearCheckpointTurnConflict,
     deleteByThreadId,
+    countRunningTurns,
   } satisfies ProjectionTurnRepositoryShape;
 });
 

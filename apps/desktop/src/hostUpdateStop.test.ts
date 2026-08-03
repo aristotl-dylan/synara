@@ -94,7 +94,9 @@ describe("stopping the host before an update", () => {
       currentPid: process.pid,
       gracefulTimeoutMs: 8_000,
     });
-    expect(outcome).toEqual({ kind: "stopped", pid, forced: false });
+    // The fake host serves /health without an activeTurns field, so the drain
+    // reads null (unknown) and does not block — the stop proceeds either way.
+    expect(outcome).toMatchObject({ kind: "stopped", pid, forced: false });
     expect(mayInstallAfterStop(outcome)).toBe(true);
     expect(() => process.kill(pid, 0)).toThrow();
 

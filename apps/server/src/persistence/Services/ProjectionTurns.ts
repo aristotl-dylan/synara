@@ -180,6 +180,18 @@ export interface ProjectionTurnRepositoryShape {
   readonly deleteByThreadId: (
     input: DeleteProjectionTurnsByThreadInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /**
+   * Counts turns currently in the `running` state across every thread this
+   * server owns. This is the drain signal a host consults before stopping for
+   * an update: while it is above zero, a turn is actively producing output and
+   * a stop would interrupt it.
+   *
+   * `running` only — not `pending`. A pending-start placeholder is pre-turn work
+   * that may never start, so blocking an update on it could wait forever; a
+   * `running` row is a turn that has actually begun.
+   */
+  readonly countRunningTurns: () => Effect.Effect<number, ProjectionRepositoryError>;
 }
 
 export class ProjectionTurnRepository extends ServiceMap.Service<
