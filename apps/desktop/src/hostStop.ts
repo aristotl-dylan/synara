@@ -63,15 +63,32 @@ async function waitForExit(input: {
 /**
  * Stops the recorded host, SIGTERM first.
  *
- * SIGTERM lets the server run its finalizers: that is what flushes the SQLite
- * journal, terminalizes open turns, and removes the runtime record. Going
- * straight to SIGKILL would leave a record pointing at a dead pid and a
- * database that the next start has to recover — which is survivable, but it is
- * the thing we are able to avoid here and cannot avoid after a crash.
+ * SIGTERM lets the server run its finalizers: terminalize open turns, and
+ * remove its own runtime record.
+ *
+ * The record is the measured difference, not database integrity. Both paths
+ * were run against the real server: SIGTERM cleared the record and left
+ * `PRAGMA integrity_check: ok` with no stray WAL; SIGKILL ALSO left
+ * `integrity_check: ok` — SQLite's WAL is crash-safe, so the database survives
+ * either way — but left the record behind pointing at a dead pid. That stale
+ * record is what the next launch then has to recognise and reject.
  *
  * SIGKILL only after the graceful window. A host mid-turn can legitimately take
  * seconds to drain, and killing it early converts an orderly update into the
  * crash path.
+ *
+ * NOT a drain. The window is a fixed timeout, not a wait for turns to finish:
+ * the local server exposes no active-turn count, so there is nothing to ask.
+ * `evaluateUpgradeGate` in remoteBootstrap/remoteUpgradePolicy.ts does exactly
+ * this job for remote upgrades — it refuses to swap while `activeTurnCount > 0`
+ * — but it is fed by the remote handshake, and no equivalent exists here.
+ *
+ * The consequence, stated plainly because the timeout hides it: an update
+ * started during a long turn kills that turn once the window elapses. The turn
+ * is terminalized by the server's own finalizers rather than lost, so this is
+ * an interrupted turn and not a corrupt database. Closing the gap needs the
+ * server to report its active-turn count — a route this stop path can poll —
+ * which is server-side work outside this change.
  */
 export async function stopDetachedHost(input: StopDetachedHostInput): Promise<StopHostOutcome> {
   const kill = input.kill ?? ((pid, signal) => process.kill(pid, signal));
