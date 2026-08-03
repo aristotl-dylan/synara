@@ -60,23 +60,27 @@ describe("isLoopbackOrigin", () => {
 
 describe("decideHostAdoption", () => {
   it("adopts a live loopback host", () => {
-    expect(
-      decideHostAdoption({ record: record(), processAlive: true, currentPid: 1 }),
-    ).toEqual({ kind: "adopt", origin: "http://127.0.0.1:8765", pid: 4242 });
+    expect(decideHostAdoption({ record: record(), processAlive: true, currentPid: 1 })).toEqual({
+      kind: "adopt",
+      origin: "http://127.0.0.1:8765",
+      pid: 4242,
+    });
   });
 
   it("spawns when no record exists", () => {
-    expect(
-      decideHostAdoption({ record: undefined, processAlive: false, currentPid: 1 }),
-    ).toEqual({ kind: "spawn", reason: "no-record" });
+    expect(decideHostAdoption({ record: undefined, processAlive: false, currentPid: 1 })).toEqual({
+      kind: "spawn",
+      reason: "no-record",
+    });
   });
 
   it("spawns when the recorded process is gone", () => {
     // The common real case: SIGKILL or a power cut skipped the finalizer, so a
     // record survives pointing at a pid that no longer exists.
-    expect(
-      decideHostAdoption({ record: record(), processAlive: false, currentPid: 1 }),
-    ).toEqual({ kind: "spawn", reason: "dead-process" });
+    expect(decideHostAdoption({ record: record(), processAlive: false, currentPid: 1 })).toEqual({
+      kind: "spawn",
+      reason: "dead-process",
+    });
   });
 
   it("refuses a record written by a newer build", () => {

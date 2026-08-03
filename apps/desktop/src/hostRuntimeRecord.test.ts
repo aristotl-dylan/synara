@@ -42,9 +42,9 @@ describe("readHostRuntimeRecord", () => {
   });
 
   it("ignores extra fields a newer writer may add", () => {
-    expect(readHostRuntimeRecord(writeRecord({ ...validRecord, externalMcpRuntimeSecret: "x" }))).toEqual(
-      validRecord,
-    );
+    expect(
+      readHostRuntimeRecord(writeRecord({ ...validRecord, externalMcpRuntimeSecret: "x" })),
+    ).toEqual(validRecord);
   });
 
   it("returns undefined when the file is absent", () => {
@@ -135,9 +135,10 @@ describe("gatherHostAdoptionFacts", () => {
 
   it("refuses a live host bound to a routable address", () => {
     writeRecord({ ...validRecord, pid: 1, origin: "http://192.168.1.50:8765" });
-    expect(
-      decideHostAdoption(gatherHostAdoptionFacts({ stateDir, currentPid: 99999 })),
-    ).toEqual({ kind: "spawn", reason: "non-loopback-origin" });
+    expect(decideHostAdoption(gatherHostAdoptionFacts({ stateDir, currentPid: 99999 }))).toEqual({
+      kind: "spawn",
+      reason: "non-loopback-origin",
+    });
   });
 
   it("does not probe liveness when there is no record", () => {
