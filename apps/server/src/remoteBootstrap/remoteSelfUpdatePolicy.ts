@@ -130,3 +130,57 @@ export function evaluateSelfUpdatePoll(input: SelfUpdatePollInput): SelfUpdateDe
   }
   return { action: "up-to-date" };
 }
+
+/**
+ * The failure state the poll consumes, tracked PER TARGET RELEASE.
+ *
+ * `consecutiveFailures` on its own is not enough, because it has to answer two
+ * questions that pull in opposite directions: should a host stop hammering a
+ * release that keeps failing to install, AND should it try a newly published
+ * release even though the previous one failed? Counting failures against a
+ * specific target answers both — the count climbs while one release keeps
+ * failing, and resets the moment a different release is attempted.
+ */
+export interface SelfUpdateProgress {
+  /** The release the failures are against, or null when there is no failing streak. */
+  readonly failingTargetReleaseId: string | null;
+  readonly consecutiveFailures: number;
+}
+
+export const INITIAL_SELF_UPDATE_PROGRESS: SelfUpdateProgress = {
+  failingTargetReleaseId: null,
+  consecutiveFailures: 0,
+};
+
+export type SelfUpdateAttemptOutcome =
+  | { readonly kind: "succeeded" }
+  | { readonly kind: "failed"; readonly targetReleaseId: string };
+
+/**
+ * Folds one upgrade attempt into the progress state.
+ *
+ * - A success clears the streak: whatever we reached is now current, and the
+ *   next poll starts fresh.
+ * - A failure against the SAME target increments — this is what eventually
+ *   trips the give-up guard, so a release that cannot install stops being
+ *   retried forever.
+ * - A failure against a DIFFERENT target starts a new streak at one. A newly
+ *   published release is not the release that was failing, so it gets its own
+ *   budget; without this a single bad release would poison every release after
+ *   it, and a host that gave up once would never update again.
+ */
+export function recordSelfUpdateAttempt(
+  previous: SelfUpdateProgress,
+  outcome: SelfUpdateAttemptOutcome,
+): SelfUpdateProgress {
+  if (outcome.kind === "succeeded") {
+    return INITIAL_SELF_UPDATE_PROGRESS;
+  }
+  if (previous.failingTargetReleaseId === outcome.targetReleaseId) {
+    return {
+      failingTargetReleaseId: outcome.targetReleaseId,
+      consecutiveFailures: previous.consecutiveFailures + 1,
+    };
+  }
+  return { failingTargetReleaseId: outcome.targetReleaseId, consecutiveFailures: 1 };
+}

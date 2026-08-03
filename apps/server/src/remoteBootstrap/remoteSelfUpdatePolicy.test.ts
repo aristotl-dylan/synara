@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   compareReleaseVersions,
   evaluateSelfUpdatePoll,
+  INITIAL_SELF_UPDATE_PROGRESS,
   parseReleaseVersion,
+  recordSelfUpdateAttempt,
   type SelfUpdatePollInput,
 } from "./remoteSelfUpdatePolicy";
 
@@ -136,5 +138,79 @@ describe("evaluateSelfUpdatePoll", () => {
     expect(
       evaluateSelfUpdatePoll(input({ currentReleaseId: "0.6.3", latestReleaseId: "latest" })),
     ).toEqual({ action: "unparseable", which: "latest" });
+  });
+});
+
+describe("recordSelfUpdateAttempt", () => {
+  it("starts a fresh streak on the first failure", () => {
+    expect(
+      recordSelfUpdateAttempt(INITIAL_SELF_UPDATE_PROGRESS, {
+        kind: "failed",
+        targetReleaseId: "0.7.0",
+      }),
+    ).toEqual({ failingTargetReleaseId: "0.7.0", consecutiveFailures: 1 });
+  });
+
+  it("increments while the SAME release keeps failing", () => {
+    // This is what eventually trips give-up so a release that cannot install
+    // stops being retried forever.
+    let progress = INITIAL_SELF_UPDATE_PROGRESS;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      progress = recordSelfUpdateAttempt(progress, { kind: "failed", targetReleaseId: "0.7.0" });
+      expect(progress.consecutiveFailures).toBe(attempt);
+      expect(progress.failingTargetReleaseId).toBe("0.7.0");
+    }
+  });
+
+  it("resets to one when a DIFFERENT release is attempted", () => {
+    // A newly published release is not the one that was failing; it gets its own
+    // budget. Without this a single bad release would poison every release after
+    // it, and a host that gave up once would never update again.
+    const failing = { failingTargetReleaseId: "0.7.0", consecutiveFailures: 3 };
+    expect(recordSelfUpdateAttempt(failing, { kind: "failed", targetReleaseId: "0.8.0" })).toEqual({
+      failingTargetReleaseId: "0.8.0",
+      consecutiveFailures: 1,
+    });
+  });
+
+  it("clears the streak on success", () => {
+    const failing = { failingTargetReleaseId: "0.7.0", consecutiveFailures: 2 };
+    expect(recordSelfUpdateAttempt(failing, { kind: "succeeded" })).toEqual(
+      INITIAL_SELF_UPDATE_PROGRESS,
+    );
+  });
+
+  it("composes with the poll so give-up fires for one release but a new one retries", () => {
+    // End-to-end of the two functions together: fail 0.7.0 to the threshold →
+    // give-up; then 0.8.0 appears → the streak resets and the poll upgrades.
+    let progress = INITIAL_SELF_UPDATE_PROGRESS;
+    for (let i = 0; i < 3; i += 1) {
+      progress = recordSelfUpdateAttempt(progress, { kind: "failed", targetReleaseId: "0.7.0" });
+    }
+    expect(
+      evaluateSelfUpdatePoll({
+        currentReleaseId: "0.6.3",
+        latestReleaseId: "0.7.0",
+        autoUpdateEnabled: true,
+        consecutiveFailures: progress.consecutiveFailures,
+        maxConsecutiveFailures: 3,
+      }),
+    ).toEqual({ action: "give-up", consecutiveFailures: 3 });
+
+    // 0.8.0 published: the reducer resets the streak on the next (failed or not)
+    // attempt against it, so the poll is free to upgrade again.
+    const afterNewRelease = recordSelfUpdateAttempt(progress, {
+      kind: "failed",
+      targetReleaseId: "0.8.0",
+    });
+    expect(
+      evaluateSelfUpdatePoll({
+        currentReleaseId: "0.6.3",
+        latestReleaseId: "0.8.0",
+        autoUpdateEnabled: true,
+        consecutiveFailures: afterNewRelease.consecutiveFailures,
+        maxConsecutiveFailures: 3,
+      }),
+    ).toMatchObject({ action: "upgrade", targetReleaseId: "0.8.0" });
   });
 });
